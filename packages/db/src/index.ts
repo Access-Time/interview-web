@@ -65,14 +65,29 @@ export class CreateRecordingSessionConflictError extends Error {
 
 export interface CreateRecordingSessionInput {
   createdAt?: number;
+  recorderMimeType?: string | null;
+  requestedMimeType?: string | null;
+  segmentId: string;
+  sessionId: string;
+}
+
+export interface CreateRecordingSessionResult {
+  recorderMimeType: string | null;
+  requestedMimeType: string | null;
   segmentId: string;
   sessionId: string;
 }
 
 export function createRecordingSession(
   db: Database,
-  { sessionId, segmentId, createdAt = Date.now() }: CreateRecordingSessionInput
-) {
+  {
+    sessionId,
+    segmentId,
+    createdAt = Date.now(),
+    requestedMimeType = null,
+    recorderMimeType = null,
+  }: CreateRecordingSessionInput
+): Promise<CreateRecordingSessionResult> {
   return db
     .batch([
       db.insert(recordingSession).values({ createdAt, id: sessionId }),
@@ -80,10 +95,17 @@ export function createRecordingSession(
         createdAt,
         id: segmentId,
         index: 0,
+        recorderMimeType,
+        requestedMimeType,
         sessionId,
       }),
     ])
-    .then(() => ({ segmentId, sessionId }))
+    .then(() => ({
+      recorderMimeType,
+      requestedMimeType,
+      segmentId,
+      sessionId,
+    }))
     .catch(async (error: unknown) => {
       const [session, segment, initialSegment] = await Promise.all([
         db
@@ -95,6 +117,8 @@ export function createRecordingSession(
           .select({
             id: recordingSegment.id,
             index: recordingSegment.index,
+            recorderMimeType: recordingSegment.recorderMimeType,
+            requestedMimeType: recordingSegment.requestedMimeType,
             sessionId: recordingSegment.sessionId,
           })
           .from(recordingSegment)
@@ -116,9 +140,16 @@ export function createRecordingSession(
         segment?.id === segmentId &&
         segment.sessionId === sessionId &&
         segment.index === 0 &&
-        initialSegment?.id === segmentId
+        initialSegment?.id === segmentId &&
+        segment.requestedMimeType === requestedMimeType &&
+        segment.recorderMimeType === recorderMimeType
       ) {
-        return { segmentId, sessionId };
+        return {
+          recorderMimeType,
+          requestedMimeType,
+          segmentId,
+          sessionId,
+        };
       }
       if (session || segment || initialSegment) {
         throw new CreateRecordingSessionConflictError(segmentId, sessionId);
@@ -133,6 +164,8 @@ export interface RecordingManifest {
     id: string;
     index: number;
     createdAt: number;
+    recorderMimeType: string | null;
+    requestedMimeType: string | null;
     parts: Array<{
       id: string;
       sequence: number;
@@ -141,6 +174,7 @@ export interface RecordingManifest {
       checksum: string;
       etag: string;
       createdAt: number;
+      mediaType: string | null;
     }>;
   }>;
   sessionId: string;
@@ -184,6 +218,8 @@ export async function getRecordingManifest(
           ({ recording_upload_part: part }) => part.segmentId === segment.id
         )
         .map(({ recording_upload_part: part }) => part),
+      recorderMimeType: segment.recorderMimeType,
+      requestedMimeType: segment.requestedMimeType,
     })),
     sessionId,
   };
@@ -194,6 +230,7 @@ export interface AcknowledgeRecordingUploadPartInput {
   checksum: string;
   createdAt?: number;
   etag: string;
+  mediaType?: string | null;
   objectKey: string;
   partId: string;
   segmentId: string;
@@ -232,6 +269,7 @@ export function acknowledgeRecordingUploadPart(
             createdAt: input.createdAt ?? Date.now(),
             etag: input.etag,
             id: input.partId,
+            mediaType: input.mediaType ?? null,
             objectKey: input.objectKey,
             segmentId: input.segmentId,
             sequence: input.sequence,
@@ -260,7 +298,8 @@ export function acknowledgeRecordingUploadPart(
       if (
         existing.objectKey !== input.objectKey ||
         existing.byteSize !== input.byteSize ||
-        existing.checksum !== input.checksum
+        existing.checksum !== input.checksum ||
+        existing.mediaType !== (input.mediaType ?? null)
       ) {
         throw new RecordingUploadPartConflictError(
           input.segmentId,

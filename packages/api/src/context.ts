@@ -1,12 +1,13 @@
 import type {
   CreateRecordingSessionInput,
+  CreateRecordingSessionResult,
   RecordingManifest,
 } from "@interview-web/db";
 
 export interface RecordingBindings {
   createRecordingSession: (
     input: CreateRecordingSessionInput
-  ) => Promise<{ segmentId: string; sessionId: string }>;
+  ) => Promise<CreateRecordingSessionResult>;
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;

@@ -19,6 +19,7 @@ function setup(
       checksum: input.checksum,
       etag: input.etag,
       id: input.partId,
+      mediaType: input.mediaType,
       objectKey: input.objectKey,
     }),
     storage: {
@@ -38,12 +39,13 @@ function setup(
 }
 
 const params = { segmentId: "g1", sequence: "2", sessionId: "s1" };
-const request = (contentChecksum = checksum) =>
+const request = (contentChecksum = checksum, mediaType?: string) =>
   new Request("https://example.test", {
-    body: "payload",
+    body: new Uint8Array([1, 2, 3]),
     duplex: "half",
     headers: {
       "X-Content-SHA256": contentChecksum,
+      ...(mediaType ? { "Content-Type": mediaType } : {}),
     },
     method: "PUT",
   } as RequestInit);
@@ -87,6 +89,29 @@ test("success streams and passes conditional R2 metadata", async () => {
   });
 });
 
+test("passes Content-Type to acknowledgement and returns authoritative media type", async () => {
+  let acknowledgedMediaType: string | null = null;
+  const { env } = setup({
+    acknowledge: (input) => {
+      ({ mediaType: acknowledgedMediaType } = input);
+      return Promise.resolve({
+        id: "existing",
+        ...input,
+        mediaType: "video/webm;codecs=opus",
+      });
+    },
+  });
+  const response = await handleRecordingUploadPart(
+    request(checksum, "video/webm"),
+    params,
+    env
+  );
+  assert.equal(acknowledgedMediaType, "video/webm");
+  const body: unknown = await response.json();
+  assert.ok(body && typeof body === "object" && "mediaType" in body);
+  assert.equal(body.mediaType, "video/webm;codecs=opus");
+});
+
 test("compatible retry returns 200", async () => {
   const { env } = setup({
     acknowledge: async (input) => ({ id: "existing", ...input }),
@@ -95,6 +120,18 @@ test("compatible retry returns 200", async () => {
     (await handleRecordingUploadPart(request(), params, env)).status,
     200
   );
+});
+
+test("missing Content-Type is acknowledged as null", async () => {
+  let mediaType: string | null = "unexpected";
+  const { env } = setup({
+    acknowledge: (input) => {
+      ({ mediaType } = input);
+      return Promise.resolve({ id: "existing", ...input });
+    },
+  });
+  await handleRecordingUploadPart(request(), params, env);
+  assert.equal(mediaType, null);
 });
 
 test("generic acknowledgement failure retains the new object", async () => {

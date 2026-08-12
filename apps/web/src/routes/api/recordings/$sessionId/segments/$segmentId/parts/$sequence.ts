@@ -37,10 +37,7 @@ export const Route = createFileRoute(
             put: (key, body, options) =>
               env.RECORDINGS.put(key, body, {
                 onlyIf: options.onlyIf,
-                sha256: Uint8Array.from(
-                  options.sha256.match(/../g) ?? [],
-                  (byte) => Number.parseInt(byte, 16)
-                ),
+                sha256: options.sha256,
               }),
           },
         } satisfies RecordingUploadBindings),

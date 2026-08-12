@@ -4,6 +4,8 @@ import type { RecordingBindings } from "../context.ts";
 import { publicProcedure } from "../index.ts";
 
 const sessionInput = z.object({
+  recorderMimeType: z.string().nullable().optional(),
+  requestedMimeType: z.string().nullable().optional(),
   segmentId: z.string().min(1),
   sessionId: z.string().min(1),
 });

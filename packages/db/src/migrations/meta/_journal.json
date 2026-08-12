@@ -15,6 +15,13 @@
       "when": 1786507113179,
       "tag": "0001_sticky_lionheart",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786544136180,
+      "tag": "0002_adorable_butterfly",
+      "breakpoints": true
     }
   ]
 }

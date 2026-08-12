@@ -11,6 +11,8 @@ export const recordingSegment = sqliteTable(
     createdAt: integer("created_at").notNull(),
     id: text("id").primaryKey(),
     index: integer("segment_index").notNull(),
+    recorderMimeType: text("recorder_mime_type"),
+    requestedMimeType: text("requested_mime_type"),
     sessionId: text("session_id")
       .notNull()
       .references(() => recordingSession.id, { onDelete: "cascade" }),
@@ -31,6 +33,7 @@ export const recordingUploadPart = sqliteTable(
     createdAt: integer("created_at").notNull(),
     etag: text("etag").notNull(),
     id: text("id").primaryKey(),
+    mediaType: text("media_type"),
     objectKey: text("object_key").notNull(),
     segmentId: text("segment_id")
       .notNull()

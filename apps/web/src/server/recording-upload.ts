@@ -21,6 +21,7 @@ export interface RecordingUploadAcknowledgement {
   checksum: string;
   etag: string;
   id: string;
+  mediaType?: string | null;
   objectKey: string;
 }
 
@@ -29,6 +30,7 @@ export interface RecordingUploadBindings {
     byteSize: number;
     checksum: string;
     etag: string;
+    mediaType: string | null;
     objectKey: string;
     partId: string;
     segmentId: string;
@@ -81,6 +83,7 @@ export async function handleRecordingUploadPart(
     return new Response(null, { status: 400 });
   }
   const normalizedChecksum = checksum.toLowerCase();
+  const mediaType = request.headers.get("Content-Type");
 
   const sequence = Number(params.sequence);
   if (!Number.isSafeInteger(sequence) || sequence < 0) {
@@ -105,6 +108,7 @@ export async function handleRecordingUploadPart(
       byteSize: stored.size,
       checksum: normalizedChecksum,
       etag: stored.etag,
+      mediaType,
       objectKey,
       partId,
       segmentId: params.segmentId,
@@ -114,6 +118,8 @@ export async function handleRecordingUploadPart(
     const status = acknowledged.id === partId ? 201 : 200;
     return Response.json(
       {
+        mediaType:
+          acknowledged.mediaType === null ? mediaType : acknowledged.mediaType,
         objectKey: acknowledged.objectKey,
         partId: acknowledged.id,
         segmentId: params.segmentId,

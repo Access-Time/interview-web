@@ -5,11 +5,15 @@
     "zod": "catalog:"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.5.8",
     "@cloudflare/workers-types": "^5.20260728.1",
     "@interview-web/config": "workspace:*",
     "@types/node": "catalog:",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.3.0",
     "turbo": "^2.10.7",
-    "typescript": "catalog:"
+    "typescript": "catalog:",
+    "ultracite": "7.9.4"
   },
   "name": "interview-web",
   "scripts": {
@@ -19,7 +23,15 @@
     "dev:web": "turbo run dev -F web",
     "db:generate": "turbo run db:generate -F @interview-web/db",
     "deploy": "turbo run deploy -F @interview-web/infra",
-    "destroy": "turbo run destroy -F @interview-web/infra"
+    "destroy": "turbo run destroy -F @interview-web/infra",
+    "check": "ultracite check",
+    "fix": "ultracite fix",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{js,ts,cjs,mjs,d.cts,d.mts,jsx,tsx,json,jsonc}": [
+      "biome check --write"
+    ]
   },
   "type": "module",
   "workspaces": [

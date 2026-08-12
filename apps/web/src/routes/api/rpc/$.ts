@@ -1,5 +1,11 @@
 import { createContext } from "@interview-web/api/context";
 import { appRouter } from "@interview-web/api/routers/index";
+import {
+  createDb,
+  createRecordingSession,
+  getRecordingManifest,
+} from "@interview-web/db";
+import { env } from "@interview-web/env/server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
 import { onError } from "@orpc/server";
@@ -29,8 +35,18 @@ const apiHandler = new OpenAPIHandler(appRouter, {
 });
 
 async function handle({ request }: { request: Request }) {
+  const context = await createContext({
+    bindings: {
+      createRecordingSession: (input) =>
+        createRecordingSession(createDb(), input),
+      getRecordingManifest: (sessionId) =>
+        getRecordingManifest(createDb(), sessionId),
+      operatorSecret: env.OPERATOR_SECRET,
+    },
+    req: request,
+  });
   const rpcResult = await rpcHandler.handle(request, {
-    context: await createContext({ req: request }),
+    context,
     prefix: "/api/rpc",
   });
   if (rpcResult.response) {
@@ -38,7 +54,7 @@ async function handle({ request }: { request: Request }) {
   }
 
   const apiResult = await apiHandler.handle(request, {
-    context: await createContext({ req: request }),
+    context,
     prefix: "/api/rpc/api-reference",
   });
   if (apiResult.response) {

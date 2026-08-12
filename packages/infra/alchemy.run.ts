@@ -1,5 +1,5 @@
 import alchemy from "alchemy";
-import { D1Database, TanStackStart } from "alchemy/cloudflare";
+import { D1Database, R2Bucket, TanStackStart } from "alchemy/cloudflare";
 import { config } from "dotenv";
 
 config({ path: "./.env" });
@@ -11,10 +11,19 @@ const db = await D1Database("database", {
   migrationsDir: "../../packages/db/src/migrations",
 });
 
+const recordings = await R2Bucket("recordings", {
+  devDomain: false,
+});
+
 export const web = await TanStackStart("web", {
   bindings: {
     CORS_ORIGIN: alchemy.env.CORS_ORIGIN ?? "*",
     DB: db,
+    OPERATOR_SECRET: alchemy.secret(
+      alchemy.env.OPERATOR_SECRET,
+      "OPERATOR_SECRET"
+    ),
+    RECORDINGS: recordings,
   },
   cwd: "../../apps/web",
 });

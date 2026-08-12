@@ -25,6 +25,7 @@
     "deploy": "turbo run deploy -F @interview-web/infra",
     "destroy": "turbo run destroy -F @interview-web/infra",
     "check": "ultracite check",
+    "test": "turbo run test",
     "fix": "ultracite fix",
     "prepare": "husky"
   },

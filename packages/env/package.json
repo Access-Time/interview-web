@@ -17,5 +17,8 @@
     "@types/node": "catalog:",
     "@interview-web/config": "workspace:*",
     "@interview-web/infra": "workspace:*"
+  },
+  "scripts": {
+    "check-types": "tsc --noEmit -p tsconfig.json"
   }
 }

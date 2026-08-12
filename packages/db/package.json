@@ -10,6 +10,7 @@
     }
   },
   "scripts": {
+    "check-types": "tsc --noEmit -p tsconfig.json",
     "db:generate": "drizzle-kit generate"
   },
   "devDependencies": {

@@ -25,11 +25,11 @@ pnpm install
 
 This project uses Cloudflare D1 (SQLite) with Drizzle ORM.
 
-Runtime database access uses the Cloudflare `DB` binding from `packages/infra/alchemy.run.ts`. If a local `DATABASE_URL` is present, it is only for database tooling.
+Runtime database access uses the Cloudflare `DB` binding from `packages/infra/alchemy.run.ts`.
 
 Alchemy provisions the D1 database and applies migrations during `dev` and `deploy`.
 
-1. Generate migration files:
+1. Generate migration files after changing the Drizzle schema:
 ```bash
 pnpm run db:generate
 ```

@@ -4,6 +4,8 @@
   "type": "module",
   "scripts": {
     "build": "vite build",
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "dev": "pnpm run dev:bare",
     "serve": "vite preview",
     "dev:bare": "vite dev"
   },

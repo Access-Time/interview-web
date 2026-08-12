@@ -1,8 +1,5 @@
 export function createContext(_options: { req: Request }) {
-  return {
-    auth: null,
-    session: null,
-  };
+  return {};
 }
 
 export type Context = Awaited<ReturnType<typeof createContext>>;

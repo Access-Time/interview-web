@@ -102,8 +102,8 @@ interview-web/
 
 ## Available Scripts
 
-- `pnpm run dev`: Start all applications in development mode
+- `pnpm run dev`: Start Alchemy development mode with local D1
 - `pnpm run build`: Build all applications
-- `pnpm run dev:web`: Start only the web application
+- `pnpm run dev:web`: Start Alchemy development mode with local D1
 - `pnpm run check-types`: Check TypeScript types across all apps
 - `pnpm run db:generate`: Generate database client/types

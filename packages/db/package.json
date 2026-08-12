@@ -1,0 +1,28 @@
+{
+  "name": "@interview-web/db",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts"
+    },
+    "./*": {
+      "default": "./src/*.ts"
+    }
+  },
+  "scripts": {
+    "db:generate": "drizzle-kit generate"
+  },
+  "devDependencies": {
+    "typescript": "catalog:",
+    "@interview-web/config": "workspace:*",
+    "drizzle-kit": "^0.31.10"
+  },
+  "dependencies": {
+    "dotenv": "catalog:",
+    "zod": "catalog:",
+    "@interview-web/env": "workspace:*",
+    "drizzle-orm": "catalog:",
+    "@libsql/client": "catalog:",
+    "libsql": "catalog:"
+  }
+}

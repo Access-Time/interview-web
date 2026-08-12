@@ -1,0 +1,6 @@
+{
+  "extends": "@interview-web/config/tsconfig.base.json",
+  "compilerOptions": {
+    "strictNullChecks": true
+  }
+}

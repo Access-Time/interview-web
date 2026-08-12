@@ -7,7 +7,7 @@ the existing research documents. Do not implement recording-session behavior.
 
 ## Stack
 
-- TanStack Start with a self backend on Cloudflare Workers
+- TanStack Start with a self backend deployed to Cloudflare
 - oRPC, Drizzle, Cloudflare D1/SQLite
 - pnpm, Husky, Turborepo, Ultracite, and the todo example
 - Cloudflare web deployment configuration
@@ -22,6 +22,10 @@ decision overrides the bootstrap ticket's conflicting Supabase/PostgreSQL text.
    overwrite the planning artifacts.
 2. Review the dry-run output, then run the same generator without `--dry-run`.
 3. Install dependencies with pnpm.
+
+The current generator requires `--backend self --runtime none --web-deploy
+cloudflare --server-deploy none`; the Workers runtime is only compatible with
+its Hono backend.
 
 ## Verification seams
 

@@ -4,48 +4,45 @@ The private recording data plane uses Cloudflare D1 for manifests and a private
 Cloudflare R2 bucket for recording objects. Alchemy provisions the bucket and
 binds it to the TanStack Start Worker as `RECORDINGS`, alongside `DB`.
 
-R2 has no `r2.dev` or custom public domain configured. Objects are intended to
-be accessed only through authenticated operator infrastructure.
+R2 has no `r2.dev` or custom public domain configured. Objects remain private
+and inaccessible directly; this PoC has no application authentication.
 
 ## Local setup
 
-Copy `apps/web/.env.example` to `apps/web/.env`, then set `OPERATOR_SECRET` to
-a locally generated value. Do not commit either the value or the local `.env`
+Copy `apps/web/.env.example` to `apps/web/.env`. Do not commit the local `.env`
 file. Alchemy also needs `ALCHEMY_PASSWORD` in `packages/infra/.env` to encrypt
 secret state.
 
-Generate a value, for example:
-
-```sh
-openssl rand -hex 32
-```
-
-Alchemy's local runtime supplies the `RECORDINGS` and `DB` bindings. The
-operator secret is wrapped with `alchemy.secret` and is never stored as a
-literal in source.
+Alchemy's local runtime supplies the `RECORDINGS` and `DB` bindings.
 
 ## Deployment
 
-Set `OPERATOR_SECRET` in the deployment environment before running the existing
-infra deploy command. Keep `ALCHEMY_PASSWORD` available so Alchemy can decrypt
+Keep `ALCHEMY_PASSWORD` available so Alchemy can decrypt
 its state. The deployment creates or updates the private R2 bucket and Worker
 bindings; it does not expose an R2 public domain.
 
 ## Tracer bullet
 
-Recording control uses authenticated oRPC procedures (`recording.create` and
+Recording control uses public oRPC procedures (`recording.create` and
 `recording.getManifest`) backed by the Drizzle manifest helpers. Binary parts use
-an authenticated raw `PUT` route and stream directly into R2; the durable object
-key is derived from session, segment, and sequence.
+an unauthenticated raw `PUT` route and stream directly into private R2. R2 keys
+are content-addressed and immutable:
+`recordings/{encodedSessionId}/segments/{encodedSegmentId}/parts/{sequence}/sha256/{checksum}`.
+No substitute authentication is part of this PoC.
 
 The uploader must send an `X-Content-SHA256` header containing the 64-character
-hex SHA-256 checksum. It is stored in R2 and used to make retries immutable;
-the R2 ETag is recorded separately and is not treated as the content checksum.
-Authentication is a temporary operator bearer secret and is not a candidate
-authentication design.
+hex SHA-256 checksum. D1 `(segmentId, sequence)` uniqueness selects the
+authoritative manifest part. Retry compatibility is checked using key, checksum,
+and size; a compatible retry may refresh the recorded ETag. The R2 ETag is
+recorded separately and is not treated as the content checksum.
 
-This local runtime remains dependency-skew blocked; no live deployment
-verification is claimed.
+The raw upload request never deletes R2 objects. Invalid, conflicting, or
+ambiguous requests may leave unreferenced private R2 candidates; this is
+deliberate for the no-auth PoC and requires later lifecycle/operator cleanup.
+
+Local and disposable remote Worker verification cover session creation,
+immutable upload retries, conflicts, and manifest retrieval against D1 and
+private R2. The disposable remote resources were removed afterward.
 
 ## Deferred prerequisite
 

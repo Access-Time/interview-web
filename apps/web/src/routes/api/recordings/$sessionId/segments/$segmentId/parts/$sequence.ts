@@ -15,9 +15,7 @@ export const Route = createFileRoute(
         handleRecordingUploadPart(request, params, {
           acknowledge: (input) =>
             acknowledgeRecordingUploadPart(createDb(), input),
-          operatorSecret: env.OPERATOR_SECRET,
           storage: {
-            delete: (key) => env.RECORDINGS.delete(key),
             head: async (key) => {
               const object = await env.RECORDINGS.head(key);
               const sha256 = object?.checksums?.sha256;

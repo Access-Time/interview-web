@@ -23,33 +23,29 @@ interface RecordingClient {
 }
 
 function setup(
-  getManifest: RecordingBindings["getRecordingManifest"] = async () => manifest
+  getManifest: RecordingBindings["getRecordingManifest"] = async () => manifest,
+  createRecordingSession: RecordingBindings["createRecordingSession"] = async (
+    value
+  ) => value
 ) {
-  let authorized = false;
   const createCalls: unknown[] = [];
   const bindings: RecordingBindings = {
     createRecordingSession: (value) => {
       createCalls.push(value);
-      return Promise.resolve(value);
+      return createRecordingSession(value);
     },
     getRecordingManifest: getManifest,
-    operatorSecret: "test-secret",
   };
   const handler = new RPCHandler({ recording: recordingRouter });
   const client = createORPCClient(
     new RPCLink({
       fetch: (request, init) => {
         const originalRequest = new Request(request, init);
-        const headers = new Headers(originalRequest.headers);
-        if (authorized) {
-          headers.set("Authorization", "Bearer test-secret");
-        }
-        const adaptedRequest = new Request(originalRequest, { headers });
+        const adaptedRequest = new Request(originalRequest);
         return handler
           .handle(adaptedRequest, {
             context: createContext({
               bindings,
-              req: adaptedRequest,
             }),
             prefix: "/rpc",
           })
@@ -60,32 +56,46 @@ function setup(
       url: "https://example.test/rpc",
     })
   ) as unknown as RecordingClient;
-  const setAuthorized = (value: boolean) => {
-    authorized = value;
-  };
   return {
     client,
     createCalls,
-    setAuthorized,
   };
 }
 
-test("unauthorized recording.create is rejected without invoking the helper", async () => {
+test("recording.create is public and calls the injected helper", async () => {
   const { client, createCalls } = setup();
-  await assert.rejects(() => client.recording.create(input));
-  assert.equal(createCalls.length, 0);
+  assert.deepEqual(await client.recording.create(input), input);
+  assert.equal(createCalls.length, 1);
 });
 
-test("authenticated recording.create calls the injected helper", async () => {
-  const setupResult = setup();
-  setupResult.setAuthorized(true);
-  assert.deepEqual(await setupResult.client.recording.create(input), input);
-  assert.equal(setupResult.createCalls.length, 1);
+test("recording.create maps session conflicts to Conflict", async () => {
+  const setupResult = setup(undefined, () => {
+    const error = new Error("conflict");
+    error.name = "CreateRecordingSessionConflictError";
+    throw error;
+  });
+  await assert.rejects(
+    () => setupResult.client.recording.create(input),
+    (error: unknown) => {
+      assert.equal(
+        error && typeof error === "object" && "status" in error
+          ? error.status
+          : undefined,
+        409
+      );
+      assert.equal(
+        error && typeof error === "object" && "code" in error
+          ? error.code
+          : undefined,
+        "CONFLICT"
+      );
+      return true;
+    }
+  );
 });
 
-test("authenticated recording.getManifest returns the manifest", async () => {
+test("recording.getManifest is public and returns the manifest", async () => {
   const setupResult = setup();
-  setupResult.setAuthorized(true);
   assert.deepEqual(
     await setupResult.client.recording.getManifest({
       sessionId: input.sessionId,
@@ -96,7 +106,6 @@ test("authenticated recording.getManifest returns the manifest", async () => {
 
 test("missing manifest maps to Not Found", async () => {
   const setupResult = setup(async () => null);
-  setupResult.setAuthorized(true);
   await assert.rejects(
     () =>
       setupResult.client.recording.getManifest({

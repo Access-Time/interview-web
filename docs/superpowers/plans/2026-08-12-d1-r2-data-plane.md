@@ -4,7 +4,7 @@
 
 **Goal:** Build the recording data plane around durable recording-session manifests in D1 and ordered binary upload parts in private R2.
 
-**Architecture:** oRPC creates and reads recording-session manifests through Drizzle. A raw TanStack route accepts each ordered binary part, streams it to private R2, and acknowledges it only after a typed Drizzle transaction records the upload part. The manifest hierarchy is session → ordered segments → ordered upload parts. Reloads create new segments; finalization is not part of this work.
+**Architecture:** oRPC creates and reads recording-session manifests through Drizzle. A raw TanStack route accepts each ordered binary part, streams it to private R2, and acknowledges it only after a typed Drizzle-backed D1 batch write records the upload part. The manifest hierarchy is session → ordered segments → ordered upload parts. Reloads create new segments; finalization is not part of this work.
 
 **Tech Stack:** TanStack Start, Cloudflare Workers, oRPC, D1, Drizzle, private R2, and the existing test tooling.
 
@@ -12,7 +12,7 @@
 
 - Keep D1/SQLite as the manifest store and use Drizzle for all manifest reads and writes.
 - Keep R2 private; do not configure an `r2.dev` or custom public domain.
-- Use temporary operator-secret authentication at the internal boundary. Never include the secret value in source, tests, logs, or responses.
+- No application authentication is part of this no-auth PoC. Keep R2 private so objects remain inaccessible directly; do not add substitute auth.
 - The two TDD seams are the public oRPC router contract and the raw upload handler.
 - Delete the current generic probe route, its probe schema, and its tests; do not preserve a compatibility path.
 - Containers are deferred.
@@ -25,7 +25,7 @@
 **Files:**
 - Delete: the current generic probe schema and its migration artifacts, if any
 - Create/modify: the Drizzle schema and exports under `packages/db/src/`
-- Create: the corresponding Drizzle migration
+- No schema migration is needed for this clean PoC.
 
 **Interfaces:**
 - `recordingSession` is the root manifest with durable identity and lifecycle timestamps.
@@ -34,8 +34,7 @@
 - Foreign keys and `(sessionId, sequence)` / `(segmentId, sequence)` uniqueness enforce the hierarchy and ordering.
 
 - [ ] Write the schema and types for session, segment, and ordered upload part.
-- [ ] Remove the generic probe table/schema exports and generate a migration that matches the replacement schema.
-- [ ] Keep migration metadata consistent and inspect the generated SQL.
+- [ ] Remove the generic probe table/schema exports; keep the existing schema and migration state consistent.
 
 ### Task 2: Public oRPC manifest contract
 
@@ -48,7 +47,7 @@
 - The router exposes the approved operations to create a recording session and read its manifest.
 - Inputs and outputs are typed; reads return the session with ordered segments and ordered acknowledged upload parts.
 - Database writes and reads go through Drizzle rather than direct ad hoc SQL.
-- Authentication uses the temporary operator-secret boundary without exposing the secret.
+- The oRPC procedures are public for this no-auth PoC; injected recording bindings remain required.
 
 - [ ] Start with failing tests against the public oRPC router contract.
 - [ ] Implement session creation and manifest reads with Drizzle and deterministic ordering.
@@ -62,14 +61,16 @@
 - Modify: Worker/R2 binding and authentication wiring only where required
 
 **Interfaces:**
-- The handler accepts an authenticated upload for an existing session and segment, validates the part ordering and request metadata, and streams the request body directly to a private R2 key.
-- It acknowledges success only after a typed Drizzle transaction records the ordered upload part.
+- The handler accepts an unauthenticated upload for an existing session and segment, validates the part ordering and request metadata, and streams the request body directly to a private R2 key.
+- It acknowledges success only after a typed Drizzle-backed D1 batch write records the ordered upload part.
 - Duplicate or conflicting part acknowledgements are rejected safely; failed manifest acknowledgement does not report success.
 - The handler is independently testable with injected R2 and Drizzle seams.
 
-- [ ] Start with failing tests for authentication, streaming the raw binary body, ordering, typed transaction acknowledgement, and failure responses.
+- [ ] Start with failing tests for public access, streaming the raw binary body, ordering, typed transaction acknowledgement, and failure responses.
 - [ ] Implement the minimum handler needed to pass those tests.
-- [ ] Define the failure/cleanup behavior for an R2 object whose database acknowledgement fails, without claiming atomicity across R2 and D1.
+- [ ] Treat R2 keys as content-addressed and immutable: `recordings/{encodedSessionId}/segments/{encodedSegmentId}/parts/{sequence}/sha256/{checksum}`.
+- [ ] Use D1 `(segmentId, sequence)` uniqueness as the authoritative manifest-part choice; check retry compatibility by key, checksum, and size, allowing a compatible retry to refresh ETag.
+- [ ] Never delete objects in the raw upload request. Invalid, conflicting, or ambiguous requests may leave unreferenced private R2 candidates for later lifecycle/operator cleanup; do not claim atomicity across R2 and D1.
 
 ### Task 4: Remove probe implementation and defer Containers
 

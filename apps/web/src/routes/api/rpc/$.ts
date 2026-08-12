@@ -5,7 +5,6 @@ import {
   createRecordingSession,
   getRecordingManifest,
 } from "@interview-web/db";
-import { env } from "@interview-web/env/server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
 import { onError } from "@orpc/server";
@@ -41,9 +40,7 @@ async function handle({ request }: { request: Request }) {
         createRecordingSession(createDb(), input),
       getRecordingManifest: (sessionId) =>
         getRecordingManifest(createDb(), sessionId),
-      operatorSecret: env.OPERATOR_SECRET,
     },
-    req: request,
   });
   const rpcResult = await rpcHandler.handle(request, {
     context,

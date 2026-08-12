@@ -1,7 +1,6 @@
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
 
 export interface RecordingUploadStorage {
-  delete: (key: string) => Promise<void>;
   head: (key: string) => Promise<{
     checksums: { sha256?: string };
     etag: string;
@@ -36,7 +35,6 @@ export interface RecordingUploadBindings {
     sequence: number;
     sessionId: string;
   }) => Promise<RecordingUploadAcknowledgement>;
-  operatorSecret: string;
   storage: RecordingUploadStorage;
 }
 
@@ -75,11 +73,6 @@ export async function handleRecordingUploadPart(
   if (request.method !== "PUT") {
     return new Response(null, { status: 405 });
   }
-  if (
-    request.headers.get("Authorization") !== `Bearer ${bindings.operatorSecret}`
-  ) {
-    return new Response(null, { status: 401 });
-  }
   if (!request.body) {
     return new Response(null, { status: 400 });
   }
@@ -94,7 +87,7 @@ export async function handleRecordingUploadPart(
     return new Response(null, { status: 400 });
   }
 
-  const objectKey = `recordings/${params.sessionId}/segments/${params.segmentId}/parts/${sequence}`;
+  const objectKey = `recordings/${encodeURIComponent(params.sessionId)}/segments/${encodeURIComponent(params.segmentId)}/parts/${sequence}/sha256/${normalizedChecksum}`;
   const storageResult = await storeRecordingUploadPart(
     objectKey,
     request.body,
@@ -104,7 +97,7 @@ export async function handleRecordingUploadPart(
   if (storageResult instanceof Response) {
     return storageResult;
   }
-  const { newlyStored, stored } = storageResult;
+  const { stored } = storageResult;
 
   const partId = crypto.randomUUID();
   try {
@@ -132,19 +125,15 @@ export async function handleRecordingUploadPart(
   } catch (error) {
     if (
       error instanceof Error &&
+      error.name === "RecordingSegmentOwnershipError"
+    ) {
+      return new Response(null, { status: 404 });
+    }
+    if (
+      error instanceof Error &&
       error.name === "RecordingUploadPartConflictError"
     ) {
       return new Response(null, { status: 409 });
-    }
-    if (newlyStored) {
-      try {
-        await bindings.storage.delete(objectKey);
-      } catch (cleanupError) {
-        console.error(
-          "Failed to compensate recording upload object",
-          cleanupError
-        );
-      }
     }
     return new Response(null, { status: 500 });
   }

@@ -24,8 +24,13 @@ catalog:
   "@orpc/zod": ^1.14.12
   "@types/react": ^19.2.17
   "@types/react-dom": ^19.2.3
-  alchemy: ^0.93.12
+  alchemy: 0.94.0
   drizzle-orm: ^0.45.2
+packageExtensions:
+  # Alchemy 0.94.0 omits safe-fetch's runtime undici dependency; exact 7.29.0 avoids the incompatible v8 dispatcher.
+  alchemy@0.94.0:
+    dependencies:
+      undici: 7.29.0
 minimumReleaseAgeExclude:
   - '@biomejs/biome@2.5.8'
   - '@biomejs/cli-darwin-arm64@2.5.8'

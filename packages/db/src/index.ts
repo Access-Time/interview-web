@@ -35,6 +35,34 @@ export class RecordingUploadPartConflictError extends Error {
   }
 }
 
+export class RecordingSegmentOwnershipError extends Error {
+  readonly segmentId: string;
+  readonly sessionId: string;
+
+  constructor(segmentId: string, sessionId: string) {
+    super(
+      `Recording segment ${segmentId} does not belong to session ${sessionId}`
+    );
+    this.name = "RecordingSegmentOwnershipError";
+    this.segmentId = segmentId;
+    this.sessionId = sessionId;
+  }
+}
+
+export class CreateRecordingSessionConflictError extends Error {
+  readonly segmentId: string;
+  readonly sessionId: string;
+
+  constructor(segmentId: string, sessionId: string) {
+    super(
+      `Recording session ${sessionId} or segment ${segmentId} conflicts with the existing manifest`
+    );
+    this.name = "CreateRecordingSessionConflictError";
+    this.segmentId = segmentId;
+    this.sessionId = sessionId;
+  }
+}
+
 export interface CreateRecordingSessionInput {
   createdAt?: number;
   segmentId: string;
@@ -45,16 +73,58 @@ export function createRecordingSession(
   db: Database,
   { sessionId, segmentId, createdAt = Date.now() }: CreateRecordingSessionInput
 ) {
-  return db.transaction(async (tx) => {
-    await tx.insert(recordingSession).values({ createdAt, id: sessionId });
-    await tx.insert(recordingSegment).values({
-      createdAt,
-      id: segmentId,
-      index: 0,
-      sessionId,
+  return db
+    .batch([
+      db.insert(recordingSession).values({ createdAt, id: sessionId }),
+      db.insert(recordingSegment).values({
+        createdAt,
+        id: segmentId,
+        index: 0,
+        sessionId,
+      }),
+    ])
+    .then(() => ({ segmentId, sessionId }))
+    .catch(async (error: unknown) => {
+      const [session, segment, initialSegment] = await Promise.all([
+        db
+          .select({ id: recordingSession.id })
+          .from(recordingSession)
+          .where(eq(recordingSession.id, sessionId))
+          .get(),
+        db
+          .select({
+            id: recordingSegment.id,
+            index: recordingSegment.index,
+            sessionId: recordingSegment.sessionId,
+          })
+          .from(recordingSegment)
+          .where(eq(recordingSegment.id, segmentId))
+          .get(),
+        db
+          .select({ id: recordingSegment.id })
+          .from(recordingSegment)
+          .where(
+            and(
+              eq(recordingSegment.sessionId, sessionId),
+              eq(recordingSegment.index, 0)
+            )
+          )
+          .get(),
+      ]);
+      if (
+        session &&
+        segment?.id === segmentId &&
+        segment.sessionId === sessionId &&
+        segment.index === 0 &&
+        initialSegment?.id === segmentId
+      ) {
+        return { segmentId, sessionId };
+      }
+      if (session || segment || initialSegment) {
+        throw new CreateRecordingSessionConflictError(segmentId, sessionId);
+      }
+      throw error;
     });
-    return { segmentId, sessionId };
-  });
 }
 
 export interface RecordingManifest {
@@ -135,59 +205,75 @@ export function acknowledgeRecordingUploadPart(
   db: Database,
   input: AcknowledgeRecordingUploadPartInput
 ) {
-  return db.transaction(async (tx) => {
-    const segment = await tx
-      .select({ id: recordingSegment.id })
-      .from(recordingSegment)
-      .where(
-        and(
-          eq(recordingSegment.id, input.segmentId),
-          eq(recordingSegment.sessionId, input.sessionId)
-        )
+  return db
+    .select({ id: recordingSegment.id })
+    .from(recordingSegment)
+    .where(
+      and(
+        eq(recordingSegment.id, input.segmentId),
+        eq(recordingSegment.sessionId, input.sessionId)
       )
-      .get();
-    if (!segment) {
-      throw new Error("Recording segment does not belong to the session");
-    }
+    )
+    .get()
+    .then(async (segment) => {
+      if (!segment) {
+        throw new RecordingSegmentOwnershipError(
+          input.segmentId,
+          input.sessionId
+        );
+      }
 
-    const existing = await tx
-      .select()
-      .from(recordingUploadPart)
-      .where(
-        and(
-          eq(recordingUploadPart.segmentId, input.segmentId),
-          eq(recordingUploadPart.sequence, input.sequence)
+      await db.batch([
+        db
+          .insert(recordingUploadPart)
+          .values({
+            byteSize: input.byteSize,
+            checksum: input.checksum,
+            createdAt: input.createdAt ?? Date.now(),
+            etag: input.etag,
+            id: input.partId,
+            objectKey: input.objectKey,
+            segmentId: input.segmentId,
+            sequence: input.sequence,
+          })
+          .onConflictDoNothing({
+            target: [
+              recordingUploadPart.segmentId,
+              recordingUploadPart.sequence,
+            ],
+          }),
+      ]);
+
+      const existing = await db
+        .select()
+        .from(recordingUploadPart)
+        .where(
+          and(
+            eq(recordingUploadPart.segmentId, input.segmentId),
+            eq(recordingUploadPart.sequence, input.sequence)
+          )
         )
-      )
-      .get();
-    if (existing) {
+        .get();
+      if (!existing) {
+        throw new Error("Recording upload part was not persisted");
+      }
       if (
         existing.objectKey !== input.objectKey ||
         existing.byteSize !== input.byteSize ||
-        existing.checksum !== input.checksum ||
-        existing.etag !== input.etag
+        existing.checksum !== input.checksum
       ) {
         throw new RecordingUploadPartConflictError(
           input.segmentId,
           input.sequence
         );
       }
+      if (existing.etag !== input.etag) {
+        await db
+          .update(recordingUploadPart)
+          .set({ etag: input.etag })
+          .where(eq(recordingUploadPart.id, existing.id));
+        return { ...existing, etag: input.etag };
+      }
       return existing;
-    }
-
-    return tx
-      .insert(recordingUploadPart)
-      .values({
-        byteSize: input.byteSize,
-        checksum: input.checksum,
-        createdAt: input.createdAt ?? Date.now(),
-        etag: input.etag,
-        id: input.partId,
-        objectKey: input.objectKey,
-        segmentId: input.segmentId,
-        sequence: input.sequence,
-      })
-      .returning()
-      .get();
-  });
+    });
 }

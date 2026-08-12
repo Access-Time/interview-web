@@ -19,10 +19,6 @@ export const web = await TanStackStart("web", {
   bindings: {
     CORS_ORIGIN: alchemy.env.CORS_ORIGIN ?? "*",
     DB: db,
-    OPERATOR_SECRET: alchemy.secret(
-      alchemy.env.OPERATOR_SECRET,
-      "OPERATOR_SECRET"
-    ),
     RECORDINGS: recordings,
   },
   cwd: "../../apps/web",

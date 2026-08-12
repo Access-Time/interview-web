@@ -8,28 +8,39 @@ const sessionInput = z.object({
   sessionId: z.string().min(1),
 });
 
-function requireOperator(context: {
-  bindings: RecordingBindings | undefined;
-  operatorAuthorized: boolean;
-}) {
-  if (!(context.operatorAuthorized && context.bindings)) {
+function requireBindings(context: { bindings: RecordingBindings | undefined }) {
+  if (!context.bindings) {
     throw new ORPCError("UNAUTHORIZED");
   }
   return context.bindings;
+}
+
+function isCreateRecordingSessionConflictError(error: unknown) {
+  return (
+    error instanceof Error &&
+    error.name === "CreateRecordingSessionConflictError"
+  );
 }
 
 export const recordingRouter = {
   create: publicProcedure
     .input(sessionInput)
     .handler(async ({ input, context }) => {
-      const bindings = requireOperator(context);
-      return await bindings.createRecordingSession(input);
+      const bindings = requireBindings(context);
+      try {
+        return await bindings.createRecordingSession(input);
+      } catch (error) {
+        if (isCreateRecordingSessionConflictError(error)) {
+          throw new ORPCError("CONFLICT", { cause: error });
+        }
+        throw error;
+      }
     }),
 
   getManifest: publicProcedure
     .input(z.object({ sessionId: z.string().min(1) }))
     .handler(async ({ input, context }) => {
-      const bindings = requireOperator(context);
+      const bindings = requireBindings(context);
       const manifest = await bindings.getRecordingManifest(input.sessionId);
       if (!manifest) {
         throw new ORPCError("NOT_FOUND");

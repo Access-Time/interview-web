@@ -10,22 +10,13 @@ export interface RecordingBindings {
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;
-  operatorSecret: string;
 }
 
 export function createContext(options: {
-  req: Request;
   bindings?: RecordingBindings;
+  req?: Request;
 }) {
-  const authorization = options.req.headers.get("Authorization");
-  const operatorAuthorized =
-    options.bindings !== undefined &&
-    authorization === `Bearer ${options.bindings.operatorSecret}`;
-
-  return {
-    bindings: options.bindings,
-    operatorAuthorized,
-  };
+  return { bindings: options.bindings };
 }
 
 export type Context = Awaited<ReturnType<typeof createContext>>;

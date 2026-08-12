@@ -11,7 +11,6 @@ function setup(
     body: ReadableStream<Uint8Array>;
     options: unknown;
   }> = [];
-  const deletes: string[] = [];
   const env = {
     acknowledge: async (
       input: Parameters<NonNullable<typeof overrides.acknowledge>>[0]
@@ -22,12 +21,7 @@ function setup(
       id: input.partId,
       objectKey: input.objectKey,
     }),
-    operatorSecret: "secret",
     storage: {
-      delete: (key: string) => {
-        deletes.push(key);
-        return Promise.resolve();
-      },
       head: async () => null,
       put: (
         key: string,
@@ -40,36 +34,25 @@ function setup(
     },
     ...overrides,
   };
-  return { deletes, env, puts };
+  return { env, puts };
 }
 
 const params = { segmentId: "g1", sequence: "2", sessionId: "s1" };
-const request = (authorization = "Bearer secret", contentChecksum = checksum) =>
+const request = (contentChecksum = checksum) =>
   new Request("https://example.test", {
     body: "payload",
     duplex: "half",
     headers: {
-      Authorization: authorization,
       "X-Content-SHA256": contentChecksum,
     },
     method: "PUT",
   } as RequestInit);
 
-test("unauthorized upload skips storage", async () => {
-  const { env, puts } = setup();
-  assert.equal(
-    (await handleRecordingUploadPart(request("Bearer wrong"), params, env))
-      .status,
-    401
-  );
-  assert.equal(puts.length, 0);
-});
-
 test("missing or malformed checksum skips storage", async () => {
   await Promise.all(
     [null, "bad", "a".repeat(63), "g".repeat(64)].map(async (value) => {
       const { env, puts } = setup();
-      const headers = new Headers({ Authorization: "Bearer secret" });
+      const headers = new Headers();
       if (value) {
         headers.set("X-Content-SHA256", value);
       }
@@ -94,6 +77,10 @@ test("success streams and passes conditional R2 metadata", async () => {
   const response = await handleRecordingUploadPart(request(), params, env);
   assert.equal(response.status, 201);
   assert.ok(puts[0]?.body instanceof ReadableStream);
+  assert.equal(
+    puts[0]?.key,
+    `recordings/s1/segments/g1/parts/2/sha256/${checksum}`
+  );
   assert.deepEqual(puts[0]?.options, {
     onlyIf: { etagDoesNotMatch: "*" },
     sha256: checksum,
@@ -110,8 +97,20 @@ test("compatible retry returns 200", async () => {
   );
 });
 
-test("conflict does not delete the object", async () => {
-  const { env, deletes } = setup({
+test("generic acknowledgement failure retains the new object", async () => {
+  const { env } = setup({
+    acknowledge: () => {
+      throw new Error("db");
+    },
+  });
+  assert.equal(
+    (await handleRecordingUploadPart(request(), params, env)).status,
+    500
+  );
+});
+
+test("new-object manifest conflict retains the object", async () => {
+  const { env, puts } = setup({
     acknowledge: () => {
       const error = new Error("conflict");
       error.name = "RecordingUploadPartConflictError";
@@ -122,25 +121,76 @@ test("conflict does not delete the object", async () => {
     (await handleRecordingUploadPart(request(), params, env)).status,
     409
   );
-  assert.deepEqual(deletes, []);
+  assert.equal(puts.length, 1);
 });
 
-test("persistence failure compensates the new object", async () => {
-  const { env, deletes } = setup({
+test("new-object invalid ownership retains the object and returns 404", async () => {
+  const { env, puts } = setup({
     acknowledge: () => {
-      throw new Error("db");
+      const error = new Error("ownership");
+      error.name = "RecordingSegmentOwnershipError";
+      throw error;
     },
   });
   assert.equal(
     (await handleRecordingUploadPart(request(), params, env)).status,
-    500
+    404
   );
-  assert.deepEqual(deletes, ["recordings/s1/segments/g1/parts/2"]);
+  assert.equal(puts.length, 1);
+});
+
+test("pre-existing invalid ownership returns 404", async () => {
+  const base = setup();
+  const { env, puts } = setup({
+    acknowledge: () => {
+      const error = new Error("ownership");
+      error.name = "RecordingSegmentOwnershipError";
+      throw error;
+    },
+    storage: {
+      ...base.env.storage,
+      head: async () => ({
+        checksums: { sha256: checksum },
+        etag: "existing",
+        size: 7,
+      }),
+      put: async () => null,
+    },
+  });
+  assert.equal(
+    (await handleRecordingUploadPart(request(), params, env)).status,
+    404
+  );
+  assert.equal(puts.length, 0);
+});
+
+test("pre-existing-object manifest conflict returns 409", async () => {
+  const base = setup();
+  const { env } = setup({
+    acknowledge: () => {
+      const error = new Error("conflict");
+      error.name = "RecordingUploadPartConflictError";
+      throw error;
+    },
+    storage: {
+      ...base.env.storage,
+      head: async () => ({
+        checksums: { sha256: checksum },
+        etag: "existing",
+        size: 7,
+      }),
+      put: async () => null,
+    },
+  });
+  assert.equal(
+    (await handleRecordingUploadPart(request(), params, env)).status,
+    409
+  );
 });
 
 test("matching existing R2 retry returns 200 without deleting", async () => {
   const base = setup();
-  const { env, deletes } = setup({
+  const { env } = setup({
     storage: {
       ...base.env.storage,
       head: async () => ({
@@ -155,12 +205,11 @@ test("matching existing R2 retry returns 200 without deleting", async () => {
     (await handleRecordingUploadPart(request(), params, env)).status,
     201
   );
-  assert.deepEqual(deletes, []);
 });
 
 test("mismatching existing R2 retry returns 409 without deleting", async () => {
   const base = setup();
-  const { env, deletes } = setup({
+  const { env } = setup({
     storage: {
       ...base.env.storage,
       head: async () => ({
@@ -175,7 +224,6 @@ test("mismatching existing R2 retry returns 409 without deleting", async () => {
     (await handleRecordingUploadPart(request(), params, env)).status,
     409
   );
-  assert.deepEqual(deletes, []);
 });
 
 test("malformed sequence is rejected", async () => {

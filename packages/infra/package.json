@@ -15,6 +15,7 @@
   "devDependencies": {
     "typescript": "catalog:",
     "@interview-web/config": "workspace:*",
-    "alchemy": "catalog:"
+    "alchemy": "catalog:",
+    "@cloudflare/vite-plugin": "1.44.0"
   }
 }

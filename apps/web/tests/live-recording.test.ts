@@ -198,7 +198,7 @@ it("uses exact blob checksum and upload headers", async () => {
   expect(request.headers.get("X-Content-SHA256")).toBe(
     "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
   );
-  expect(await new Response(request.body).text()).toBe("hello");
+  expect(await request.text()).toBe("hello");
 });
 
 it("several parts can be persisted and uploaded while active", async () => {

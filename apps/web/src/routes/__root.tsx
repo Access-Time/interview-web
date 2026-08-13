@@ -1,17 +1,13 @@
 import { Toaster } from "@interview-web/ui/components/sonner";
 import type { QueryClient } from "@tanstack/react-query";
 
-import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
-
 import {
   createRootRouteWithContext,
   HeadContent,
   Outlet,
   Scripts,
 } from "@tanstack/react-router";
-import { TanStackRouterDevtools } from "@tanstack/react-router-devtools";
 import type { orpc } from "@/utils/orpc";
-import Header from "../components/header";
 import appCss from "../index.css?url";
 export interface RouterAppContext {
   orpc: typeof orpc;
@@ -36,7 +32,7 @@ export const Route = createRootRouteWithContext<RouterAppContext>()({
         name: "viewport",
       },
       {
-        title: "My App",
+        title: "Video introduction",
       },
     ],
   }),
@@ -49,13 +45,8 @@ function RootDocument() {
         <HeadContent />
       </head>
       <body>
-        <div className="grid h-svh grid-rows-[auto_1fr]">
-          <Header />
-          <Outlet />
-        </div>
+        <Outlet />
         <Toaster richColors />
-        <TanStackRouterDevtools position="bottom-left" />
-        <ReactQueryDevtools buttonPosition="bottom-right" position="bottom" />
         <Scripts />
       </body>
     </html>

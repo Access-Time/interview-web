@@ -13,6 +13,7 @@ const migrationFiles = [
   "0001_sticky_lionheart.sql",
   "0002_adorable_butterfly.sql",
   "0003_durable_finalization.sql",
+  "0004_even_starhawk.sql",
 ];
 
 async function applyMigrations(client, files = migrationFiles) {
@@ -108,6 +109,11 @@ test("0003 preserves a live recording manifest during replay", async (t) => {
     ).rows[0].count,
     2
   );
+
+  const todoTable = await client.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'todo'"
+  );
+  assert.equal(todoTable.rows.length, 0);
 
   const triggers = await client.execute(
     "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"

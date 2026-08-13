@@ -194,8 +194,10 @@ it("reconstructs parts within segments but keeps segments separate", async () =>
       )
     )
   ).toEqual([[Buffer.from("a"), Buffer.from("b")], [Buffer.from("c")]]);
-  expect(inputs.every(({ args }) => args[args.indexOf("-f") + 1] === "concat"));
-  expect(inputs.every(({ input }) => input.endsWith(".txt")));
+  expect(
+    inputs.every(({ args }) => args[args.indexOf("-f") + 1] === "concat")
+  ).toBe(true);
+  expect(inputs.every(({ input }) => input.endsWith(".txt"))).toBe(true);
   expect(inputs[0].input).not.toBe(inputs[1].input);
 });
 

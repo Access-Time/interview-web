@@ -111,7 +111,9 @@ it("passes Content-Type to acknowledgement and returns authoritative media type"
   );
   expect(acknowledgedMediaType).toBe("video/webm");
   const body: unknown = await response.json();
-  expect(body && typeof body === "object" && "mediaType" in body).toBeTruthy();
+  if (!body || typeof body !== "object" || !("mediaType" in body)) {
+    throw new Error("Expected upload response to include mediaType");
+  }
   expect(body.mediaType).toBe("video/webm;codecs=opus");
 });
 

@@ -133,9 +133,13 @@ function harness(
     },
   };
   const request = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestInit =
+      init?.body instanceof Blob
+        ? { ...init, body: await init.body.arrayBuffer() }
+        : init;
     events.push("request");
     calls.push(
-      new Request(new URL(input.toString(), "http://localhost"), init)
+      new Request(new URL(input.toString(), "http://localhost"), requestInit)
     );
     return await response;
   };
@@ -194,9 +198,7 @@ it("uses exact blob checksum and upload headers", async () => {
   expect(request.headers.get("X-Content-SHA256")).toBe(
     "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
   );
-  expect(await request.blob()).toEqual(
-    new Blob(["hello"], { type: "video/webm" })
-  );
+  expect(await new Response(request.body).text()).toBe("hello");
 });
 
 it("several parts can be persisted and uploaded while active", async () => {

@@ -1,5 +1,4 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-// @ts-expect-error jsdom ships no declarations in this workspace.
 import React from "react";
 import { afterEach, expect, it } from "vitest";
 import {
@@ -15,7 +14,6 @@ const globalProperties = [
   "indexedDB",
   "MediaRecorder",
   "fetch",
-  "IS_REACT_ACT_ENVIRONMENT",
 ];
 
 function installIndexedDb() {
@@ -120,11 +118,6 @@ function installBrowserGlobals() {
       Object.getOwnPropertyDescriptor(globalThis, property)
     );
   }
-  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
-    configurable: true,
-    value: true,
-    writable: true,
-  });
   installIndexedDb();
 }
 

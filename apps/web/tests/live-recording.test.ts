@@ -4,6 +4,9 @@ import {
   createLiveRecordingOutbox,
   isRetryableRecordingFailure,
   type RecordingPart,
+  type RecordingSession,
+  recordingIntentMetadata,
+  recordingRemoteAction,
 } from "../src/recording/live-recording.ts";
 
 const part: RecordingPart = {
@@ -14,6 +17,8 @@ const part: RecordingPart = {
   sessionId: "session",
 };
 const STORAGE_ERROR = /storage unavailable/;
+const PENDING_ERROR = /pending/i;
+const UPLOAD_ERROR = /upload failed|pending/i;
 
 function harness(
   response: Response | Promise<Response> = new Response(null, { status: 201 })
@@ -218,4 +223,129 @@ test("terminal upload failure is retained and does not retry when online", async
   assert.equal(box.saveState, "error");
   assert.equal(errors.length, 1);
   box.dispose();
+});
+
+test("drain does not resolve while offline work is pending", async () => {
+  const h = harness();
+  await h.box.setOnline(false);
+  await h.box.add(part);
+  await assert.rejects(h.box.drain(), PENDING_ERROR);
+  await h.box.setOnline(true);
+  await h.box.drain();
+  assert.equal(h.box.pendingCount, 0);
+});
+
+test("drain rejects terminal failures", async () => {
+  const box = createLiveRecordingOutbox(
+    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    async () => new Response(null, { status: 409 })
+  );
+  await box.add(part);
+  await assert.rejects(box.drain(), UPLOAD_ERROR);
+  box.dispose();
+});
+
+test("reuses zero-tail intent metadata for remote retry", () => {
+  const session: RecordingSession = {
+    recorderMimeType: "video/webm;codecs=vp8,opus",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 0, segmentId: "tail" }],
+    sessionId: "session",
+    status: "recording",
+  };
+  assert.deepEqual(
+    recordingIntentMetadata(session, {
+      recorderMimeType: "video/mp4",
+      requestedMimeType: "video/mp4",
+    }),
+    {
+      recorderMimeType: session.recorderMimeType,
+      requestedMimeType: session.requestedMimeType,
+    }
+  );
+});
+
+test("selects create for an initial tail and append for later tails", () => {
+  const initial: RecordingSession = {
+    recorderMimeType: null,
+    requestedMimeType: null,
+    segments: [{ partCount: 0, segmentId: "initial" }],
+    sessionId: "session",
+    status: "recording",
+  };
+  const later = {
+    ...initial,
+    segments: [...initial.segments, { partCount: 0, segmentId: "later" }],
+  };
+  assert.equal(recordingRemoteAction(initial, true), "create");
+  assert.equal(recordingRemoteAction(later, true), "append");
+  assert.equal(recordingRemoteAction(undefined, false), "create");
+  assert.equal(recordingRemoteAction(later, false), "append");
+});
+
+test("allows retrying an empty fifth tail but not adding a sixth", () => {
+  const fifth: RecordingSession = {
+    recorderMimeType: null,
+    requestedMimeType: null,
+    segments: Array.from({ length: 5 }, (_, index) => ({
+      partCount: index === 4 ? 0 : 1,
+      segmentId: `segment-${index}`,
+    })),
+    sessionId: "session",
+    status: "recording",
+  };
+  assert.equal(fifth.segments.at(-1)?.partCount, 0);
+  assert.equal(recordingRemoteAction(fifth, true), "append");
+  assert.equal(fifth.segments.length, 5);
+});
+
+test("keeps orphan parts without fabricating session metadata", async () => {
+  const sessions: RecordingSession[] = [];
+  const parts = [
+    { ...part, segmentId: "a1", sequence: 0, sessionId: "a" },
+    { ...part, segmentId: "a2", sequence: 4, sessionId: "a" },
+    { ...part, segmentId: "b1", sequence: 2, sessionId: "b" },
+  ];
+  const box = createLiveRecordingOutbox(
+    {
+      delete: () => Promise.resolve(),
+      listParts: () => Promise.resolve(parts),
+      listSessions: () => Promise.resolve(sessions),
+      put: () => Promise.resolve(),
+      putSession: (value) => {
+        sessions.push(value);
+        return Promise.resolve();
+      },
+    },
+    async () => new Response(null, { status: 503 })
+  );
+  await box.hydrate();
+  assert.deepEqual(sessions, []);
+  assert.equal(box.pendingCount, 3);
+  box.dispose();
+});
+
+test("savePartAndSession reports durable persistence failure", async () => {
+  const errors: unknown[] = [];
+  const box = createLiveRecordingOutbox(
+    {
+      delete: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+      putPartAndSession: () => Promise.reject(new Error("storage unavailable")),
+    },
+    fetch,
+    (error) => errors.push(error)
+  );
+  await assert.rejects(
+    box.savePartAndSession(part, {
+      recorderMimeType: "video/webm",
+      requestedMimeType: "video/webm",
+      segments: [{ partCount: 4, segmentId: part.segmentId }],
+      sessionId: part.sessionId,
+      status: "recording",
+    }),
+    STORAGE_ERROR
+  );
+  assert.equal(box.saveState, "error");
+  assert.equal(errors.length, 1);
 });

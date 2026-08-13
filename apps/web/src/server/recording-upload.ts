@@ -1,8 +1,27 @@
 const SHA256_PATTERN = /^[0-9a-f]{64}$/i;
+type Sha256Checksum = string | ArrayBuffer | ArrayBufferView;
+
+function normalizeSha256Checksum(checksum: Sha256Checksum): string | undefined {
+  if (typeof checksum === "string") {
+    return checksum.toLowerCase();
+  }
+  const bytes =
+    checksum instanceof ArrayBuffer
+      ? new Uint8Array(checksum)
+      : new Uint8Array(
+          checksum.buffer,
+          checksum.byteOffset,
+          checksum.byteLength
+        );
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    ""
+  );
+}
 
 export interface RecordingUploadStorage {
+  delete: (key: string) => Promise<void>;
   head: (key: string) => Promise<{
-    checksums: { sha256?: string };
+    checksums: { sha256?: Sha256Checksum };
     etag: string;
     size: number;
   } | null>;
@@ -58,7 +77,10 @@ async function storeRecordingUploadPart(
     }
 
     const existing = await storage.head(objectKey);
-    if (!existing || existing.checksums.sha256?.toLowerCase() !== checksum) {
+    if (
+      !existing ||
+      normalizeSha256Checksum(existing.checksums.sha256 ?? "") !== checksum
+    ) {
       return new Response(null, { status: 409 });
     }
     return { newlyStored: false, stored: existing };

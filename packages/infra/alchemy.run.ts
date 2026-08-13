@@ -1,5 +1,12 @@
 import alchemy from "alchemy";
-import { D1Database, R2Bucket, TanStackStart } from "alchemy/cloudflare";
+import {
+  Container,
+  D1Database,
+  Queue,
+  R2Bucket,
+  TanStackStart,
+  Worker,
+} from "alchemy/cloudflare";
 import { config } from "dotenv";
 
 config({ path: "./.env" });
@@ -15,13 +22,50 @@ const recordings = await R2Bucket("recordings", {
   devDomain: false,
 });
 
+const finalizationQueue = await Queue("finalization", {
+  name: "recording-finalizations",
+});
+
 export const web = await TanStackStart("web", {
   bindings: {
     CORS_ORIGIN: alchemy.env.CORS_ORIGIN ?? "*",
     DB: db,
+    FINALIZATION_QUEUE: finalizationQueue,
     RECORDINGS: recordings,
   },
   cwd: "../../apps/web",
+});
+
+const tokenValue = process.env.FINALIZER_TOKEN;
+if (!tokenValue) {
+  throw new Error("FINALIZER_TOKEN is required for finalizer deployment");
+}
+const token = alchemy.secret(tokenValue);
+const finalizerContainer = await Container("recording-finalizer-container", {
+  build: {
+    context: "../../packages/finalizer",
+    dockerfile: "Dockerfile",
+    platform: "linux/amd64",
+  },
+  className: "RecordingFinalizerContainer",
+  maxInstances: 1,
+});
+export const finalizer = await Worker("recording-finalizer", {
+  bindings: {
+    DB: db,
+    FINALIZATION_QUEUE: finalizationQueue,
+    FINALIZER: finalizerContainer,
+    FINALIZER_TOKEN: token,
+    RECORDINGS: recordings,
+  },
+  crons: ["*/15 * * * *"],
+  entrypoint: "../../packages/finalizer/src/worker.ts",
+  eventSources: [
+    {
+      queue: finalizationQueue,
+      settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5 },
+    },
+  ],
 });
 
 console.log(`Web    -> ${web.url}`);

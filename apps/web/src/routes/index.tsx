@@ -24,7 +24,8 @@ export const Route = createFileRoute("/")({
   head: () => ({ meta: [{ title: "Video introduction" }] }),
 });
 
-type PendingAction = "initialize" | "start" | "stop";
+type PendingAction = "initialize" | "retry" | "start" | "stop";
+type FinalizationState = "idle" | "queued" | "finalizing" | "ready" | "failed";
 
 const PERMISSION_ERROR = /permission|notallowed|denied|security/;
 const DEVICE_ERROR = /notfound|device|camera|microphone|media/;
@@ -65,15 +66,6 @@ const PENDING_GUIDANCE: Record<SaveState, string> = {
   retrying: "Keep this browser tab open while saving tries again.",
 };
 
-const STOPPED_GUIDANCE: Record<SaveState, string> = {
-  error:
-    "Saving needs attention and will not retry automatically. Keep this tab open and check your connection.",
-  healthy: "Capture stopped. Saving is up to date.",
-  offline:
-    "Capture stopped. Keep this tab open; saving resumes when your connection returns.",
-  retrying: "Capture stopped. Keep this tab open while saving tries again.",
-};
-
 const NETWORK_GUIDANCE: Record<SaveState, string> = {
   error:
     "Saving stopped and is not retrying automatically. Keep this tab open and check your connection. Use Try again if it becomes available.",
@@ -109,7 +101,7 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
   );
   const [actionError, setActionError] = useState<string | null>(null);
   const [hasStopped, setHasStopped] = useState(false);
-  const { initialize, start, stop } = recording;
+  const { initialize, retryFinalization, start, stop } = recording;
 
   const perform = useCallback(
     async (action: PendingAction, task: () => Promise<void>) => {
@@ -142,9 +134,14 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
     perform("stop", stopAndMark).catch(() => undefined);
   }, [perform, stop]);
 
+  const handleRetryFinalization = useCallback(() => {
+    perform("retry", retryFinalization).catch(() => undefined);
+  }, [perform, retryFinalization]);
+
   return {
     actionError,
     handleInitialize,
+    handleRetryFinalization,
     handleStart,
     handleStop,
     hasStopped,
@@ -268,16 +265,30 @@ function DeviceIndicators() {
 }
 
 function getControlCopy({
+  finalizationState,
   hasStopped,
   isReady,
   isRecording,
 }: {
+  finalizationState: FinalizationState;
   hasStopped: boolean;
   isReady: boolean;
   isRecording: boolean;
 }) {
   if (hasStopped) {
-    return { heading: "Your capture has stopped.", label: "Capture complete" };
+    if (finalizationState === "ready") {
+      return { heading: "Your video has been submitted.", label: "Complete" };
+    }
+    if (finalizationState === "failed") {
+      return {
+        heading: "Your recording is saved.",
+        label: "Finalization needs attention",
+      };
+    }
+    return {
+      heading: "We’re preparing your submission.",
+      label: "Capture complete",
+    };
   }
   if (isRecording) {
     return {
@@ -292,23 +303,25 @@ function getControlCopy({
 }
 
 function RecordingAction({
+  finalizationState,
   hasStopped,
   isReady,
   isRecording,
   onInitialize,
+  onRetryFinalization,
   onStart,
   onStop,
   pendingAction,
-  stoppedGuidance,
 }: {
+  finalizationState: FinalizationState;
   hasStopped: boolean;
   isReady: boolean;
   isRecording: boolean;
   onInitialize: () => void;
+  onRetryFinalization: () => void;
   onStart: () => void;
   onStop: () => void;
   pendingAction: PendingAction | null;
-  stoppedGuidance: string;
 }) {
   if (!isReady) {
     return (
@@ -340,10 +353,67 @@ function RecordingAction({
     );
   }
   if (hasStopped) {
+    if (finalizationState === "ready") {
+      return (
+        <div
+          className="flex gap-3 border border-emerald-400/25 bg-emerald-400/10 p-4 text-emerald-100"
+          role="status"
+        >
+          <CloudCheck
+            aria-hidden="true"
+            className="mt-0.5 size-5 shrink-0 text-emerald-300"
+          />
+          <p className="text-sm leading-6">
+            Your submission has been validated and is ready to retrieve.
+          </p>
+        </div>
+      );
+    }
+    if (finalizationState === "failed") {
+      return (
+        <div aria-live="polite">
+          <div className="flex gap-3 border border-amber-300/25 bg-amber-300/10 p-4 text-amber-100">
+            <AlertTriangle
+              aria-hidden="true"
+              className="mt-0.5 size-5 shrink-0 text-amber-300"
+            />
+            <p className="text-sm leading-6">
+              Your recorded source is still saved. We couldn’t finish the
+              submission. Keep this tab open and try finalization again.
+            </p>
+          </div>
+          <Button
+            className="mt-3 h-12 w-full bg-lime-300 px-5 font-bold text-[#11150e] text-sm hover:bg-lime-200 focus-visible:ring-lime-300/60"
+            disabled={pendingAction !== null}
+            onClick={onRetryFinalization}
+            type="button"
+          >
+            <RotateCw
+              aria-hidden="true"
+              className={pendingAction === "retry" ? "animate-spin" : ""}
+            />
+            {pendingAction === "retry" ? "Retrying…" : "Retry finalization"}
+          </Button>
+        </div>
+      );
+    }
     return (
-      <p className="border-lime-300 border-l-2 pl-4 text-sm text-stone-300 leading-6">
-        {stoppedGuidance}
-      </p>
+      <div aria-live="polite" className="flex gap-3" role="status">
+        <RotateCw
+          aria-hidden="true"
+          className="mt-1 size-4 shrink-0 animate-spin text-lime-300"
+        />
+        <div>
+          <p className="text-sm text-stone-200 leading-6">
+            {finalizationState === "finalizing"
+              ? "We’re validating and finishing your submission."
+              : "Your submission is queued and will begin shortly."}
+          </p>
+          <p className="mt-1 text-sm text-stone-400 leading-6">
+            Keep this tab open until your submission is complete.
+          </p>
+        </div>
+      </div>
     );
   }
   return (
@@ -363,6 +433,7 @@ function RecordingControls({
   actionError,
   hasStopped,
   onInitialize,
+  onRetryFinalization,
   onStart,
   onStop,
   pendingAction,
@@ -371,21 +442,26 @@ function RecordingControls({
   actionError: string | null;
   hasStopped: boolean;
   onInitialize: () => void;
+  onRetryFinalization: () => void;
   onStart: () => void;
   onStop: () => void;
   pendingAction: PendingAction | null;
   recording: UseLiveRecordingResult;
 }) {
+  const finalizationState = recording.finalization?.state ?? "idle";
   const copy = getControlCopy({
+    finalizationState,
     hasStopped,
     isReady: recording.isReady,
     isRecording: recording.isRecording,
   });
   const displayedError =
-    actionError ??
-    (recording.error
-      ? usefulError(recording.error, recording.saveState)
-      : null);
+    finalizationState === "failed"
+      ? null
+      : (actionError ??
+        (recording.error
+          ? usefulError(recording.error, recording.saveState)
+          : null));
 
   return (
     <div className="border border-white/10 bg-[#151916]/95 p-5 shadow-black/20 shadow-xl sm:p-7">
@@ -418,14 +494,15 @@ function RecordingControls({
 
       <div className="mt-6">
         <RecordingAction
+          finalizationState={finalizationState}
           hasStopped={hasStopped}
           isReady={recording.isReady}
           isRecording={recording.isRecording}
           onInitialize={onInitialize}
+          onRetryFinalization={onRetryFinalization}
           onStart={onStart}
           onStop={onStop}
           pendingAction={pendingAction}
-          stoppedGuidance={STOPPED_GUIDANCE[recording.saveState]}
         />
       </div>
     </div>
@@ -492,9 +569,14 @@ function SaveStatus({ recording }: { recording: UseLiveRecordingResult }) {
 
 function HomeComponent() {
   const recording = useLiveRecording({
+    appendSegment: (input) => client.recording.appendSegment(input),
     createSession: (input) => client.recording.create(input),
+    finalizeSession: (input) => client.recording.finalize(input),
+    getFinalizationStatus: (input) => client.recording.getStatus(input),
   });
   const controls = useRecordingControls(recording);
+  const finalizationState = recording.finalization?.state ?? "idle";
+  const hasStopped = controls.hasStopped || finalizationState !== "idle";
 
   return (
     <main className="relative min-h-0 overflow-y-auto bg-[#0b0e0c] text-stone-100 selection:bg-lime-300 selection:text-[#10130d]">
@@ -525,7 +607,7 @@ function HomeComponent() {
           </div>
 
           <Preview
-            hasStopped={controls.hasStopped}
+            hasStopped={hasStopped}
             isReady={recording.isReady}
             isRecording={recording.isRecording}
             stream={recording.stream}
@@ -535,8 +617,9 @@ function HomeComponent() {
         <aside aria-label="Recording controls" className="lg:pt-16">
           <RecordingControls
             actionError={controls.actionError}
-            hasStopped={controls.hasStopped}
+            hasStopped={hasStopped}
             onInitialize={controls.handleInitialize}
+            onRetryFinalization={controls.handleRetryFinalization}
             onStart={controls.handleStart}
             onStop={controls.handleStop}
             pendingAction={controls.pendingAction}

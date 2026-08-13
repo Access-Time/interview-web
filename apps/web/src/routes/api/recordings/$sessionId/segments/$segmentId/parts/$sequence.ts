@@ -16,19 +16,12 @@ export const Route = createFileRoute(
           acknowledge: (input) =>
             acknowledgeRecordingUploadPart(createDb(), input),
           storage: {
+            delete: (key) => env.RECORDINGS.delete(key),
             head: async (key) => {
               const object = await env.RECORDINGS.head(key);
-              const sha256 = object?.checksums?.sha256;
               return object
                 ? {
-                    checksums: {
-                      sha256:
-                        sha256 instanceof ArrayBuffer
-                          ? Array.from(new Uint8Array(sha256), (byte) =>
-                              byte.toString(16).padStart(2, "0")
-                            ).join("")
-                          : undefined,
-                    },
+                    checksums: { sha256: object.checksums?.sha256 },
                     etag: object.etag,
                     size: object.size,
                   }

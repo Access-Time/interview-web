@@ -1,16 +1,29 @@
 import type {
+  AppendRecordingSegmentInput,
+  AppendRecordingSegmentResult,
   CreateRecordingSessionInput,
   CreateRecordingSessionResult,
+  RecordingFinalizeInput,
+  RecordingFinalizeResult,
   RecordingManifest,
+  RecordingStatus,
 } from "@interview-web/db";
 
 export interface RecordingBindings {
+  appendRecordingSegment: (
+    input: AppendRecordingSegmentInput
+  ) => Promise<AppendRecordingSegmentResult>;
   createRecordingSession: (
     input: CreateRecordingSessionInput
   ) => Promise<CreateRecordingSessionResult>;
+  enqueueFinalization: (sessionId: string) => Promise<void>;
+  finalizeRecording: (
+    input: RecordingFinalizeInput
+  ) => Promise<RecordingFinalizeResult>;
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;
+  getRecordingStatus: (sessionId: string) => Promise<RecordingStatus | null>;
 }
 
 export function createContext(options: {

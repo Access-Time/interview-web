@@ -1,0 +1,19 @@
+{
+  "name": "@interview-web/finalizer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test server.test.js tests/*.test.js tests/*.test.ts",
+    "check-types": "tsc --noEmit -p tsconfig.json",
+    "docker:build": "docker build --platform linux/amd64 -t recording-finalizer ."
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7",
+    "@interview-web/db": "workspace:*"
+  },
+  "devDependencies": {
+    "@interview-web/config": "workspace:*",
+    "typescript": "catalog:"
+  }
+}

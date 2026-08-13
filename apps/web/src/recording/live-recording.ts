@@ -1,13 +1,39 @@
 import { useEffect, useRef, useState } from "react";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";
+export type RecordingFinalizationState =
+  | "queued"
+  | "finalizing"
+  | "ready"
+  | "failed";
+export interface RecordingFinalizationStatus {
+  status: RecordingFinalizationState;
+}
+export interface RecordingFinalizationResult {
+  error: string | null;
+  state: RecordingFinalizationState;
+}
+
+export function normalizeFinalizationStatus(
+  result: unknown
+): RecordingFinalizationState | null {
+  if (typeof result !== "object" || result === null || !("status" in result)) {
+    return null;
+  }
+  const status = String(result.status);
+  return ["queued", "finalizing", "ready", "failed"].includes(status)
+    ? (status as RecordingFinalizationState)
+    : null;
+}
 
 export interface UseLiveRecordingResult {
   error: string | null;
+  finalization: RecordingFinalizationResult | null;
   initialize: () => Promise<void>;
   isReady: boolean;
   isRecording: boolean;
   pendingPartCount: number;
+  retryFinalization: () => Promise<void>;
   saveState: RecordingSaveState;
   start: () => Promise<void>;
   stop: () => Promise<void>;
@@ -22,9 +48,58 @@ export interface RecordingPart {
   sessionId: string;
 }
 
+export interface RecordingSegment {
+  partCount: number;
+  segmentId: string;
+}
+
+export interface RecordingSession {
+  recorderMimeType: string | null;
+  requestedMimeType: string | null;
+  segments: RecordingSegment[];
+  sessionId: string;
+  status: "recording" | "sealed";
+}
+
+export function recordingIntentMetadata(
+  stored: RecordingSession | null | undefined,
+  current: { requestedMimeType: string | null; recorderMimeType: string | null }
+) {
+  return stored?.segments.at(-1)?.partCount === 0
+    ? {
+        recorderMimeType: stored.recorderMimeType,
+        requestedMimeType: stored.requestedMimeType,
+      }
+    : current;
+}
+
+export function recordingRemoteAction(
+  previous: RecordingSession | null | undefined,
+  resumeTail: boolean
+): "append" | "create" {
+  return !previous || (resumeTail && previous.segments.length === 1)
+    ? "create"
+    : "append";
+}
+
+const isPendingFinalizationState = (state: RecordingFinalizationState) =>
+  state === "queued" || state === "finalizing";
+
 interface PartStore {
   delete: (part: RecordingPart) => Promise<void>;
   put: (part: RecordingPart) => Promise<void>;
+}
+
+export interface RecordingRecoveryStore extends PartStore {
+  deleteSession?: (sessionId: string) => Promise<void>;
+  getSession?: (sessionId: string) => Promise<RecordingSession | undefined>;
+  listParts?: () => Promise<RecordingPart[]>;
+  listSessions?: () => Promise<RecordingSession[]>;
+  putPartAndSession?: (
+    part: RecordingPart,
+    session: RecordingSession
+  ) => Promise<void>;
+  putSession?: (session: RecordingSession) => Promise<void>;
 }
 
 type RecordingFailure = Error & {
@@ -63,13 +138,19 @@ const ignorePromise = (promise: Promise<unknown>) => {
   promise.catch(() => undefined);
 };
 
-function browserStore(): PartStore {
+function browserStore(): RecordingRecoveryStore {
   let database: Promise<IDBDatabase> | undefined;
   const open = () => {
     database ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open("live-recording-outbox", 1);
+      const request = indexedDB.open("live-recording-outbox", 2);
       request.onupgradeneeded = () => {
-        request.result.createObjectStore("parts", { keyPath: "id" });
+        const db = request.result;
+        if (!db.objectStoreNames.contains("parts")) {
+          db.createObjectStore("parts", { keyPath: "id" });
+        }
+        if (!db.objectStoreNames.contains("sessions")) {
+          db.createObjectStore("sessions", { keyPath: "sessionId" });
+        }
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () =>
@@ -81,13 +162,13 @@ function browserStore(): PartStore {
     `${part.sessionId}:${part.segmentId}:${part.sequence}`;
   const transaction = (
     mode: IDBTransactionMode,
-    action: (store: IDBObjectStore) => void
+    action: (parts: IDBObjectStore, sessions: IDBObjectStore) => void
   ) =>
     open().then(
       (db) =>
         new Promise<void>((resolve, reject) => {
-          const tx = db.transaction("parts", mode);
-          action(tx.objectStore("parts"));
+          const tx = db.transaction(["parts", "sessions"], mode);
+          action(tx.objectStore("parts"), tx.objectStore("sessions"));
           tx.oncomplete = () => resolve();
           tx.onerror = () =>
             reject(
@@ -102,15 +183,50 @@ function browserStore(): PartStore {
   return {
     delete: (part) =>
       transaction("readwrite", (store) => store.delete(key(part))),
+    deleteSession: (sessionId) =>
+      transaction("readwrite", (_, store) => store.delete(sessionId)),
+    listParts: () =>
+      open().then(
+        (db) =>
+          new Promise((resolve, reject) => {
+            const request = db
+              .transaction("parts")
+              .objectStore("parts")
+              .getAll();
+            request.onsuccess = () =>
+              resolve(request.result as RecordingPart[]);
+            request.onerror = () => reject(request.error);
+          })
+      ),
+    listSessions: () =>
+      open().then(
+        (db) =>
+          new Promise((resolve, reject) => {
+            const request = db
+              .transaction("sessions")
+              .objectStore("sessions")
+              .getAll();
+            request.onsuccess = () =>
+              resolve(request.result as RecordingSession[]);
+            request.onerror = () => reject(request.error);
+          })
+      ),
     put: (part) =>
       transaction("readwrite", (store) =>
         store.put({ ...part, id: key(part) })
       ),
+    putPartAndSession: (part, session) =>
+      transaction("readwrite", (parts, sessions) => {
+        parts.put({ ...part, id: key(part) });
+        sessions.put(session);
+      }),
+    putSession: (session) =>
+      transaction("readwrite", (_, store) => store.put(session)),
   };
 }
 
 export function createLiveRecordingOutbox(
-  store: PartStore = browserStore(),
+  store: RecordingRecoveryStore = browserStore(),
   request: typeof fetch = fetch,
   onError?: (error: unknown) => void
 ) {
@@ -118,6 +234,7 @@ export function createLiveRecordingOutbox(
   const pending = new Map<string, RecordingPart>();
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   const failed = new Set<string>();
+  const failureByKey = new Map<string, unknown>();
   const terminal = new Set<string>();
   let persistenceFailed = false;
   let disposed = false;
@@ -168,6 +285,7 @@ export function createLiveRecordingOutbox(
     if (!disposed) {
       pending.delete(key(part));
       failed.delete(key(part));
+      failureByKey.delete(key(part));
       onChange?.();
     }
   };
@@ -188,6 +306,7 @@ export function createLiveRecordingOutbox(
             return;
           }
           failed.add(partKey);
+          failureByKey.set(partKey, error);
           const retryable = isRetryableRecordingFailure(error);
           if (!retryable) {
             terminal.add(partKey);
@@ -210,6 +329,13 @@ export function createLiveRecordingOutbox(
     }
     await Promise.all(attempts);
   };
+  const hydrate = async () => {
+    const parts = (await store.listParts?.()) ?? [];
+    for (const item of parts) {
+      pending.set(key(item), item);
+    }
+    await flush();
+  };
   return {
     async add(part: RecordingPart) {
       try {
@@ -226,6 +352,9 @@ export function createLiveRecordingOutbox(
       pending.set(key(part), part);
       await flush();
     },
+    async deleteSession(sessionId: string) {
+      await store.deleteSession?.(sessionId);
+    },
     dispose() {
       disposed = true;
       if (retryTimer) {
@@ -234,8 +363,47 @@ export function createLiveRecordingOutbox(
       retryTimer = undefined;
       onChange = undefined;
     },
+    async drain() {
+      await flush();
+      if (pending.size) {
+        const failure = failureByKey.values().next().value;
+        throw markRecordingFailure(
+          failure ??
+            (online
+              ? "Recording uploads are still pending"
+              : "Recording uploads are pending while offline"),
+          failure && !isRetryableRecordingFailure(failure)
+            ? "fatal"
+            : "retryable"
+        );
+      }
+    },
+    getSessions() {
+      return store.listSessions?.() ?? [];
+    },
+    hydrate,
     get pendingCount() {
       return pending.size;
+    },
+    async savePartAndSession(part: RecordingPart, session: RecordingSession) {
+      try {
+        if (store.putPartAndSession) {
+          await store.putPartAndSession(part, session);
+        } else {
+          await store.put(part);
+          await store.putSession?.(session);
+        }
+      } catch (error) {
+        persistenceFailed = true;
+        const failure = markRecordingFailure(error, "fatal");
+        onError?.(failure);
+        throw failure;
+      }
+      pending.set(key(part), part);
+      await flush();
+    },
+    async saveSession(session: RecordingSession) {
+      await store.putSession?.(session);
     },
     get saveState(): RecordingSaveState {
       if (terminal.size || persistenceFailed) {
@@ -277,6 +445,19 @@ export function useLiveRecording(options: {
     requestedMimeType: string | null;
     recorderMimeType: string | null;
   }) => Promise<unknown>;
+  appendSegment: (input: {
+    sessionId: string;
+    segmentId: string;
+    requestedMimeType: string | null;
+    recorderMimeType: string | null;
+  }) => Promise<unknown>;
+  finalizeSession: (input: {
+    sessionId: string;
+    segments: Array<{ segmentId: string; partCount: number }>;
+  }) => Promise<unknown>;
+  getFinalizationStatus?: (input: {
+    sessionId: string;
+  }) => Promise<RecordingFinalizationStatus>;
 }): UseLiveRecordingResult {
   const outbox = useRef<ReturnType<typeof createLiveRecordingOutbox> | null>(
     null
@@ -285,14 +466,125 @@ export function useLiveRecording(options: {
   const sequence = useRef(0);
   const processing = useRef<Promise<void>[]>([]);
   const ids = useRef<{ sessionId: string; segmentId: string } | null>(null);
+  const session = useRef<RecordingSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const lifecycle = useRef<boolean | undefined>(undefined);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isReady, setReady] = useState(false);
   const [isRecording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [finalization, setFinalization] =
+    useState<RecordingFinalizationResult | null>(null);
+  const finalizationInput = useRef<{
+    sessionId: string;
+    segments: Array<{ segmentId: string; partCount: number }>;
+  } | null>(null);
+  const finalizationAttempted = useRef(false);
+  const finalizationRef = useRef<RecordingFinalizationResult | null>(null);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined
+  );
+  const pollGeneration = useRef(0);
+  const recoveryGeneration = useRef(0);
+  const recoveryPromise = useRef<Promise<void> | null>(null);
+  const finalizationInFlight = useRef<Promise<void> | null>(null);
+  const sealedPumpLock = useRef(false);
+  const sealedPlans = useRef<
+    Array<{
+      sessionId: string;
+      segments: Array<{ segmentId: string; partCount: number }>;
+    }>
+  >([]);
+  const submitSealedRef = useRef<(() => Promise<void>) | null>(null);
   const [, redraw] = useState(0);
 
+  const cancelFinalizationPolling = () => {
+    pollGeneration.current += 1;
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: timer refs are populated at runtime.
+    if (pollTimer.current) {
+      clearTimeout(pollTimer.current);
+    }
+    pollTimer.current = undefined;
+  };
+
+  const setFinalizationState = (value: RecordingFinalizationResult | null) => {
+    finalizationRef.current = value;
+    setFinalization(value);
+  };
+
+  const completeReadyFinalization = async (input: {
+    sessionId: string;
+    segments: Array<{ segmentId: string; partCount: number }>;
+  }) => {
+    await outbox.current?.deleteSession(input.sessionId);
+    sealedPlans.current = sealedPlans.current.filter(
+      (plan) => plan.sessionId !== input.sessionId
+    );
+    if (finalizationInput.current?.sessionId === input.sessionId) {
+      finalizationInput.current = null;
+    }
+    if (
+      !sealedPlans.current.length &&
+      session.current?.status === "recording"
+    ) {
+      setFinalizationState(null);
+    }
+    ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
+  };
+
+  const pollFinalization = async (generation: number) => {
+    const input = finalizationInput.current;
+    const getStatus = options.getFinalizationStatus;
+    const isDisposed = () => lifecycle.current === true;
+    if (
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: refs and optional callbacks are runtime state.
+      !(input && getStatus) ||
+      generation !== pollGeneration.current ||
+      isDisposed()
+    ) {
+      return;
+    }
+    try {
+      const status = normalizeFinalizationStatus(await getStatus(input));
+      if (status === null) {
+        throw new Error("Invalid finalization status");
+      }
+      if (generation !== pollGeneration.current || isDisposed()) {
+        return;
+      }
+      setFinalizationState({ error: null, state: status });
+      if (status === "ready") {
+        await completeReadyFinalization(input);
+      }
+      if (status === "queued" || status === "finalizing") {
+        pollTimer.current = setTimeout(() => {
+          pollTimer.current = undefined;
+          ignorePromise(pollFinalization(generation));
+        }, RETRY_DELAY);
+      }
+    } catch {
+      if (generation !== pollGeneration.current || isDisposed()) {
+        return;
+      }
+      pollTimer.current = setTimeout(() => {
+        pollTimer.current = undefined;
+        ignorePromise(pollFinalization(generation));
+      }, RETRY_DELAY);
+    }
+  };
+
+  const beginFinalizationPolling = () => {
+    cancelFinalizationPolling();
+    const generation = pollGeneration.current;
+    if (options.getFinalizationStatus) {
+      pollTimer.current = setTimeout(() => {
+        pollTimer.current = undefined;
+        ignorePromise(pollFinalization(generation));
+      }, RETRY_DELAY);
+    }
+  };
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: lifecycle effect intentionally runs once; mutable refs carry runtime callbacks.
   useEffect(() => {
     lifecycle.current = false;
     const box = createLiveRecordingOutbox(undefined, undefined, (cause) => {
@@ -308,14 +600,103 @@ export function useLiveRecording(options: {
       }
     });
     outbox.current = box;
-    const unsubscribe = box.subscribe(() => redraw((value) => value + 1));
-    const online = () => box.setOnline(true);
+    const unsubscribe = box.subscribe(() => {
+      redraw((value) => value + 1);
+      ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
+    });
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: sealed plans are intentionally drained and submitted in order.
+    const submitSealed = async () => {
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: this ref is a runtime serialization lock.
+      if (sealedPumpLock.current || finalizationInFlight.current) {
+        return;
+      }
+      sealedPumpLock.current = true;
+      try {
+        while (sealedPlans.current.length && !finalizationInFlight.current) {
+          const [plan] = sealedPlans.current;
+          finalizationInput.current = plan;
+          setFinalizationState({ error: null, state: "queued" });
+          try {
+            // biome-ignore lint/performance/noAwaitInLoops: each plan must complete before the next is submitted.
+            await box.drain();
+            finalizationAttempted.current = true;
+            const attempt = finalize(plan);
+            finalizationInFlight.current = attempt;
+            await attempt;
+            finalizationInFlight.current = null;
+            if (finalizationRef.current?.state !== "ready") {
+              return;
+            }
+            finalizationAttempted.current = false;
+          } catch (cause) {
+            finalizationInFlight.current = null;
+            if (
+              box.saveState !== "offline" &&
+              !isRetryableRecordingFailure(cause)
+            ) {
+              setError(cause instanceof Error ? cause.message : String(cause));
+            }
+            return;
+          }
+        }
+      } finally {
+        sealedPumpLock.current = false;
+      }
+    };
+    submitSealedRef.current = submitSealed;
+    const online = () => {
+      ignorePromise(
+        (async () => {
+          await box.setOnline(true);
+          await submitSealed();
+        })()
+      );
+    };
     const offline = () => box.setOnline(false);
     window.addEventListener("online", online);
     window.addEventListener("offline", offline);
     box.setOnline(navigator.onLine);
+    recoveryGeneration.current += 1;
+    const generation = recoveryGeneration.current;
+    recoveryPromise.current = (async () => {
+      await box.hydrate();
+      if (
+        generation !== recoveryGeneration.current ||
+        lifecycle.current === true
+      ) {
+        return;
+      }
+      const sessions = await box.getSessions();
+      const [stored] = sessions
+        .filter((item) => item.status === "recording")
+        .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+      if (stored) {
+        session.current = stored;
+        ids.current = {
+          segmentId: stored.segments.at(-1)?.segmentId ?? "",
+          sessionId: stored.sessionId,
+        };
+      }
+      sealedPlans.current = sessions
+        .filter((item) => item.status === "sealed")
+        .map((item) => ({
+          segments: item.segments,
+          sessionId: item.sessionId,
+        }));
+      if (sealedPlans.current.length) {
+        await submitSealed();
+      }
+    })();
+    ignorePromise(recoveryPromise.current);
     return () => {
       lifecycle.current = true;
+      recoveryGeneration.current += 1;
+      pollGeneration.current += 1;
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: timer refs are populated at runtime.
+      if (pollTimer.current) {
+        clearTimeout(pollTimer.current);
+      }
+      pollTimer.current = undefined;
       unsubscribe();
       window.removeEventListener("online", online);
       window.removeEventListener("offline", offline);
@@ -355,26 +736,63 @@ export function useLiveRecording(options: {
       );
     }
   };
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
+    await recoveryPromise.current;
+    if (sealedPlans.current.length) {
+      throw new Error("The previous recording is still being finalized");
+    }
     if (!stream) {
       throw new Error("Recording is not initialized");
     }
     const requested =
       MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
-    const sessionId = crypto.randomUUID();
-    const segmentId = crypto.randomUUID();
+    const previous = session.current;
+    if (previous?.status === "sealed") {
+      throw new Error("The previous recording is still being finalized");
+    }
+    const resumeTail = previous?.segments.at(-1)?.partCount === 0;
+    if (!resumeTail && (previous?.segments.length ?? 0) >= 5) {
+      throw new Error("A recording cannot contain more than five segments");
+    }
+    const sessionId = previous?.sessionId ?? crypto.randomUUID();
+    const segmentId = resumeTail
+      ? (previous.segments.at(-1)?.segmentId ?? crypto.randomUUID())
+      : crypto.randomUUID();
     const instance = requested
       ? new MediaRecorder(stream, { mimeType: requested })
       : new MediaRecorder(stream);
+    cancelFinalizationPolling();
+    finalizationAttempted.current = false;
+    finalizationInput.current = null;
+    setFinalizationState(null);
     ids.current = { segmentId, sessionId };
     sequence.current = 0;
     recorder.current = instance;
-    await options.createSession({
+    const metadata = {
       recorderMimeType: instance.mimeType || null,
       requestedMimeType: requested,
       segmentId,
       sessionId,
-    });
+    };
+    const intent = recordingIntentMetadata(previous, metadata);
+    const nextSession: RecordingSession = {
+      recorderMimeType: intent.recorderMimeType,
+      requestedMimeType: intent.requestedMimeType,
+      segments: resumeTail
+        ? previous.segments
+        : [...(previous?.segments ?? []), { partCount: 0, segmentId }],
+      sessionId,
+      status: "recording",
+    };
+    session.current = nextSession;
+    await outbox.current?.saveSession(nextSession);
+    const remoteMetadata = { ...metadata, ...intent };
+    if (recordingRemoteAction(previous, resumeTail) === "append") {
+      await options.appendSegment(remoteMetadata);
+    } else {
+      await options.createSession(remoteMetadata);
+    }
     if (lifecycle.current === true) {
       return;
     }
@@ -390,7 +808,24 @@ export function useLiveRecording(options: {
         sequence: sequence.current,
       };
       sequence.current += 1;
-      const work = outbox.current.add(part);
+      const currentSession = session.current;
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: session is established before MediaRecorder starts.
+      if (!currentSession) {
+        return;
+      }
+      const updatedSession = {
+        recorderMimeType: currentSession.recorderMimeType,
+        requestedMimeType: currentSession.requestedMimeType,
+        segments: currentSession.segments.map((segment) =>
+          segment.segmentId === part.segmentId
+            ? { ...segment, partCount: part.sequence + 1 }
+            : segment
+        ),
+        sessionId: currentSession.sessionId,
+        status: currentSession.status,
+      };
+      session.current = updatedSession;
+      const work = outbox.current.savePartAndSession(part, updatedSession);
       processing.current.push(work);
       work.then(
         () => {
@@ -431,14 +866,107 @@ export function useLiveRecording(options: {
       instance.addEventListener("stop", done, { once: true });
       instance.stop();
     });
-    await Promise.all(processing.current);
+    while (processing.current.length) {
+      // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
+      await Promise.all(processing.current);
+    }
+    const { current } = ids;
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: recording IDs are established before capture.
+    if (!(current && outbox.current)) {
+      return;
+    }
+    const plan = {
+      segments: session.current?.segments ?? [
+        { partCount: sequence.current, segmentId: current.segmentId },
+      ],
+      sessionId: current.sessionId,
+    };
+    const currentSession = session.current;
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: a recording session is established before stop.
+    if (!currentSession) {
+      throw new Error("Recording session is unavailable; press Start to retry");
+    }
+    if (plan.segments.some((segment) => segment.partCount === 0)) {
+      session.current = { ...currentSession, status: "recording" };
+      await outbox.current.saveSession(session.current);
+      throw new Error(
+        "Recording stopped before any media data was captured; press Start to retry"
+      );
+    }
+    session.current = {
+      ...currentSession,
+      segments: plan.segments,
+      status: "sealed",
+    };
+    await outbox.current.saveSession(session.current);
+    sealedPlans.current.push(plan);
+    finalizationInput.current ??= plan;
+    setFinalizationState({ error: null, state: "queued" });
+    await submitSealedRef.current?.();
+  };
+  const finalize = async (input: {
+    sessionId: string;
+    segments: Array<{ segmentId: string; partCount: number }>;
+  }) => {
+    cancelFinalizationPolling();
+    setFinalizationState({ error: null, state: "finalizing" });
+    try {
+      const result = await options.finalizeSession(input);
+      const state = normalizeFinalizationStatus(result);
+      if (state === null) {
+        throw new Error("Invalid finalization status");
+      }
+      setFinalizationState({ error: null, state });
+      if (state === "ready") {
+        await outbox.current?.deleteSession(input.sessionId);
+        sealedPlans.current = sealedPlans.current.filter(
+          (plan) => plan.sessionId !== input.sessionId
+        );
+        finalizationInput.current = null;
+        if (
+          !sealedPlans.current.length &&
+          session.current?.status === "recording"
+        ) {
+          setFinalizationState(null);
+        }
+        ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
+      }
+      if (isPendingFinalizationState(state)) {
+        beginFinalizationPolling();
+      }
+    } catch (cause) {
+      const retryable =
+        outbox.current?.saveState === "offline" ||
+        isRetryableRecordingFailure(cause);
+      if (retryable) {
+        finalizationAttempted.current = false;
+        setFinalizationState({ error: null, state: "queued" });
+        throw cause;
+      }
+      setFinalizationState({
+        error: cause instanceof Error ? cause.message : String(cause),
+        state: "failed",
+      });
+      throw cause;
+    }
+  };
+  const retryFinalization = async () => {
+    if (
+      finalizationRef.current?.state !== "failed" ||
+      !finalizationInput.current
+    ) {
+      return;
+    }
+    await submitSealedRef.current?.();
   };
   return {
     error,
+    finalization,
     initialize,
     isReady,
     isRecording,
     pendingPartCount: outbox.current?.pendingCount ?? 0,
+    retryFinalization,
     saveState: outbox.current?.saveState ?? "healthy",
     start,
     stop,

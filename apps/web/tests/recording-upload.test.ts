@@ -11,6 +11,7 @@ function setup(
     body: ReadableStream<Uint8Array>;
     options: unknown;
   }> = [];
+  const deletes: string[] = [];
   const env = {
     acknowledge: async (
       input: Parameters<NonNullable<typeof overrides.acknowledge>>[0]
@@ -23,6 +24,10 @@ function setup(
       objectKey: input.objectKey,
     }),
     storage: {
+      delete: (key: string) => {
+        deletes.push(key);
+        return Promise.resolve();
+      },
       head: async () => null,
       put: (
         key: string,
@@ -35,7 +40,7 @@ function setup(
     },
     ...overrides,
   };
-  return { env, puts };
+  return { deletes, env, puts };
 }
 
 const params = { segmentId: "g1", sequence: "2", sessionId: "s1" };
@@ -146,8 +151,8 @@ test("generic acknowledgement failure retains the new object", async () => {
   );
 });
 
-test("new-object manifest conflict retains the object", async () => {
-  const { env, puts } = setup({
+test("new-object manifest conflict retains the candidate for race safety", async () => {
+  const { deletes, env, puts } = setup({
     acknowledge: () => {
       const error = new Error("conflict");
       error.name = "RecordingUploadPartConflictError";
@@ -159,10 +164,12 @@ test("new-object manifest conflict retains the object", async () => {
     409
   );
   assert.equal(puts.length, 1);
+  // A concurrent acknowledgement may have made this object authoritative in D1.
+  assert.deepEqual(deletes, []);
 });
 
-test("new-object invalid ownership retains the object and returns 404", async () => {
-  const { env, puts } = setup({
+test("new-object invalid ownership retains the candidate and returns 404", async () => {
+  const { deletes, env, puts } = setup({
     acknowledge: () => {
       const error = new Error("ownership");
       error.name = "RecordingSegmentOwnershipError";
@@ -174,6 +181,7 @@ test("new-object invalid ownership retains the object and returns 404", async ()
     404
   );
   assert.equal(puts.length, 1);
+  assert.deepEqual(deletes, []);
 });
 
 test("pre-existing invalid ownership returns 404", async () => {
@@ -203,7 +211,7 @@ test("pre-existing invalid ownership returns 404", async () => {
 
 test("pre-existing-object manifest conflict returns 409", async () => {
   const base = setup();
-  const { env } = setup({
+  const { deletes, env } = setup({
     acknowledge: () => {
       const error = new Error("conflict");
       error.name = "RecordingUploadPartConflictError";
@@ -223,6 +231,29 @@ test("pre-existing-object manifest conflict returns 409", async () => {
     (await handleRecordingUploadPart(request(), params, env)).status,
     409
   );
+  assert.equal(deletes.length, 0);
+});
+
+test("new-object conflict does not attempt candidate deletion", async () => {
+  const { deletes, env } = setup({
+    acknowledge: () => {
+      const error = new Error("conflict");
+      error.name = "RecordingUploadPartConflictError";
+      throw error;
+    },
+    storage: {
+      ...setup().env.storage,
+      delete: (key: string) => {
+        deletes.push(key);
+        return Promise.reject(new Error("r2"));
+      },
+    },
+  });
+  assert.equal(
+    (await handleRecordingUploadPart(request(), params, env)).status,
+    409
+  );
+  assert.deepEqual(deletes, []);
 });
 
 test("matching existing R2 retry returns 200 without deleting", async () => {
@@ -241,6 +272,50 @@ test("matching existing R2 retry returns 200 without deleting", async () => {
   assert.equal(
     (await handleRecordingUploadPart(request(), params, env)).status,
     201
+  );
+});
+
+test("matching binary existing R2 checksums return 200", async () => {
+  const bytes = Uint8Array.from(checksum.match(/../g) ?? [], (byte) =>
+    Number.parseInt(byte, 16)
+  );
+  await Promise.all(
+    [bytes.buffer, bytes].map(async (sha256) => {
+      const base = setup();
+      const { env } = setup({
+        storage: {
+          ...base.env.storage,
+          head: async () => ({
+            checksums: { sha256 },
+            etag: "existing",
+            size: 7,
+          }),
+          put: async () => null,
+        },
+      });
+      assert.equal(
+        (await handleRecordingUploadPart(request(), params, env)).status,
+        201
+      );
+    })
+  );
+});
+
+test("mismatching binary existing R2 checksum returns 409", async () => {
+  const { env } = setup({
+    storage: {
+      ...setup().env.storage,
+      head: async () => ({
+        checksums: { sha256: new Uint8Array(32).buffer },
+        etag: "existing",
+        size: 7,
+      }),
+      put: async () => null,
+    },
+  });
+  assert.equal(
+    (await handleRecordingUploadPart(request(), params, env)).status,
+    409
   );
 });
 

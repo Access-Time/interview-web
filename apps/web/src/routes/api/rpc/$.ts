@@ -1,10 +1,14 @@
 import { createContext } from "@interview-web/api/context";
 import { appRouter } from "@interview-web/api/routers/index";
 import {
+  appendRecordingSegment,
   createDb,
   createRecordingSession,
+  finalizeRecording,
   getRecordingManifest,
+  getRecordingStatus,
 } from "@interview-web/db";
+import { env } from "@interview-web/env/server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
 import { onError } from "@orpc/server";
@@ -36,10 +40,18 @@ const apiHandler = new OpenAPIHandler(appRouter, {
 async function handle({ request }: { request: Request }) {
   const context = await createContext({
     bindings: {
+      appendRecordingSegment: (input) =>
+        appendRecordingSegment(createDb(), input),
       createRecordingSession: (input) =>
         createRecordingSession(createDb(), input),
+      enqueueFinalization: async (sessionId) => {
+        await env.FINALIZATION_QUEUE.send({ sessionId });
+      },
+      finalizeRecording: (input) => finalizeRecording(createDb(), input),
       getRecordingManifest: (sessionId) =>
         getRecordingManifest(createDb(), sessionId),
+      getRecordingStatus: (sessionId) =>
+        getRecordingStatus(createDb(), sessionId),
     },
   });
   const rpcResult = await rpcHandler.handle(request, {

@@ -1,9 +1,39 @@
-import { integer, sqliteTable, text, unique } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
+import {
+  check,
+  integer,
+  sqliteTable,
+  text,
+  unique,
+} from "drizzle-orm/sqlite-core";
 
-export const recordingSession = sqliteTable("recording_session", {
-  createdAt: integer("created_at").notNull(),
-  id: text("id").primaryKey(),
-});
+export const recordingSession = sqliteTable(
+  "recording_session",
+  {
+    createdAt: integer("created_at").notNull(),
+    failureCode: text("failure_code"),
+    finalizationAttempt: integer("finalization_attempt").notNull().default(0),
+    finalizePlan: text("finalize_plan"),
+    id: text("id").primaryKey(),
+    leaseExpiresAt: integer("lease_expires_at"),
+    manifestVersion: integer("manifest_version").notNull().default(0),
+    outputByteSize: integer("output_byte_size"),
+    outputChecksum: text("output_checksum"),
+    outputMediaType: text("output_media_type"),
+    outputObjectKey: text("output_object_key"),
+    status: text("status").notNull().default("recording"),
+  },
+  () => [
+    check(
+      "recording_session_status_check",
+      sql`status in ('recording','queued','finalizing','ready','failed','deleting')`
+    ),
+    check(
+      "recording_session_failure_code_check",
+      sql`failure_code is null or length(failure_code) <= 128`
+    ),
+  ]
+);
 
 export const recordingSegment = sqliteTable(
   "recording_segment",

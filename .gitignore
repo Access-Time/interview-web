@@ -60,3 +60,6 @@ coverage
 .cache
 tmp
 temp
+
+# Local orchestration state
+.slim/deepwork/

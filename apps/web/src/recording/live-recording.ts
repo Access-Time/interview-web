@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";
+export type RecordingIntegrity = "ok" | "gap" | "conflict";
 export type RecordingFinalizationState =
   | "queued"
   | "finalizing"
@@ -30,9 +31,11 @@ export interface UseLiveRecordingResult {
   error: string | null;
   finalization: RecordingFinalizationResult | null;
   initialize: () => Promise<void>;
+  integrity: RecordingIntegrity;
   isReady: boolean;
   isRecording: boolean;
   pendingPartCount: number;
+  recovered: boolean;
   retryFinalization: () => Promise<void>;
   saveState: RecordingSaveState;
   start: () => Promise<void>;
@@ -80,6 +83,186 @@ export function recordingRemoteAction(
   return !previous || (resumeTail && previous.segments.length === 1)
     ? "create"
     : "append";
+}
+
+export interface RecordingManifestView {
+  segments: Array<{
+    id: string;
+    parts: Array<{ checksum: string; sequence: number }>;
+  }>;
+  sessionId: string;
+}
+
+const partIdentity = (segmentId: string, sequence: number) =>
+  `${segmentId}:${sequence}`;
+
+export async function recordingBlobChecksum(blob: Blob): Promise<string> {
+  return Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", await blob.arrayBuffer())
+    ),
+    (byte) => byte.toString(16).padStart(2, "0")
+  ).join("");
+}
+
+export function integrityMessage(integrity: RecordingIntegrity): string | null {
+  if (integrity === "conflict") {
+    return "This recording has conflicting parts and cannot be finalized";
+  }
+  if (integrity === "gap") {
+    return "This recording is missing ordered parts and cannot be finalized";
+  }
+  return null;
+}
+
+function sequencesAreContiguous(sequences: Iterable<number>): boolean {
+  const unique = [...new Set(sequences)].sort((a, b) => a - b);
+  return unique.every((sequence, index) => sequence === index);
+}
+
+function acknowledgedChecksums(manifest: RecordingManifestView | null) {
+  const checksums = new Map<string, string>();
+  for (const segment of manifest?.segments ?? []) {
+    for (const part of segment.parts) {
+      checksums.set(
+        partIdentity(segment.id, part.sequence),
+        part.checksum.toLowerCase()
+      );
+    }
+  }
+  return checksums;
+}
+
+function segmentUnionSequences(
+  segmentId: string,
+  manifest: RecordingManifestView | null,
+  remaining: RecordingPart[]
+) {
+  const sequences = new Set<number>();
+  const remote = manifest?.segments.find((segment) => segment.id === segmentId);
+  for (const part of remote?.parts ?? []) {
+    sequences.add(part.sequence);
+  }
+  for (const part of remaining) {
+    if (part.segmentId === segmentId) {
+      sequences.add(part.sequence);
+    }
+  }
+  return sequences;
+}
+
+function refreshedPartCount(
+  current: number,
+  sequences: ReadonlySet<number>
+): number {
+  if (sequences.size === 0) {
+    return current;
+  }
+  return Math.max(current, Math.max(...sequences) + 1);
+}
+
+function classifyIntegrity(
+  conflicts: RecordingPart[],
+  session: RecordingSession,
+  manifest: RecordingManifestView,
+  remaining: RecordingPart[]
+): RecordingIntegrity {
+  if (conflicts.length > 0) {
+    return "conflict";
+  }
+  for (const segment of session.segments) {
+    const sequences = segmentUnionSequences(
+      segment.segmentId,
+      manifest,
+      remaining
+    );
+    if (segment.partCount === 0 && sequences.size === 0) {
+      continue;
+    }
+    if (
+      !sequencesAreContiguous(sequences) ||
+      sequences.size !== segment.partCount
+    ) {
+      return "gap";
+    }
+  }
+  return "ok";
+}
+
+export async function reconcileRecordingParts(input: {
+  localParts: RecordingPart[];
+  localSession: RecordingSession | null | undefined;
+  manifest: RecordingManifestView | null;
+}): Promise<{
+  conflicts: RecordingPart[];
+  drop: RecordingPart[];
+  integrity: RecordingIntegrity;
+  keep: RecordingPart[];
+  session: RecordingSession | null;
+}> {
+  const remote = acknowledgedChecksums(input.manifest);
+  const checksumEntries = input.manifest
+    ? await Promise.all(
+        input.localParts
+          .filter((part) =>
+            remote.has(partIdentity(part.segmentId, part.sequence))
+          )
+          .map(async (part) => {
+            const checksum = await recordingBlobChecksum(part.blob);
+            return [
+              partIdentity(part.segmentId, part.sequence),
+              checksum,
+            ] as const;
+          })
+      )
+    : [];
+  const localChecksums = new Map(checksumEntries);
+  const drop: RecordingPart[] = [];
+  const keep: RecordingPart[] = [];
+  const conflicts: RecordingPart[] = [];
+
+  for (const part of input.localParts) {
+    if (!input.manifest) {
+      keep.push(part);
+      continue;
+    }
+    const acknowledged = remote.get(
+      partIdentity(part.segmentId, part.sequence)
+    );
+    if (acknowledged === undefined) {
+      keep.push(part);
+      continue;
+    }
+    const checksum = localChecksums.get(
+      partIdentity(part.segmentId, part.sequence)
+    );
+    if (checksum === acknowledged) {
+      drop.push(part);
+      continue;
+    }
+    conflicts.push(part);
+  }
+
+  const remaining = [...keep, ...conflicts];
+  const session = input.localSession
+    ? {
+        ...input.localSession,
+        segments: input.localSession.segments.map((segment) => ({
+          ...segment,
+          partCount: refreshedPartCount(
+            segment.partCount,
+            segmentUnionSequences(segment.segmentId, input.manifest, remaining)
+          ),
+        })),
+      }
+    : null;
+
+  const integrity =
+    input.manifest && session
+      ? classifyIntegrity(conflicts, session, input.manifest, remaining)
+      : "ok";
+
+  return { conflicts, drop, integrity, keep, session };
 }
 
 const isPendingFinalizationState = (state: RecordingFinalizationState) =>
@@ -239,17 +422,11 @@ export function createLiveRecordingOutbox(
   let persistenceFailed = false;
   let disposed = false;
   let online = true;
+  let integrity: RecordingIntegrity = "ok";
   let onChange: (() => void) | undefined;
 
   const key = (part: RecordingPart) =>
     `${part.sessionId}:${part.segmentId}:${part.sequence}`;
-  const checksum = async (blob: Blob) =>
-    Array.from(
-      new Uint8Array(
-        await crypto.subtle.digest("SHA-256", await blob.arrayBuffer())
-      ),
-      (byte) => byte.toString(16).padStart(2, "0")
-    ).join("");
   const send = async (part: RecordingPart) => {
     let response: Response;
     try {
@@ -259,7 +436,7 @@ export function createLiveRecordingOutbox(
           body: part.blob,
           headers: {
             "Content-Type": part.mediaType || "application/octet-stream",
-            "X-Content-SHA256": await checksum(part.blob),
+            "X-Content-SHA256": await recordingBlobChecksum(part.blob),
           },
           method: "PUT",
         }
@@ -334,7 +511,71 @@ export function createLiveRecordingOutbox(
     for (const item of parts) {
       pending.set(key(item), item);
     }
+  };
+  const applyReconcile = async (
+    result: Awaited<ReturnType<typeof reconcileRecordingParts>>
+  ) => {
+    const { conflicts, drop, integrity: nextIntegrity, session } = result;
+    integrity = nextIntegrity;
+    await Promise.all(drop.map((item) => store.delete(item)));
+    for (const item of drop) {
+      pending.delete(key(item));
+      failed.delete(key(item));
+      failureByKey.delete(key(item));
+    }
+    for (const item of conflicts) {
+      terminal.add(key(item));
+    }
+    if (session) {
+      await store.putSession?.(session);
+    }
+    if (!disposed) {
+      onChange?.();
+    }
+  };
+  const recover = async (
+    getManifest?: (input: {
+      sessionId: string;
+    }) => Promise<RecordingManifestView | null>
+  ) => {
+    const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
+    const [stored] = sessions
+      .filter((item) => item.status === "recording")
+      .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+    if (stored && getManifest && online) {
+      let manifest: RecordingManifestView | null = null;
+      try {
+        manifest = await getManifest({ sessionId: stored.sessionId });
+      } catch {
+        manifest = null;
+      }
+      const localParts = [...pending.values()].filter(
+        (item) => item.sessionId === stored.sessionId
+      );
+      await applyReconcile(
+        await reconcileRecordingParts({
+          localParts,
+          localSession: stored,
+          manifest,
+        })
+      );
+    }
     await flush();
+    const session =
+      stored === undefined
+        ? null
+        : ((await store.getSession?.(stored.sessionId)) ?? stored);
+    return {
+      integrity,
+      recovered: Boolean(stored),
+      session,
+    };
+  };
+  const assertCanFinalize = () => {
+    const message = integrityMessage(integrity);
+    if (message) {
+      throw markRecordingFailure(message, "fatal");
+    }
   };
   return {
     async add(part: RecordingPart) {
@@ -352,6 +593,7 @@ export function createLiveRecordingOutbox(
       pending.set(key(part), part);
       await flush();
     },
+    assertCanFinalize,
     async deleteSession(sessionId: string) {
       await store.deleteSession?.(sessionId);
     },
@@ -382,9 +624,13 @@ export function createLiveRecordingOutbox(
       return store.listSessions?.() ?? [];
     },
     hydrate,
+    get integrity() {
+      return integrity;
+    },
     get pendingCount() {
       return pending.size;
     },
+    recover,
     async savePartAndSession(part: RecordingPart, session: RecordingSession) {
       try {
         if (store.putPartAndSession) {
@@ -414,13 +660,13 @@ export function createLiveRecordingOutbox(
       }
       return failed.size ? "retrying" : "healthy";
     },
-    async setOnline(value: boolean) {
+    async setOnline(value: boolean, options?: { flush?: boolean }) {
       online = value;
       if (!value && retryTimer) {
         clearTimeout(retryTimer);
         retryTimer = undefined;
       }
-      if (value) {
+      if (value && options?.flush !== false) {
         await flush();
       }
       if (!disposed) {
@@ -458,6 +704,9 @@ export function useLiveRecording(options: {
   getFinalizationStatus?: (input: {
     sessionId: string;
   }) => Promise<RecordingFinalizationStatus>;
+  getManifest?: (input: {
+    sessionId: string;
+  }) => Promise<RecordingManifestView | null>;
 }): UseLiveRecordingResult {
   const outbox = useRef<ReturnType<typeof createLiveRecordingOutbox> | null>(
     null
@@ -473,6 +722,7 @@ export function useLiveRecording(options: {
   const [isReady, setReady] = useState(false);
   const [isRecording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [recovered, setRecovered] = useState(false);
   const [finalization, setFinalization] =
     useState<RecordingFinalizationResult | null>(null);
   const finalizationInput = useRef<{
@@ -587,8 +837,9 @@ export function useLiveRecording(options: {
   // biome-ignore lint/correctness/useExhaustiveDependencies: lifecycle effect intentionally runs once; mutable refs carry runtime callbacks.
   useEffect(() => {
     lifecycle.current = false;
+    const isDisposed = () => lifecycle.current === true;
     const box = createLiveRecordingOutbox(undefined, undefined, (cause) => {
-      if (lifecycle.current === true) {
+      if (isDisposed()) {
         return;
       }
       if (isRetryableRecordingFailure(cause)) {
@@ -614,6 +865,15 @@ export function useLiveRecording(options: {
       try {
         while (sealedPlans.current.length && !finalizationInFlight.current) {
           const [plan] = sealedPlans.current;
+          try {
+            box.assertCanFinalize();
+          } catch (cause) {
+            const message =
+              cause instanceof Error ? cause.message : String(cause);
+            setError(message);
+            setFinalizationState({ error: message, state: "failed" });
+            return;
+          }
           finalizationInput.current = plan;
           setFinalizationState({ error: null, state: "queued" });
           try {
@@ -644,10 +904,34 @@ export function useLiveRecording(options: {
       }
     };
     submitSealedRef.current = submitSealed;
+    recoveryGeneration.current += 1;
+    const generation = recoveryGeneration.current;
+    const applyRecovery = async () => {
+      const recovery = await box.recover(options.getManifest);
+      if (generation !== recoveryGeneration.current || isDisposed()) {
+        return recovery;
+      }
+      if (recovery.recovered) {
+        setRecovered(true);
+      }
+      if (recovery.session) {
+        session.current = recovery.session;
+        ids.current = {
+          segmentId: recovery.session.segments.at(-1)?.segmentId ?? "",
+          sessionId: recovery.session.sessionId,
+        };
+      }
+      const message = integrityMessage(recovery.integrity);
+      if (message) {
+        setError(message);
+      }
+      return recovery;
+    };
     const online = () => {
       ignorePromise(
         (async () => {
-          await box.setOnline(true);
+          await box.setOnline(true, { flush: false });
+          await applyRecovery();
           await submitSealed();
         })()
       );
@@ -655,28 +939,17 @@ export function useLiveRecording(options: {
     const offline = () => box.setOnline(false);
     window.addEventListener("online", online);
     window.addEventListener("offline", offline);
-    box.setOnline(navigator.onLine);
-    recoveryGeneration.current += 1;
-    const generation = recoveryGeneration.current;
+    box.setOnline(navigator.onLine, { flush: false });
     recoveryPromise.current = (async () => {
       await box.hydrate();
-      if (
-        generation !== recoveryGeneration.current ||
-        lifecycle.current === true
-      ) {
+      if (generation !== recoveryGeneration.current || isDisposed()) {
+        return;
+      }
+      await applyRecovery();
+      if (generation !== recoveryGeneration.current || isDisposed()) {
         return;
       }
       const sessions = await box.getSessions();
-      const [stored] = sessions
-        .filter((item) => item.status === "recording")
-        .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-      if (stored) {
-        session.current = stored;
-        ids.current = {
-          segmentId: stored.segments.at(-1)?.segmentId ?? "",
-          sessionId: stored.sessionId,
-        };
-      }
       sealedPlans.current = sessions
         .filter((item) => item.status === "sealed")
         .map((item) => ({
@@ -726,7 +999,9 @@ export function useLiveRecording(options: {
       streamRef.current = acquired;
       setStream(acquired);
       setReady(true);
-      setError(null);
+      if (outbox.current?.integrity === "ok") {
+        setError(null);
+      }
     } catch (cause) {
       if (lifecycle.current === true) {
         return;
@@ -853,7 +1128,9 @@ export function useLiveRecording(options: {
     instance.start(5000);
     if (lifecycle.current === false || lifecycle.current === undefined) {
       setRecording(true);
-      setError(null);
+      if (outbox.current?.integrity === "ok") {
+        setError(null);
+      }
     }
   };
   const stop = async () => {
@@ -893,6 +1170,7 @@ export function useLiveRecording(options: {
         "Recording stopped before any media data was captured; press Start to retry"
       );
     }
+    outbox.current.assertCanFinalize();
     session.current = {
       ...currentSession,
       segments: plan.segments,
@@ -908,6 +1186,7 @@ export function useLiveRecording(options: {
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
   }) => {
+    outbox.current?.assertCanFinalize();
     cancelFinalizationPolling();
     setFinalizationState({ error: null, state: "finalizing" });
     try {
@@ -963,9 +1242,11 @@ export function useLiveRecording(options: {
     error,
     finalization,
     initialize,
+    integrity: outbox.current?.integrity ?? "ok",
     isReady,
     isRecording,
     pendingPartCount: outbox.current?.pendingCount ?? 0,
+    recovered,
     retryFinalization,
     saveState: outbox.current?.saveState ?? "healthy",
     start,

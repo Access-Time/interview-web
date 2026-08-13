@@ -9,6 +9,7 @@ import {
   HardDrive,
   Mic,
   RotateCw,
+  Smartphone,
   Square,
   WifiOff,
 } from "lucide-react";
@@ -31,6 +32,7 @@ const PERMISSION_ERROR = /permission|notallowed|denied|security/;
 const DEVICE_ERROR = /notfound|device|camera|microphone|media/;
 const STORAGE_ERROR = /storage|quota|indexeddb|store/;
 const NETWORK_ERROR = /network|fetch|upload|offline|connection/;
+const INTEGRITY_ERROR = /conflicting parts|missing ordered parts/;
 
 const SAVE_STATUS = {
   error: {
@@ -91,6 +93,9 @@ function usefulError(error: unknown, saveState: SaveState = "healthy") {
   }
   if (NETWORK_ERROR.test(normalized)) {
     return NETWORK_GUIDANCE[saveState];
+  }
+  if (INTEGRITY_ERROR.test(normalized)) {
+    return detail;
   }
   return "Something went wrong with the recording. Keep this page open and try the action again.";
 }
@@ -269,12 +274,20 @@ function getControlCopy({
   hasStopped,
   isReady,
   isRecording,
+  recovered,
 }: {
   finalizationState: FinalizationState;
   hasStopped: boolean;
   isReady: boolean;
   isRecording: boolean;
+  recovered: boolean;
 }) {
+  if (!hasStopped && recovered && !isRecording) {
+    return {
+      heading: "Your recording session was recovered.",
+      label: "Recovered after reload",
+    };
+  }
   if (hasStopped) {
     if (finalizationState === "ready") {
       return { heading: "Your video has been submitted.", label: "Complete" };
@@ -312,6 +325,7 @@ function RecordingAction({
   onStart,
   onStop,
   pendingAction,
+  recovered,
 }: {
   finalizationState: FinalizationState;
   hasStopped: boolean;
@@ -322,6 +336,7 @@ function RecordingAction({
   onStart: () => void;
   onStop: () => void;
   pendingAction: PendingAction | null;
+  recovered: boolean;
 }) {
   if (!isReady) {
     return (
@@ -424,9 +439,16 @@ function RecordingAction({
       type="button"
     >
       <Circle aria-hidden="true" className="fill-current" />
-      {pendingAction === "start" ? "Starting…" : "Start recording"}
+      {startLabel(pendingAction, recovered)}
     </Button>
   );
+}
+
+function startLabel(pendingAction: PendingAction | null, recovered: boolean) {
+  if (pendingAction === "start") {
+    return "Starting…";
+  }
+  return recovered ? "Continue recording" : "Start recording";
 }
 
 function RecordingControls({
@@ -454,6 +476,7 @@ function RecordingControls({
     hasStopped,
     isReady: recording.isReady,
     isRecording: recording.isRecording,
+    recovered: recording.recovered,
   });
   const displayedError =
     finalizationState === "failed"
@@ -479,6 +502,15 @@ function RecordingControls({
         </p>
       )}
 
+      {recording.recovered &&
+      !recording.isRecording &&
+      finalizationState === "idle" ? (
+        <p className="mt-3 text-sm text-stone-400 leading-6">
+          Acknowledged parts are still on the server, and queued parts stayed on
+          this device. Starting again continues this session as a new segment.
+        </p>
+      ) : null}
+
       {displayedError ? (
         <div
           className="mt-5 flex gap-3 border border-red-400/25 bg-red-400/10 p-3 text-red-100 text-sm leading-5"
@@ -503,6 +535,7 @@ function RecordingControls({
           onStart={onStart}
           onStop={onStop}
           pendingAction={pendingAction}
+          recovered={recording.recovered}
         />
       </div>
     </div>
@@ -563,7 +596,40 @@ function SaveStatus({ recording }: { recording: UseLiveRecordingResult }) {
           {PENDING_GUIDANCE[recording.saveState]}
         </p>
       ) : null}
+      <MobileRecordingGuidance />
     </section>
+  );
+}
+
+function useCoarsePointer() {
+  const [coarse, setCoarse] = useState(false);
+  useEffect(() => {
+    const media = window.matchMedia("(pointer: coarse)");
+    const sync = () => setCoarse(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+  return coarse;
+}
+
+function MobileRecordingGuidance() {
+  const coarse = useCoarsePointer();
+  if (!coarse) {
+    return null;
+  }
+  return (
+    <div className="mt-4 flex gap-3 border-white/10 border-t pt-4">
+      <Smartphone
+        aria-hidden="true"
+        className="mt-0.5 size-4 shrink-0 text-stone-500"
+      />
+      <p className="text-sm text-stone-400 leading-5">
+        Keep this browser in the foreground. Locking the screen, switching apps,
+        or backgrounding the tab can stop capture, and pending uploads may not
+        finish until you return.
+      </p>
+    </div>
   );
 }
 
@@ -573,10 +639,29 @@ function HomeComponent() {
     createSession: (input) => client.recording.create(input),
     finalizeSession: (input) => client.recording.finalize(input),
     getFinalizationStatus: (input) => client.recording.getStatus(input),
+    getManifest: async (input) => {
+      try {
+        return await client.recording.getManifest(input);
+      } catch {
+        return null;
+      }
+    },
   });
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
   const hasStopped = controls.hasStopped || finalizationState !== "idle";
+
+  useEffect(() => {
+    const warnPending = (event: BeforeUnloadEvent) => {
+      if (recording.pendingPartCount === 0) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnPending);
+    return () => window.removeEventListener("beforeunload", warnPending);
+  }, [recording.pendingPartCount]);
 
   return (
     <main className="relative min-h-0 overflow-y-auto bg-[#0b0e0c] text-stone-100 selection:bg-lime-300 selection:text-[#10130d]">

@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { CandidateRecordingJourney } from "@/recording/candidate-recording-journey";
 import {
+  type RecordingFinalizationState,
   type RecordingSaveState,
   type UseLiveRecordingResult,
   useLiveRecording,
@@ -31,36 +32,96 @@ const NETWORK_GUIDANCE: Record<RecordingSaveState, string> = {
   retrying: "Saving is delayed. Keep this tab open while we try again.",
 };
 
-function usefulError(
+interface CandidateError {
+  kind: "blocking" | "saving";
+  message: string;
+  title: string;
+}
+
+export function usefulError(
   error: unknown,
   saveState: RecordingSaveState = "healthy"
-) {
+): CandidateError {
   const detail = error instanceof Error ? error.message : String(error);
   const normalized = detail.toLowerCase();
 
   if (PERMISSION_ERROR.test(normalized)) {
-    return "Camera and microphone access was blocked. Allow both in your browser settings, then try again.";
+    return {
+      kind: "blocking",
+      message:
+        "Camera and microphone access was blocked. Allow both in your browser settings, then try again.",
+      title: "Camera and microphone access blocked",
+    };
   }
   if (DEVICE_ERROR.test(normalized)) {
-    return "We couldn’t connect to both a camera and microphone. Check that they’re plugged in and not in use by another app.";
+    return {
+      kind: "blocking",
+      message:
+        "We couldn’t connect to both a camera and microphone. Check that they’re plugged in and not in use by another app.",
+      title: "Camera or microphone unavailable",
+    };
   }
   if (STORAGE_ERROR.test(normalized)) {
-    return "This browser can’t save your recording safely right now. Free up space on your device, then try again.";
+    return {
+      kind: "blocking",
+      message:
+        "This browser can’t save your recording safely right now. Free up space on your device, then try again.",
+      title: "Recording can’t be saved",
+    };
   }
   if (NETWORK_ERROR.test(normalized)) {
-    return NETWORK_GUIDANCE[saveState];
+    return {
+      kind: "saving",
+      message: NETWORK_GUIDANCE[saveState],
+      title: "Saving needs attention",
+    };
   }
   if (INTEGRITY_ERROR.test(normalized)) {
-    return "We found a problem with your recording that needs attention. Keep this tab open and try again.";
+    return {
+      kind: "blocking",
+      message:
+        "We found a problem with your recording that needs attention. Keep this tab open and try again.",
+      title: "Recording needs attention",
+    };
   }
-  return "Something went wrong with the recording. Keep this page open and try the action again.";
+  return {
+    kind: "blocking",
+    message:
+      "Something went wrong with the recording. Keep this page open and try the action again.",
+    title: "Recording needs attention",
+  };
+}
+
+export function candidateJourneyHandoff(input: {
+  actionError: CandidateError | null;
+  controlsHasStopped: boolean;
+  finalizationState: RecordingFinalizationState | "idle";
+  recordingError: string | null;
+  saveState: RecordingSaveState;
+}) {
+  const recordingError = input.recordingError
+    ? usefulError(input.recordingError, input.saveState)
+    : null;
+  const visibleError = input.actionError ?? recordingError;
+  const blockingError =
+    input.finalizationState === "failed" || visibleError?.kind !== "blocking"
+      ? null
+      : visibleError.message;
+
+  return {
+    blockingError,
+    blockingErrorTitle: blockingError ? (visibleError?.title ?? null) : null,
+    finalizationState: input.finalizationState,
+    hasStopped: input.controlsHasStopped || input.finalizationState !== "idle",
+    savingNotice: visibleError?.kind === "saving" ? visibleError.message : null,
+  };
 }
 
 function useRecordingControls(recording: UseLiveRecordingResult) {
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(
     null
   );
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<CandidateError | null>(null);
   const [hasStopped, setHasStopped] = useState(false);
   const { initialize, retryFinalization, saveState, start, stop } = recording;
 
@@ -126,14 +187,13 @@ function HomeComponent() {
   });
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
-  const hasStopped = controls.hasStopped || finalizationState !== "idle";
-  const blockingError =
-    finalizationState === "failed"
-      ? null
-      : (controls.actionError ??
-        (recording.error
-          ? usefulError(recording.error, recording.saveState)
-          : null));
+  const handoff = candidateJourneyHandoff({
+    actionError: controls.actionError,
+    controlsHasStopped: controls.hasStopped,
+    finalizationState,
+    recordingError: recording.error,
+    saveState: recording.saveState,
+  });
 
   useEffect(() => {
     if (recording.pendingPartCount === 0) {
@@ -149,9 +209,10 @@ function HomeComponent() {
 
   return (
     <CandidateRecordingJourney
-      blockingError={blockingError}
+      blockingError={handoff.blockingError}
+      blockingErrorTitle={handoff.blockingErrorTitle}
       finalization={recording.finalization}
-      hasStopped={hasStopped}
+      hasStopped={handoff.hasStopped}
       isReady={recording.isReady}
       isRecording={recording.isRecording}
       onInitialize={controls.handleInitialize}
@@ -161,6 +222,7 @@ function HomeComponent() {
       pendingAction={controls.pendingAction}
       recovered={recording.recovered}
       saveState={recording.saveState}
+      savingNotice={handoff.savingNotice}
       stream={recording.stream}
     />
   );

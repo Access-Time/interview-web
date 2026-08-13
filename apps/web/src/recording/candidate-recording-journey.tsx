@@ -9,6 +9,7 @@ import type {
 // biome-ignore lint: preserve the approved public type-alias contract.
 export type CandidateRecordingJourneyProps = {
   blockingError: string | null;
+  blockingErrorTitle: string | null;
   finalization: RecordingFinalizationResult | null;
   hasStopped: boolean;
   isReady: boolean;
@@ -20,6 +21,7 @@ export type CandidateRecordingJourneyProps = {
   pendingAction: "initialize" | "retry" | "start" | "stop" | null;
   recovered: boolean;
   saveState: RecordingSaveState;
+  savingNotice: string | null;
   stream: MediaStream | null;
 };
 
@@ -75,7 +77,7 @@ function CameraStage({ stream }: { stream: MediaStream | null }) {
   }, [stream]);
 
   return (
-    <div className="mt-8 aspect-video overflow-hidden border border-white/40 bg-black shadow-[10px_10px_0_0_#2563eb] sm:mt-10">
+    <div className="mt-8 aspect-video overflow-hidden rounded-xl border border-white/15 bg-black sm:mt-10">
       {stream ? (
         <video
           aria-label="Your camera preview"
@@ -102,14 +104,23 @@ const saveMessages: Record<Exclude<RecordingSaveState, "healthy">, string> = {
   retrying: "Saving is delayed. Keep this tab open while we try again.",
 };
 
-function SaveNotice({ saveState }: { saveState: RecordingSaveState }) {
-  if (saveState === "healthy") {
+function SaveNotice({
+  saveState,
+  savingNotice,
+}: {
+  saveState: RecordingSaveState;
+  savingNotice: string | null;
+}) {
+  if (saveState === "healthy" && !savingNotice) {
     return null;
   }
   return (
     <Banner
-      className="mt-6 rounded-none border border-black/20 bg-white text-black"
-      description={saveMessages[saveState]}
+      className="mt-6 rounded-lg border border-neutral-200 bg-neutral-50 text-black"
+      description={
+        savingNotice ??
+        (saveState === "healthy" ? undefined : saveMessages[saveState])
+      }
       size="sm"
       variant="secondary"
     />
@@ -147,7 +158,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
 
   const actionsDisabled = props.pendingAction !== null;
   const actionClassName =
-    "min-h-12 w-full rounded-none !bg-blue-600 px-5 font-semibold !text-white hover:!bg-blue-700 focus-visible:ring-0 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-blue-600 forced-colors:outline";
+    "min-h-12 w-full rounded-lg !bg-black px-5 font-medium !text-white hover:!bg-neutral-800 focus-visible:ring-0 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline";
   let announcement = "";
   let content: React.JSX.Element;
 
@@ -155,7 +166,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     announcement = "Set up your camera and microphone.";
     content = (
       <>
-        <h2 className="font-semibold font-serif text-3xl leading-tight">
+        <h2
+          className="font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
           Set up your camera and microphone.
         </h2>
         <p className="mt-4 text-gray-600 leading-7">
@@ -180,7 +194,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     announcement = "You’re ready to record.";
     content = (
       <>
-        <h2 className="font-semibold font-serif text-3xl leading-tight">
+        <h2
+          className="font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
           You’re ready to record.
         </h2>
         <p className="mt-4 text-gray-600 leading-7">
@@ -214,7 +231,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     }
     content = (
       <>
-        <h2 className="font-semibold font-serif text-3xl leading-tight">
+        <h2
+          className="font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
           We found an unfinished recording. You can continue where you left off.
         </h2>
         <Button
@@ -234,8 +254,11 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     announcement = "Recording started.";
     content = (
       <>
-        <h2 className="flex items-center gap-3 font-semibold font-serif text-3xl leading-tight">
-          <span aria-hidden="true" className="text-blue-600">
+        <h2
+          className="flex items-center gap-3 font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
+          <span aria-hidden="true" className="text-black">
             ●
           </span>
           <span>Recording</span>
@@ -263,7 +286,8 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     content = (
       <>
         <h2
-          className="font-semibold font-serif text-3xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600 focus-visible:outline-offset-4 forced-colors:outline"
+          className="font-semibold text-2xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
+          id="journey-state-heading"
           ref={submissionHeadingRef}
           tabIndex={-1}
         >
@@ -283,7 +307,8 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     content = (
       <>
         <h2
-          className="font-semibold font-serif text-3xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600 focus-visible:outline-offset-4 forced-colors:outline"
+          className="font-semibold text-2xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
+          id="journey-state-heading"
           ref={failureRef}
           tabIndex={-1}
         >
@@ -291,11 +316,11 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         </h2>
         <div className="mt-6">
           <Banner
-            className="rounded-none border border-black/20"
+            className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
             description="Keep this tab open, then try again."
             icon={<span aria-hidden="true">!</span>}
             title="Submission needs attention"
-            variant="error"
+            variant="secondary"
           />
         </div>
         <Button
@@ -317,8 +342,11 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     announcement = "Submission complete.";
     content = (
       <>
-        <h2 className="flex items-center gap-3 font-semibold font-serif text-3xl leading-tight">
-          <span aria-hidden="true" className="text-blue-600">
+        <h2
+          className="flex items-center gap-3 font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
+          <span aria-hidden="true" className="text-black">
             ✓
           </span>
           <span>Submission complete.</span>
@@ -332,8 +360,8 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
 
   return (
     <aside
-      aria-label="Recording controls"
-      className="border border-white bg-white p-6 text-black shadow-[10px_10px_0_0_#2563eb] sm:p-8 lg:p-10"
+      aria-labelledby="journey-state-heading"
+      className="rounded-xl border border-neutral-200 bg-white p-6 text-black sm:p-8"
     >
       <div aria-atomic="true" aria-live="polite" className="sr-only">
         {announcement}
@@ -341,20 +369,23 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
       {content}
       {props.blockingError && state !== "failed" ? (
         <div
-          className="mt-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-600 focus-visible:outline-offset-4 forced-colors:outline"
+          className="mt-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
           role="alert"
           tabIndex={-1}
         >
           <Banner
-            className="rounded-none border border-black/20"
+            className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
             description={props.blockingError}
             icon={<span aria-hidden="true">!</span>}
-            title="Check your camera and microphone"
-            variant="error"
+            title={props.blockingErrorTitle ?? "Something went wrong"}
+            variant="secondary"
           />
         </div>
       ) : null}
-      <SaveNotice saveState={props.saveState} />
+      <SaveNotice
+        saveState={props.saveState}
+        savingNotice={props.savingNotice}
+      />
     </aside>
   );
 }
@@ -364,13 +395,13 @@ export function CandidateRecordingJourney(
 ): React.JSX.Element {
   return (
     <main className="min-h-dvh bg-black text-white">
-      <div className="mx-auto grid min-h-dvh max-w-7xl gap-12 px-4 py-8 sm:px-8 sm:py-12 lg:grid-cols-[minmax(0,1.55fr)_minmax(20rem,0.75fr)] lg:items-center lg:gap-16">
+      <div className="mx-auto grid min-h-dvh max-w-6xl gap-10 px-4 py-8 sm:px-8 sm:py-12 lg:grid-cols-[minmax(0,1.5fr)_minmax(20rem,0.8fr)] lg:items-center lg:gap-14">
         <section aria-labelledby="recording-title">
-          <p className="font-semibold text-blue-300 text-xs uppercase tracking-[0.16em]">
+          <p className="font-medium text-white/60 text-xs uppercase tracking-[0.14em]">
             Video introduction
           </p>
           <h1
-            className="mt-4 max-w-2xl font-semibold font-serif text-5xl leading-[0.95] tracking-tight sm:text-7xl"
+            className="mt-4 max-w-2xl font-semibold text-4xl leading-tight tracking-tight sm:text-6xl"
             id="recording-title"
           >
             Tell us about yourself

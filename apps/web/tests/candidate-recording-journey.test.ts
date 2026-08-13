@@ -57,6 +57,7 @@ const { CandidateRecordingJourney } = await import(
 
 const baseProps: CandidateRecordingJourneyProps = {
   blockingError: null,
+  blockingErrorTitle: null,
   finalization: null,
   hasStopped: false,
   isReady: false,
@@ -68,6 +69,7 @@ const baseProps: CandidateRecordingJourneyProps = {
   pendingAction: null,
   recovered: false,
   saveState: "healthy",
+  savingNotice: null,
   stream: null,
 };
 
@@ -224,9 +226,38 @@ test("uses an alert only for a blocking error", () => {
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
       blockingError: "Camera and microphone access was blocked.",
+      blockingErrorTitle: "Camera and microphone access blocked",
     })
   );
   assert.equal(container.querySelectorAll('[role="alert"]').length, 1);
+  assert.ok(screen.getByText("Camera and microphone access blocked"));
+  assert.equal(screen.queryByText("Check your camera and microphone"), null);
+});
+
+test("labels the controls by the active state heading", () => {
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, baseProps)
+  );
+  let heading = screen.getByRole("heading", {
+    name: "Set up your camera and microphone.",
+  });
+  let controls = screen.getByRole("complementary", {
+    name: "Set up your camera and microphone.",
+  });
+  assert.equal(heading.id, "journey-state-heading");
+  assert.equal(controls.getAttribute("aria-labelledby"), heading.id);
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      isReady: true,
+    })
+  );
+  heading = screen.getByRole("heading", { name: "You’re ready to record." });
+  controls = screen.getByRole("complementary", {
+    name: "You’re ready to record.",
+  });
+  assert.equal(controls.getAttribute("aria-labelledby"), heading.id);
 });
 
 test("keeps saving notices non-alerting and uses the approved copy", () => {
@@ -251,6 +282,19 @@ test("keeps saving notices non-alerting and uses the approved copy", () => {
     assert.equal(container.querySelector('[role="alert"]'), null);
     unmount();
   }
+});
+
+test("shows a saving network notice once without a blocking alert", () => {
+  const message =
+    "Saving needs attention. Keep this tab open and check your connection.";
+  const { container } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      savingNotice: message,
+    })
+  );
+  assert.equal(screen.getAllByText(message).length, 1);
+  assert.equal(container.querySelector('[role="alert"]'), null);
 });
 
 test("suppresses a blocking error when submission has failed", () => {

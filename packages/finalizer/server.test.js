@@ -53,15 +53,11 @@ async function harness(
 function finalizeBody(segments = [{ partIndexes: [0], segmentIndex: 0 }]) {
   return JSON.stringify({ outputMediaType: "video/webm", segments });
 }
-function auth(token) {
-  return token ? { authorization: `Bearer ${token}` } : {};
-}
 function upload(h, segment, part, text, headers = {}) {
   const body = Buffer.from(text);
   return h.request("PUT", `/jobs/job/parts/${segment}/${part}`, body, {
     ...headers,
     "x-content-sha256": sha(body),
-    ...auth(headers.token),
   });
 }
 
@@ -227,40 +223,12 @@ test("failed ffmpeg never exposes output", async (t) => {
   assert.equal((await h.request("GET", "/jobs/job/output")).status, 409);
 });
 
-test("explicit token rejects missing and wrong credentials", async (t) => {
-  const h = await harness(undefined, { token: "secret" });
-  t.after(() => h.close());
-  const body = Buffer.from("x");
-  const base = { "x-content-sha256": sha(body) };
-  assert.equal(
-    (await h.request("PUT", "/jobs/auth/parts/0/0", body, base)).status,
-    401
-  );
-  assert.equal(
-    (
-      await h.request("PUT", "/jobs/auth/parts/0/0", body, {
-        ...base,
-        authorization: "Bearer wrong",
-      })
-    ).status,
-    401
-  );
-  assert.equal(
-    (
-      await h.request("PUT", "/jobs/auth/parts/0/0", body, {
-        ...base,
-        authorization: "Bearer secret",
-      })
-    ).status,
-    201
-  );
-});
-
-test("health is public while job routes require the token", async (t) => {
-  const h = await harness(undefined, { token: "secret" });
+test("private binding allows health and job routes without authorization", async (t) => {
+  const h = await harness();
   t.after(() => h.close());
   assert.equal((await h.request("GET", "/health")).status, 204);
-  assert.equal((await h.request("GET", "/jobs/job/output")).status, 401);
+  const body = Buffer.from("x");
+  assert.equal((await upload(h, 0, 0, body)).status, 201);
 });
 
 test("concurrent finalization permits exactly one runner", async (t) => {

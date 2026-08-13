@@ -136,7 +136,6 @@ async function streamPart(req, temp, maxBytes, expected) {
 export function createFinalizerServer({
   root = path.join(os.tmpdir(), "recording-finalizer"),
   run = defaultRun,
-  token,
   maxPartBytes = 512 * 1024 * 1024,
   maxJobBytes = 2 * 1024 * 1024 * 1024,
   maxJsonBytes = 2 * 1024 * 1024,
@@ -316,12 +315,6 @@ export function createFinalizerServer({
         res.writeHead(204);
         return res.end();
       }
-      if (
-        token !== undefined &&
-        req.headers.authorization !== `Bearer ${token}`
-      ) {
-        throw fail(401, "unauthorized");
-      }
       const u = new URL(req.url, "http://localhost");
       const deleteMatch = u.pathname.match(DELETE_JOB);
       const m = u.pathname.match(JOB_ROUTE);
@@ -432,10 +425,5 @@ export function createFinalizerServer({
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  if (!process.env.FINALIZER_TOKEN) {
-    throw new Error("FINALIZER_TOKEN is required");
-  }
-  createFinalizerServer({ token: process.env.FINALIZER_TOKEN }).listen(
-    Number(process.env.PORT) || 8080
-  );
+  createFinalizerServer().listen(Number(process.env.PORT) || 8080);
 }

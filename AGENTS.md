@@ -20,9 +20,7 @@ backed by Cloudflare D1 (SQLite) and a private R2 bucket. Standard scripts live 
 ### Environment / secrets (required to run the app)
 - `apps/web/.env` sets `CORS_ORIGIN=http://localhost:3001` (copied from `.env.example`).
 - `packages/infra/.env` sets `ALCHEMY_PASSWORD` (encrypts Alchemy's local secret state; any
-  stable value works for local dev — a default is provided) and a stable, non-empty
-  `FINALIZER_TOKEN` (the private Worker-to-container token; never client-visible). These `.env`
-  files are gitignored.
+  stable value works for local dev — a default is provided). These `.env` files are gitignored.
 - `alchemy dev` (i.e. `pnpm dev`) provisions a Cloudflare Worker and therefore **requires real
   Cloudflare credentials**: set `CLOUDFLARE_API_TOKEN` (provided via Cursor Secrets → injected as
   an env var). There is no offline/local-only mode; `dev:bare` (plain `vite dev`) renders the UI

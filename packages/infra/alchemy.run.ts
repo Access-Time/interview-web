@@ -36,11 +36,6 @@ export const web = await TanStackStart("web", {
   cwd: "../../apps/web",
 });
 
-const tokenValue = process.env.FINALIZER_TOKEN;
-if (!tokenValue) {
-  throw new Error("FINALIZER_TOKEN is required for finalizer deployment");
-}
-const token = alchemy.secret(tokenValue);
 const finalizerContainer = await Container("recording-finalizer-container", {
   build: {
     context: "../../packages/finalizer",
@@ -55,7 +50,6 @@ export const finalizer = await Worker("recording-finalizer", {
     DB: db,
     FINALIZATION_QUEUE: finalizationQueue,
     FINALIZER: finalizerContainer,
-    FINALIZER_TOKEN: token,
     RECORDINGS: recordings,
   },
   crons: ["*/15 * * * *"],

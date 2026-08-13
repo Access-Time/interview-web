@@ -60,14 +60,6 @@ export class RecordingFinalizerContainer extends Container {
   sleepAfter = "10m";
   pingEndpoint = "container/health";
   enableInternet = false;
-  envVars: Record<string, string>;
-  constructor(
-    ctx: DurableObjectState<Record<string, never>>,
-    env: { FINALIZER_TOKEN: string }
-  ) {
-    super(ctx, env);
-    this.envVars = { FINALIZER_TOKEN: env.FINALIZER_TOKEN };
-  }
 }
 
 function hex(bytes: ArrayBuffer) {
@@ -120,7 +112,6 @@ export async function processFinalization(input: {
     attempt: number
   ) => FinalizerContainer | Promise<FinalizerContainer>;
   sessionId: string;
-  token?: string;
   dbFns?: Partial<DbFns>;
   heartbeatMs?: number;
 }) {
@@ -173,7 +164,6 @@ export async function processFinalization(input: {
     await renew();
     container = await input.containerForAttempt(attempt);
     const job = await deterministicJobName(input.sessionId, attempt);
-    const auth = { Authorization: `Bearer ${String(input.token ?? "")}` };
     const activeContainer = container;
     const fetch = (url: string, init: RequestInit = {}) =>
       activeContainer.fetch(url, { ...init, signal: abort.signal });
@@ -199,7 +189,6 @@ export async function processFinalization(input: {
           {
             body: object.body,
             headers: {
-              ...auth,
               "content-length": String(part.byteSize),
               "x-content-sha256": part.checksum,
             },
@@ -217,16 +206,13 @@ export async function processFinalization(input: {
           outputMediaType: outputMediaType(manifest),
           segments: plan,
         }),
-        headers: { ...auth, "content-type": "application/json" },
+        headers: { "content-type": "application/json" },
         method: "POST",
       }),
       "finalize"
     );
     await renew();
-    const out = check(
-      await fetch(`/jobs/${job}/output`, { headers: auth }),
-      "output"
-    );
+    const out = check(await fetch(`/jobs/${job}/output`), "output");
     await renew();
     const type = out.headers.get("content-type");
     const size = Number(out.headers.get("content-length"));
@@ -322,7 +308,6 @@ export async function processFinalization(input: {
         await container.fetch(
           `/jobs/${await deterministicJobName(input.sessionId, attempt)}`,
           {
-            headers: { Authorization: `Bearer ${String(input.token ?? "")}` },
             method: "DELETE",
           }
         );
@@ -349,7 +334,6 @@ export interface FinalizerEnv {
   DB: D1Database;
   FINALIZATION_QUEUE: FinalizationQueue;
   FINALIZER: DurableObjectNamespace<RecordingFinalizerContainer>;
-  FINALIZER_TOKEN: string;
   RECORDINGS: FinalizerBucket;
 }
 export async function handleQueueMessage(
@@ -364,7 +348,6 @@ export async function handleQueueMessage(
     db: createDb(),
     recordings: env.RECORDINGS,
     sessionId: message.body.sessionId,
-    token: env.FINALIZER_TOKEN,
   });
   message.ack?.();
 }

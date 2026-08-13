@@ -53,7 +53,10 @@ export const finalizer = await Worker("recording-finalizer", {
     RECORDINGS: recordings,
   },
   crons: ["*/15 * * * *"],
-  entrypoint: "../finalizer/src/worker.ts",
+  // Bundle from the finalizer package so esbuild's watch root is not
+  // packages/infra (which includes .alchemy/out and hot-reloads forever).
+  cwd: "../finalizer",
+  entrypoint: "src/worker.ts",
   eventSources: [
     {
       queue: finalizationQueue,

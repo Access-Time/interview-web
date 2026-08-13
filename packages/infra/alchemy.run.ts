@@ -53,7 +53,7 @@ export const finalizer = await Worker("recording-finalizer", {
     RECORDINGS: recordings,
   },
   crons: ["*/15 * * * *"],
-  entrypoint: "../../packages/finalizer/src/worker.ts",
+  entrypoint: "../finalizer/src/worker.ts",
   eventSources: [
     {
       queue: finalizationQueue,

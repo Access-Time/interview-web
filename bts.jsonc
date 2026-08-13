@@ -17,6 +17,14 @@
   "runtime": "none",
   "frontend": ["tanstack-start"],
   "addons": ["husky", "turborepo", "ultracite"],
+  "addonOptions": {
+    "ultracite": {
+      "linter": "biome",
+      "editors": ["cursor", "zed"],
+      "agents": ["universal"],
+      "hooks": ["cursor"]
+    }
+  },
   "examples": ["todo"],
   "auth": "none",
   "payments": "none",

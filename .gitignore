@@ -21,6 +21,12 @@ apps/web/src/routeTree.gen.ts
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
+.zed/*
+!.zed/settings.json
+.cursor/*
+!.cursor/hooks.json
+!.cursor/rules/
+!.cursor/rules/**
 .idea
 *.swp
 *.swo

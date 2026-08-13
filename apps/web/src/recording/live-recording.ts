@@ -1222,6 +1222,13 @@ export function useLiveRecording(options: {
       instance.addEventListener("stop", done, { once: true });
       instance.stop();
     });
+    const activeStream = streamRef.current;
+    for (const track of activeStream?.getTracks() ?? []) {
+      track.stop();
+    }
+    streamRef.current = null;
+    setStream(null);
+    setReady(false);
     while (processing.current.length) {
       // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
       await Promise.all(processing.current);

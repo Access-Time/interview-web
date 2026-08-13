@@ -36,7 +36,6 @@
     "@tanstack/react-router-ssr-query": "^1.167.1"
   },
   "devDependencies": {
-    "@tanstack/react-router-devtools": "^1.167.0",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/react": "^16.3.2",
     "@types/react": "catalog:",
@@ -47,7 +46,6 @@
     "web-vitals": "^6.0.1",
     "typescript": "catalog:",
     "@interview-web/config": "workspace:*",
-    "@tanstack/react-query-devtools": "^5.101.4",
     "alchemy": "catalog:",
     "@cloudflare/vite-plugin": "1.44.0",
     "wrangler": "^4.115.0"

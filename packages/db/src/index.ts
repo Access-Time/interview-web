@@ -6,7 +6,6 @@ import {
   recordingSession,
   recordingUploadPart,
 } from "./schema/recording-manifest";
-import { todo } from "./schema/todo";
 
 export type Database = DrizzleD1Database<typeof schema>;
 
@@ -14,7 +13,6 @@ const schema = {
   recordingSegment,
   recordingSession,
   recordingUploadPart,
-  todo,
 };
 
 export function createDb() {

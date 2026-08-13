@@ -58,8 +58,7 @@ backed by Cloudflare D1 (SQLite) and a private R2 bucket. Standard scripts live 
 - Tests: `pnpm test` — `node --test` with mocked storage/db (no live services needed).
 - Build: `pnpm build`. Type-check: `pnpm check-types`.
 - Lint/format: `pnpm check` / `pnpm fix` (Ultracite/Biome). Note: the repo currently has
-  pre-existing lint findings in `apps/web/src/routes/todos.tsx` and `packages/env/env.d.ts`;
-  these are not environment issues.
+  a pre-existing lint finding in `packages/env/env.d.ts`; this is not an environment issue.
 
 
 # Ultracite Code Standards

@@ -165,8 +165,13 @@ export async function processFinalization(input: {
     container = await input.containerForAttempt(attempt);
     const job = await deterministicJobName(input.sessionId, attempt);
     const activeContainer = container;
+    // Local miniflare Container.fetch uses the standard URL parser and rejects
+    // relative paths. Production accepts them; resolve against a dummy origin.
     const fetch = (url: string, init: RequestInit = {}) =>
-      activeContainer.fetch(url, { ...init, signal: abort.signal });
+      activeContainer.fetch(new URL(url, "http://container"), {
+        ...init,
+        signal: abort.signal,
+      });
     const plan = manifest.segments.map((s) => ({
       partIndexes: s.parts.map((p) => p.sequence),
       segmentIndex: s.index,
@@ -306,7 +311,10 @@ export async function processFinalization(input: {
     if (container) {
       try {
         await container.fetch(
-          `/jobs/${await deterministicJobName(input.sessionId, attempt)}`,
+          new URL(
+            `/jobs/${await deterministicJobName(input.sessionId, attempt)}`,
+            "http://container"
+          ),
           {
             method: "DELETE",
           }
@@ -340,15 +348,23 @@ export async function handleQueueMessage(
   message: { body: { sessionId: string }; ack?: () => void },
   env: FinalizerEnv
 ) {
-  await processFinalization({
-    containerForAttempt: (attempt) =>
-      deterministicJobName(message.body.sessionId, attempt).then((name) =>
-        getContainer(env.FINALIZER, name)
-      ),
-    db: createDb(),
-    recordings: env.RECORDINGS,
-    sessionId: message.body.sessionId,
-  });
+  try {
+    await processFinalization({
+      containerForAttempt: (attempt) =>
+        deterministicJobName(message.body.sessionId, attempt).then((name) =>
+          getContainer(env.FINALIZER, name)
+        ),
+      db: createDb(),
+      recordings: env.RECORDINGS,
+      sessionId: message.body.sessionId,
+    });
+  } catch (error) {
+    console.error("Recording finalization failed", {
+      error,
+      sessionId: message.body.sessionId,
+    });
+    throw error;
+  }
   message.ack?.();
 }
 

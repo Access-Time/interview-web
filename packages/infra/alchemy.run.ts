@@ -1,3 +1,4 @@
+import path from "node:path";
 import alchemy from "alchemy";
 import {
   Container,
@@ -8,6 +9,9 @@ import {
   Worker,
 } from "alchemy/cloudflare";
 import { config } from "dotenv";
+
+const infraDir = import.meta.dirname;
+const finalizerDir = path.resolve(infraDir, "../finalizer");
 
 config({ path: "./.env" });
 config({ path: "../../apps/web/.env" });
@@ -53,13 +57,20 @@ export const finalizer = await Worker("recording-finalizer", {
     RECORDINGS: recordings,
   },
   crons: ["*/15 * * * *"],
-  entrypoint: "../../packages/finalizer/src/worker.ts",
+  // Alchemy 0.94 matches Worker.entrypoint against esbuild's metafile string.
+  // A repo-root path like ../../packages/finalizer/src/worker.ts is the same
+  // file as ../finalizer/src/worker.ts, but esbuild records the latter and
+  // the worker never starts. Bundle from the finalizer package instead.
+  // sourceMap: false avoids a watch loop (Alchemy rewrites worker.js.map).
+  cwd: finalizerDir,
+  entrypoint: "src/worker.ts",
   eventSources: [
     {
       queue: finalizationQueue,
       settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5 },
     },
   ],
+  sourceMap: false,
 });
 
 console.log(`Web    -> ${web.url}`);

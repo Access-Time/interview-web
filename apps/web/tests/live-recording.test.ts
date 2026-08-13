@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createLiveRecordingOutbox,
+  integrityMessage,
   isRetryableRecordingFailure,
+  type RecordingManifestView,
   type RecordingPart,
   type RecordingSession,
+  reconcileRecordingParts,
   recordingIntentMetadata,
   recordingRemoteAction,
 } from "../src/recording/live-recording.ts";
@@ -19,6 +22,97 @@ const part: RecordingPart = {
 const STORAGE_ERROR = /storage unavailable/;
 const PENDING_ERROR = /pending/i;
 const UPLOAD_ERROR = /upload failed|pending/i;
+const CONFLICT_FINALIZE_ERROR = /conflicting parts and cannot be finalized/;
+const GAP_FINALIZE_ERROR = /missing ordered parts and cannot be finalized/;
+const HELLO_CHECKSUM =
+  "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+const OTHER_CHECKSUM =
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const recordingSession: RecordingSession = {
+  recorderMimeType: "video/webm",
+  requestedMimeType: "video/webm",
+  segments: [{ partCount: 4, segmentId: "segment" }],
+  sessionId: "session",
+  status: "recording",
+};
+
+function manifestParts(
+  sequences: Array<{ checksum?: string; sequence: number }>
+): RecordingManifestView {
+  return {
+    segments: [
+      {
+        id: "segment",
+        parts: sequences.map((item) => ({
+          checksum: item.checksum ?? HELLO_CHECKSUM,
+          sequence: item.sequence,
+        })),
+      },
+    ],
+    sessionId: "session",
+  };
+}
+
+function recoveryHarness(
+  parts: RecordingPart[],
+  session = recordingSession,
+  storeOptions?: { deleteError?: Error }
+) {
+  const stored = [...parts];
+  const sessions = [session];
+  const deleted: RecordingPart[] = [];
+  const calls: Request[] = [];
+  const store = {
+    delete: (value: RecordingPart) => {
+      if (storeOptions?.deleteError) {
+        return Promise.reject(storeOptions.deleteError);
+      }
+      deleted.push(value);
+      const index = stored.findIndex(
+        (item) =>
+          item.segmentId === value.segmentId &&
+          item.sequence === value.sequence &&
+          item.sessionId === value.sessionId
+      );
+      if (index >= 0) {
+        stored.splice(index, 1);
+      }
+      return Promise.resolve();
+    },
+    getSession: (sessionId: string) =>
+      Promise.resolve(sessions.find((item) => item.sessionId === sessionId)),
+    listParts: () => Promise.resolve([...stored]),
+    listSessions: () => Promise.resolve([...sessions]),
+    put: (value: RecordingPart) => {
+      stored.push(value);
+      return Promise.resolve();
+    },
+    putSession: (value: RecordingSession) => {
+      const index = sessions.findIndex(
+        (item) => item.sessionId === value.sessionId
+      );
+      if (index >= 0) {
+        sessions[index] = value;
+      } else {
+        sessions.push(value);
+      }
+      return Promise.resolve();
+    },
+  };
+  const request = (input: RequestInfo | URL, init?: RequestInit) => {
+    calls.push(
+      new Request(new URL(input.toString(), "http://localhost"), init)
+    );
+    return Promise.resolve(new Response(null, { status: 201 }));
+  };
+  return {
+    box: createLiveRecordingOutbox(store, request),
+    calls,
+    deleted,
+    sessions,
+    stored,
+  };
+}
 
 function harness(
   response: Response | Promise<Response> = new Response(null, { status: 201 })
@@ -348,4 +442,165 @@ test("savePartAndSession reports durable persistence failure", async () => {
   );
   assert.equal(box.saveState, "error");
   assert.equal(errors.length, 1);
+});
+
+test("reconcile drops matching acknowledgements and keeps missing parts", async () => {
+  const acked = { ...part, sequence: 1 };
+  const missing = { ...part, sequence: 3 };
+  const result = await reconcileRecordingParts({
+    localParts: [acked, missing],
+    localSession: recordingSession,
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { sequence: 2 },
+    ]),
+  });
+  assert.deepEqual(
+    result.drop.map((item) => item.sequence),
+    [1]
+  );
+  assert.deepEqual(
+    result.keep.map((item) => item.sequence),
+    [3]
+  );
+  assert.equal(result.integrity, "ok");
+  assert.equal(result.session?.segments[0]?.partCount, 4);
+});
+
+test("reload recovers acknowledged parts without duplicating uploads", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
+    )
+  );
+  assert.equal(recovery.recovered, true);
+  assert.equal(recovery.integrity, "ok");
+  assert.equal(harnessed.calls.length, 1);
+  assert.equal(harnessed.calls[0]?.url.endsWith("/parts/3"), true);
+  assert.equal(harnessed.deleted.length, 1);
+  assert.equal(harnessed.box.pendingCount, 0);
+  harnessed.box.dispose();
+});
+
+test("lost acknowledgement drops a matching local copy without discarding bytes", async () => {
+  const local = { ...part, sequence: 3 };
+  const harnessed = recoveryHarness([local]);
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+        { sequence: 3 },
+      ])
+    )
+  );
+  assert.equal(recovery.integrity, "ok");
+  assert.equal(harnessed.calls.length, 0);
+  assert.equal(harnessed.deleted.length, 1);
+  assert.equal(harnessed.stored.length, 0);
+  harnessed.box.dispose();
+});
+
+test("reconcile continues when dropping an acknowledged part fails in storage", async () => {
+  const local = { ...part, sequence: 3 };
+  const harnessed = recoveryHarness([local], recordingSession, {
+    deleteError: new Error("IndexedDB delete failed"),
+  });
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+        { sequence: 3 },
+      ])
+    )
+  );
+  assert.equal(recovery.recovered, true);
+  assert.equal(recovery.integrity, "ok");
+  assert.equal(harnessed.box.pendingCount, 0);
+  assert.equal(harnessed.stored.length, 1);
+  harnessed.box.dispose();
+});
+
+test("offline hydrate retains parts and reconciles after reconnect", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.setOnline(false);
+  await harnessed.box.hydrate();
+  const offline = await harnessed.box.recover(() => {
+    throw new Error("manifest should not be fetched offline");
+  });
+  assert.equal(offline.recovered, true);
+  assert.equal(harnessed.calls.length, 0);
+  assert.equal(harnessed.box.pendingCount, 1);
+  await harnessed.box.setOnline(true, { flush: false });
+  await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
+    )
+  );
+  assert.equal(harnessed.calls.length, 1);
+  assert.equal(harnessed.box.pendingCount, 0);
+  harnessed.box.dispose();
+});
+
+test("conflicting checksums retain local media and refuse finalization", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 2 }]);
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { checksum: OTHER_CHECKSUM, sequence: 2 },
+      ])
+    )
+  );
+  assert.equal(recovery.integrity, "conflict");
+  assert.equal(harnessed.deleted.length, 0);
+  assert.equal(harnessed.stored.length, 1);
+  assert.equal(harnessed.box.pendingCount, 1);
+  assert.equal(harnessed.box.saveState, "error");
+  assert.equal(integrityMessage("conflict")?.includes("conflicting"), true);
+  await assert.rejects(harnessed.box.drain(), PENDING_ERROR);
+  assert.throws(
+    () => harnessed.box.assertCanFinalize(),
+    CONFLICT_FINALIZE_ERROR
+  );
+  harnessed.box.dispose();
+});
+
+test("missing ordered parts refuse misleading finalization", async () => {
+  const harnessed = recoveryHarness([], {
+    ...recordingSession,
+    segments: [{ partCount: 3, segmentId: "segment" }],
+  });
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(manifestParts([{ sequence: 0 }, { sequence: 1 }]))
+  );
+  assert.equal(recovery.integrity, "gap");
+  assert.equal(harnessed.calls.length, 0);
+  await harnessed.box.drain();
+  assert.throws(() => harnessed.box.assertCanFinalize(), GAP_FINALIZE_ERROR);
+  harnessed.box.dispose();
+});
+
+test("selects append after recovering a non-empty tail", () => {
+  const recovered: RecordingSession = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 3, segmentId: "interrupted" }],
+    sessionId: "session",
+    status: "recording",
+  };
+  const resumeTail = recovered.segments.at(-1)?.partCount === 0;
+  assert.equal(resumeTail, false);
+  assert.equal(recordingRemoteAction(recovered, resumeTail), "append");
 });

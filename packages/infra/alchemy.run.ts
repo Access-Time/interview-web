@@ -53,8 +53,9 @@ export const finalizer = await Worker("recording-finalizer", {
     RECORDINGS: recordings,
   },
   crons: ["*/15 * * * *"],
-  // Bundle from the finalizer package so esbuild's watch root is not
-  // packages/infra (which includes .alchemy/out and hot-reloads forever).
+  // Bundle from the finalizer package. Disable source maps: Alchemy rewrites
+  // worker.js.map after each build, which esbuild then watches as a change
+  // and rebuilds forever — the queue worker never stays up.
   cwd: "../finalizer",
   entrypoint: "src/worker.ts",
   eventSources: [
@@ -63,6 +64,7 @@ export const finalizer = await Worker("recording-finalizer", {
       settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5 },
     },
   ],
+  sourceMap: false,
 });
 
 console.log(`Web    -> ${web.url}`);

@@ -10,6 +10,7 @@ import type {
 export type CandidateRecordingJourneyProps = {
   blockingError: string | null;
   blockingErrorTitle: string | null;
+  captureBlocked: boolean;
   finalization: RecordingFinalizationResult | null;
   hasStopped: boolean;
   isReady: boolean;
@@ -41,15 +42,15 @@ function journeyState(props: CandidateRecordingJourneyProps): JourneyState {
   if (props.finalization?.state === "failed") {
     return "failed";
   }
-  if (props.isRecording) {
-    return "recording";
-  }
   if (
     props.hasStopped ||
     props.finalization?.state === "queued" ||
     props.finalization?.state === "finalizing"
   ) {
     return "submitting";
+  }
+  if (props.isRecording) {
+    return "recording";
   }
   if (props.recovered) {
     return "recovered";
@@ -205,7 +206,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         </p>
         <Button
           className={`${actionClassName} mt-8`}
-          disabled={actionsDisabled}
+          disabled={actionsDisabled || (props.isReady && props.captureBlocked)}
           onClick={props.onStart}
           ref={actionRef}
           size="lg"
@@ -239,7 +240,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         </h2>
         <Button
           className={`${actionClassName} mt-8`}
-          disabled={actionsDisabled}
+          disabled={actionsDisabled || (props.isReady && props.captureBlocked)}
           onClick={props.isReady ? props.onStart : props.onInitialize}
           ref={actionRef}
           size="lg"

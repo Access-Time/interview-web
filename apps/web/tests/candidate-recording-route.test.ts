@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { runnerImport } from "vite";
 
 interface CandidateError {
+  captureBlocked: boolean;
   kind: "blocking" | "saving";
   message: string;
   title: string;
@@ -12,6 +13,7 @@ interface CandidateError {
 interface RouteModule {
   candidateJourneyHandoff: (input: {
     actionError: CandidateError | null;
+    captureEnded: boolean;
     controlsHasStopped: boolean;
     finalizationState: "failed" | "finalizing" | "idle" | "queued" | "ready";
     recordingError: string | null;
@@ -19,6 +21,7 @@ interface RouteModule {
   }) => {
     blockingError: string | null;
     blockingErrorTitle: string | null;
+    captureBlocked: boolean;
     finalizationState: string;
     hasStopped: boolean;
     savingNotice: string | null;
@@ -73,6 +76,7 @@ test("classifies connection failures as saving guidance", () => {
 
   for (const scenario of scenarios) {
     assert.deepEqual(route.usefulError(scenario.error, scenario.saveState), {
+      captureBlocked: false,
       kind: "saving",
       message: scenario.message,
       title: "Saving needs attention",
@@ -95,12 +99,17 @@ test("keeps non-network failures blocking and candidate-safe", () => {
     assert.equal(classification.title, title);
     assert.equal(FORBIDDEN_COPY.test(classification.message), false);
     assert.equal(FORBIDDEN_COPY.test(classification.title), false);
+    assert.equal(
+      classification.captureBlocked,
+      error === "quota exceeded" || error === "conflicting parts"
+    );
   }
 });
 
 test("hands saving failures to the notice only", () => {
   const handoff = route.candidateJourneyHandoff({
     actionError: null,
+    captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "idle",
     recordingError: "fetch failed",
@@ -118,6 +127,7 @@ test("hands off blocking failures and suppresses them after failed submission", 
   const classification = route.usefulError("permission denied");
   const visible = route.candidateJourneyHandoff({
     actionError: classification,
+    captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "idle",
     recordingError: null,
@@ -129,6 +139,7 @@ test("hands off blocking failures and suppresses them after failed submission", 
 
   const failed = route.candidateJourneyHandoff({
     actionError: classification,
+    captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "failed",
     recordingError: null,
@@ -149,6 +160,7 @@ test("preserves stopped semantics for pending and terminal states", () => {
   ] as const) {
     const handoff = route.candidateJourneyHandoff({
       actionError: null,
+      captureEnded: false,
       controlsHasStopped: false,
       finalizationState,
       recordingError: null,
@@ -160,10 +172,44 @@ test("preserves stopped semantics for pending and terminal states", () => {
 
   const locallyStopped = route.candidateJourneyHandoff({
     actionError: null,
+    captureEnded: false,
     controlsHasStopped: true,
     finalizationState: "idle",
     recordingError: null,
     saveState: "healthy",
   });
   assert.equal(locallyStopped.hasStopped, true);
+});
+
+test("capture-ended signal produces stopped handoff immediately", () => {
+  const handoff = route.candidateJourneyHandoff({
+    actionError: null,
+    captureEnded: true,
+    controlsHasStopped: false,
+    finalizationState: "idle",
+    recordingError: null,
+    saveState: "healthy",
+  });
+  assert.equal(handoff.hasStopped, true);
+  assert.equal(handoff.finalizationState, "idle");
+});
+
+test("blocks capture handoff only for unsafe recording failures", () => {
+  for (const [error, captureBlocked] of [
+    ["quota exceeded", true],
+    ["missing ordered parts", true],
+    ["permission denied", false],
+    ["device notfound", false],
+    ["fetch failed", false],
+  ] as const) {
+    const handoff = route.candidateJourneyHandoff({
+      actionError: null,
+      captureEnded: false,
+      controlsHasStopped: false,
+      finalizationState: "idle",
+      recordingError: error,
+      saveState: "healthy",
+    });
+    assert.equal(handoff.captureBlocked, captureBlocked);
+  }
 });

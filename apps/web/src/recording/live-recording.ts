@@ -34,6 +34,7 @@ export function normalizeFinalizationStatus(
 }
 
 export interface UseLiveRecordingResult {
+  captureEnded: boolean;
   error: string | null;
   finalization: RecordingFinalizationResult | null;
   initialize: () => Promise<void>;
@@ -756,6 +757,7 @@ export function useLiveRecording(options: {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isReady, setReady] = useState(false);
   const [isRecording, setRecording] = useState(false);
+  const [captureEnded, setCaptureEnded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recovered, setRecovered] = useState(false);
   const [finalization, setFinalization] =
@@ -1092,6 +1094,7 @@ export function useLiveRecording(options: {
   };
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
+    setCaptureEnded(false);
     await recoveryPromise.current;
     if (sealedPlans.current.length) {
       throw new Error("The previous recording is still being finalized");
@@ -1222,51 +1225,60 @@ export function useLiveRecording(options: {
       instance.addEventListener("stop", done, { once: true });
       instance.stop();
     });
-    const activeStream = streamRef.current;
-    for (const track of activeStream?.getTracks() ?? []) {
-      track.stop();
-    }
-    streamRef.current = null;
-    setStream(null);
-    setReady(false);
-    while (processing.current.length) {
-      // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
-      await Promise.all(processing.current);
-    }
-    const { current } = ids;
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: recording IDs are established before capture.
-    if (!(current && outbox.current)) {
-      return;
-    }
-    const plan = {
-      segments: session.current?.segments ?? [
-        { partCount: sequence.current, segmentId: current.segmentId },
-      ],
-      sessionId: current.sessionId,
-    };
-    const currentSession = session.current;
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: a recording session is established before stop.
-    if (!currentSession) {
-      throw new Error("Recording session is unavailable; press Start to retry");
-    }
-    if (plan.segments.some((segment) => segment.partCount === 0)) {
-      session.current = { ...currentSession, status: "recording" };
+    setCaptureEnded(true);
+    try {
+      const activeStream = streamRef.current;
+      for (const track of activeStream?.getTracks() ?? []) {
+        track.stop();
+      }
+      streamRef.current = null;
+      setStream(null);
+      setReady(false);
+      while (processing.current.length) {
+        // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
+        await Promise.all(processing.current);
+      }
+      const { current } = ids;
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: recording IDs are established before capture.
+      if (!(current && outbox.current)) {
+        setCaptureEnded(false);
+        return;
+      }
+      const plan = {
+        segments: session.current?.segments ?? [
+          { partCount: sequence.current, segmentId: current.segmentId },
+        ],
+        sessionId: current.sessionId,
+      };
+      const currentSession = session.current;
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: a recording session is established before stop.
+      if (!currentSession) {
+        throw new Error(
+          "Recording session is unavailable; press Start to retry"
+        );
+      }
+      if (plan.segments.some((segment) => segment.partCount === 0)) {
+        session.current = { ...currentSession, status: "recording" };
+        await outbox.current.saveSession(session.current);
+        throw new Error(
+          "Recording stopped before any media data was captured; press Start to retry"
+        );
+      }
+      outbox.current.assertCanFinalize();
+      session.current = {
+        ...currentSession,
+        segments: plan.segments,
+        status: "sealed",
+      };
       await outbox.current.saveSession(session.current);
-      throw new Error(
-        "Recording stopped before any media data was captured; press Start to retry"
-      );
+      sealedPlans.current.push(plan);
+      finalizationInput.current ??= plan;
+      setFinalizationState({ error: null, state: "queued" });
+      await submitSealedRef.current?.();
+    } catch (cause) {
+      setCaptureEnded(false);
+      throw cause;
     }
-    outbox.current.assertCanFinalize();
-    session.current = {
-      ...currentSession,
-      segments: plan.segments,
-      status: "sealed",
-    };
-    await outbox.current.saveSession(session.current);
-    sealedPlans.current.push(plan);
-    finalizationInput.current ??= plan;
-    setFinalizationState({ error: null, state: "queued" });
-    await submitSealedRef.current?.();
   };
   const finalize = async (input: {
     sessionId: string;
@@ -1325,6 +1337,7 @@ export function useLiveRecording(options: {
     await submitSealedRef.current?.();
   };
   return {
+    captureEnded,
     error,
     finalization,
     initialize,

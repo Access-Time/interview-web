@@ -58,6 +58,7 @@ const { CandidateRecordingJourney } = await import(
 const baseProps: CandidateRecordingJourneyProps = {
   blockingError: null,
   blockingErrorTitle: null,
+  captureBlocked: false,
   finalization: null,
   hasStopped: false,
   isReady: false,
@@ -505,4 +506,63 @@ test("connects a stream to an accessible inline camera preview", () => {
   assert.equal(video.autoplay, true);
   assert.equal(video.muted, true);
   assert.equal(video.playsInline, true);
+});
+
+test("capture ended overrides a stale recording flag and focuses submission", async () => {
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      isReady: true,
+      isRecording: true,
+    })
+  );
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      hasStopped: true,
+      isRecording: true,
+    })
+  );
+  const heading = screen.getByRole("heading", {
+    name: "Submitting your recording.",
+  });
+  await waitFor(() => assert.equal(document.activeElement, heading));
+});
+
+test("blocks only Start and Continue when beginning capture is unsafe", () => {
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      blockingError: "This browser can’t save your recording safely right now.",
+      blockingErrorTitle: "Recording can’t be saved",
+      captureBlocked: true,
+      isReady: true,
+    })
+  );
+  assert.equal(
+    screen
+      .getByRole("button", { name: "Start recording" })
+      .hasAttribute("disabled"),
+    true
+  );
+  assert.ok(screen.getByRole("alert"));
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      blockingError:
+        "We found a problem with your recording that needs attention.",
+      blockingErrorTitle: "Recording needs attention",
+      captureBlocked: true,
+      isReady: true,
+      recovered: true,
+    })
+  );
+  assert.equal(
+    screen
+      .getByRole("button", { name: "Continue recording" })
+      .hasAttribute("disabled"),
+    true
+  );
+  assert.ok(screen.getByRole("alert"));
 });

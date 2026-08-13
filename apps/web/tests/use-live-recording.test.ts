@@ -194,14 +194,18 @@ class FakeMediaRecorder extends EventTarget {
 
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
+let resolveFinalization: (() => void) | null = null;
 
 function RecordingHost() {
   latest = useLiveRecording({
     appendSegment: () => Promise.resolve(),
     createSession: () => Promise.resolve(),
-    finalizeSession: () => {
+    finalizeSession: async () => {
       finalizeCalls += 1;
-      return Promise.resolve({ status: "ready" });
+      await new Promise<void>((resolve) => {
+        resolveFinalization = resolve;
+      });
+      return { status: "ready" };
     },
   });
   return null;
@@ -221,6 +225,7 @@ afterEach(() => {
   events.length = 0;
   latest = null;
   finalizeCalls = 0;
+  resolveFinalization = null;
 });
 
 test("normal stop releases tracks after capture and retains submission", async () => {
@@ -251,11 +256,15 @@ test("normal stop releases tracks after capture and retains submission", async (
   });
   await waitFor(() => assert.equal(latest?.isRecording, true));
 
+  let stopPromise: Promise<void> | undefined;
   await act(async () => {
-    await latest?.stop();
+    stopPromise = latest?.stop();
+    await Promise.resolve();
   });
-
   await waitFor(() => assert.equal(finalizeCalls, 1));
+  assert.equal(latest?.captureEnded, true);
+  assert.equal(latest?.stream, null);
+  assert.equal(latest?.isReady, false);
   assert.deepEqual(events, [
     "capture-ended",
     "audio-track-stopped",
@@ -263,4 +272,8 @@ test("normal stop releases tracks after capture and retains submission", async (
   ]);
   assert.equal(latest?.stream, null);
   assert.equal(latest?.isReady, false);
+  await act(async () => {
+    resolveFinalization?.();
+    await stopPromise;
+  });
 });

@@ -33,6 +33,7 @@ const NETWORK_GUIDANCE: Record<RecordingSaveState, string> = {
 };
 
 interface CandidateError {
+  captureBlocked: boolean;
   kind: "blocking" | "saving";
   message: string;
   title: string;
@@ -47,6 +48,7 @@ export function usefulError(
 
   if (PERMISSION_ERROR.test(normalized)) {
     return {
+      captureBlocked: false,
       kind: "blocking",
       message:
         "Camera and microphone access was blocked. Allow both in your browser settings, then try again.",
@@ -55,6 +57,7 @@ export function usefulError(
   }
   if (DEVICE_ERROR.test(normalized)) {
     return {
+      captureBlocked: false,
       kind: "blocking",
       message:
         "We couldn’t connect to both a camera and microphone. Check that they’re plugged in and not in use by another app.",
@@ -63,6 +66,7 @@ export function usefulError(
   }
   if (STORAGE_ERROR.test(normalized)) {
     return {
+      captureBlocked: true,
       kind: "blocking",
       message:
         "This browser can’t save your recording safely right now. Free up space on your device, then try again.",
@@ -71,6 +75,7 @@ export function usefulError(
   }
   if (NETWORK_ERROR.test(normalized)) {
     return {
+      captureBlocked: false,
       kind: "saving",
       message: NETWORK_GUIDANCE[saveState],
       title: "Saving needs attention",
@@ -78,6 +83,7 @@ export function usefulError(
   }
   if (INTEGRITY_ERROR.test(normalized)) {
     return {
+      captureBlocked: true,
       kind: "blocking",
       message:
         "We found a problem with your recording that needs attention. Keep this tab open and try again.",
@@ -85,6 +91,7 @@ export function usefulError(
     };
   }
   return {
+    captureBlocked: false,
     kind: "blocking",
     message:
       "Something went wrong with the recording. Keep this page open and try the action again.",
@@ -94,6 +101,7 @@ export function usefulError(
 
 export function candidateJourneyHandoff(input: {
   actionError: CandidateError | null;
+  captureEnded: boolean;
   controlsHasStopped: boolean;
   finalizationState: RecordingFinalizationState | "idle";
   recordingError: string | null;
@@ -111,8 +119,14 @@ export function candidateJourneyHandoff(input: {
   return {
     blockingError,
     blockingErrorTitle: blockingError ? (visibleError?.title ?? null) : null,
+    captureBlocked: Boolean(
+      input.actionError?.captureBlocked || recordingError?.captureBlocked
+    ),
     finalizationState: input.finalizationState,
-    hasStopped: input.controlsHasStopped || input.finalizationState !== "idle",
+    hasStopped:
+      input.captureEnded ||
+      input.controlsHasStopped ||
+      input.finalizationState !== "idle",
     savingNotice: visibleError?.kind === "saving" ? visibleError.message : null,
   };
 }
@@ -189,6 +203,7 @@ function HomeComponent() {
   const finalizationState = recording.finalization?.state ?? "idle";
   const handoff = candidateJourneyHandoff({
     actionError: controls.actionError,
+    captureEnded: recording.captureEnded,
     controlsHasStopped: controls.hasStopped,
     finalizationState,
     recordingError: recording.error,
@@ -211,6 +226,7 @@ function HomeComponent() {
     <CandidateRecordingJourney
       blockingError={handoff.blockingError}
       blockingErrorTitle={handoff.blockingErrorTitle}
+      captureBlocked={handoff.captureBlocked}
       finalization={recording.finalization}
       hasStopped={handoff.hasStopped}
       isReady={recording.isReady}

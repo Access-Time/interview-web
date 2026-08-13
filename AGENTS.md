@@ -17,6 +17,31 @@ backed by Cloudflare D1 (SQLite) and a private R2 bucket. Standard scripts live 
   If you ever see the `registerHooks` error, run `nvm use 22.22.2` (or start a login shell) first.
 - `pnpm install` itself works on either node version.
 
+### Turbo strict env mode (important, non-obvious)
+- Turborepo 2.x defaults to **strict** env mode, which strips undeclared env vars (including
+  `CLOUDFLARE_API_TOKEN`) from task processes. Because of this, `pnpm dev` (which is
+  `turbo run dev -F @interview-web/infra`) fails with Alchemy's `No credentials found ...
+  set either CLOUDFLARE_API_TOKEN or CLOUDFLARE_API_KEY` even when the token is exported.
+- The environment handles this by exporting `TURBO_ENV_MODE=loose` from `~/.bashrc` (captured
+  in the snapshot), so login/tmux shells forward the token to turbo tasks. If you invoke
+  `pnpm dev` from a non-login shell and hit the credentials error, prefix it with
+  `TURBO_ENV_MODE=loose` (or run `alchemy dev` directly from `packages/infra`).
+
+### Docker (required for `pnpm dev`, non-obvious)
+- `packages/infra/alchemy.run.ts` declares a Cloudflare **Container** (`recording-finalizer-container`,
+  an ffmpeg image built from `packages/finalizer/Dockerfile`). During `alchemy dev`, Alchemy runs
+  `docker build`, so `pnpm dev` **requires a running Docker daemon** — without it dev crashes with
+  `spawn docker ENOENT`.
+- The environment installs `docker.io` + `fuse-overlayfs` and starts `dockerd` on boot (fuse-overlayfs
+  storage driver, needed for nested VMs) via the environment `start` script. If `docker info` fails,
+  run `sudo dockerd >/tmp/dockerd.log 2>&1 &` and `sudo chmod 666 /var/run/docker.sock`.
+
+### Local Alchemy dev state (troubleshooting)
+- `alchemy dev` keeps local resource state under gitignored `.alchemy/` dirs. If a dev run is
+  interrupted mid-provision, a later run may fail on the `[updating] web` path with a spurious
+  `No credentials found`. Clearing state fixes it:
+  `rm -rf .alchemy apps/web/.alchemy packages/infra/.alchemy ~/.alchemy` then `pnpm dev`.
+
 ### Environment / secrets (required to run the app)
 - `apps/web/.env` sets `CORS_ORIGIN=http://localhost:3001` (copied from `.env.example`).
 - `packages/infra/.env` sets `ALCHEMY_PASSWORD` (encrypts Alchemy's local secret state; any
@@ -33,8 +58,7 @@ backed by Cloudflare D1 (SQLite) and a private R2 bucket. Standard scripts live 
 - Tests: `pnpm test` — `node --test` with mocked storage/db (no live services needed).
 - Build: `pnpm build`. Type-check: `pnpm check-types`.
 - Lint/format: `pnpm check` / `pnpm fix` (Ultracite/Biome). Note: the repo currently has
-  pre-existing lint findings in `apps/web/src/routes/todos.tsx` and `packages/env/env.d.ts`;
-  these are not environment issues.
+  a pre-existing lint finding in `packages/env/env.d.ts`; this is not an environment issue.
 
 
 # Ultracite Code Standards

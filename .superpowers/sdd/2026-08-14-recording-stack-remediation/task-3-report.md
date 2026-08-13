@@ -18,7 +18,7 @@ No changes were required in `apps/web/package.json` or `pnpm-lock.yaml`; the Pla
 
 ## Commit
 
-`test: add playwright candidate journey harness`
+`b358aaf test: add playwright candidate journey harness`
 
 ## Concerns
 

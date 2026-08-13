@@ -1,9 +1,7 @@
-import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 // @ts-expect-error jsdom ships no declarations in this workspace.
-import { JSDOM } from "jsdom";
 import React from "react";
+import { afterEach, expect, it } from "vitest";
 import {
   type UseLiveRecordingResult,
   useLiveRecording,
@@ -12,9 +10,6 @@ import {
 const originalDescriptors = new Map<string, PropertyDescriptor | undefined>();
 const NodeEvent = Event;
 const globalProperties = [
-  "window",
-  "document",
-  "HTMLElement",
   "Event",
   "navigator",
   "indexedDB",
@@ -119,39 +114,18 @@ function installIndexedDb() {
 }
 
 function installBrowserGlobals() {
-  const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-    url: "http://localhost",
-  });
   for (const property of globalProperties) {
     originalDescriptors.set(
       property,
       Object.getOwnPropertyDescriptor(globalThis, property)
     );
   }
-  for (const [property, value] of Object.entries({
-    document: dom.window.document,
-    Event: dom.window.Event,
-    HTMLElement: dom.window.HTMLElement,
-    navigator: dom.window.navigator,
-    window: dom.window,
-  })) {
-    Object.defineProperty(globalThis, property, {
-      configurable: true,
-      value,
-      writable: true,
-    });
-  }
-  Object.defineProperty(dom.window.navigator, "onLine", {
-    configurable: true,
-    value: true,
-  });
   Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
     configurable: true,
     value: true,
     writable: true,
   });
   installIndexedDb();
-  return dom;
 }
 
 const events: string[] = [];
@@ -228,7 +202,7 @@ afterEach(() => {
   resolveFinalization = null;
 });
 
-test("normal stop releases tracks after capture and retains submission", async () => {
+it("normal stop releases tracks after capture and retains submission", async () => {
   installBrowserGlobals();
   Object.defineProperty(globalThis, "MediaRecorder", {
     configurable: true,
@@ -244,34 +218,34 @@ test("normal stop releases tracks after capture and retains submission", async (
   });
 
   render(React.createElement(RecordingHost));
-  await waitFor(() => assert.notEqual(latest, null));
+  await waitFor(() => expect(latest).not.toBe(null));
 
   await act(async () => {
     await latest?.initialize();
   });
-  await waitFor(() => assert.equal(latest?.isReady, true));
+  await waitFor(() => expect(latest?.isReady).toBe(true));
 
   await act(async () => {
     await latest?.start();
   });
-  await waitFor(() => assert.equal(latest?.isRecording, true));
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
 
   let stopPromise: Promise<void> | undefined;
   await act(async () => {
     stopPromise = latest?.stop();
     await Promise.resolve();
   });
-  await waitFor(() => assert.equal(finalizeCalls, 1));
-  assert.equal(latest?.captureEnded, true);
-  assert.equal(latest?.stream, null);
-  assert.equal(latest?.isReady, false);
-  assert.deepEqual(events, [
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.stream).toBe(null);
+  expect(latest?.isReady).toBe(false);
+  expect(events).toEqual([
     "capture-ended",
     "audio-track-stopped",
     "video-track-stopped",
   ]);
-  assert.equal(latest?.stream, null);
-  assert.equal(latest?.isReady, false);
+  expect(latest?.stream).toBe(null);
+  expect(latest?.isReady).toBe(false);
   await act(async () => {
     resolveFinalization?.();
     await stopPromise;

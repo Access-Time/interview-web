@@ -1,59 +1,18 @@
-import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
-// @ts-expect-error jsdom ships no declarations in this workspace.
-import { JSDOM } from "jsdom";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import React from "react";
+import { afterEach, expect, it } from "vitest";
 import type { CandidateRecordingJourneyProps } from "../src/recording/candidate-recording-journey";
+import { CandidateRecordingJourney } from "../src/recording/candidate-recording-journey";
 
 const CLOSE_TAB_PATTERN = /may close this tab/i;
 const IMPLEMENTATION_LANGUAGE_PATTERN =
   /\b(session|raw|storage|server|segment|part|queue|acknowledged|finalization|retrieve)\b/i;
-
-const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-  url: "http://localhost",
-});
-
-Object.defineProperties(globalThis, {
-  document: { configurable: true, value: dom.window.document },
-  Event: { configurable: true, value: dom.window.Event },
-  HTMLElement: { configurable: true, value: dom.window.HTMLElement },
-  IS_REACT_ACT_ENVIRONMENT: {
-    configurable: true,
-    value: true,
-    writable: true,
-  },
-  navigator: { configurable: true, value: dom.window.navigator },
-  window: { configurable: true, value: dom.window },
-});
-
-window.matchMedia = () =>
-  ({
-    addEventListener: () => undefined,
-    dispatchEvent: () => false,
-    matches: false,
-    media: "",
-    onchange: null,
-    removeEventListener: () => undefined,
-  }) as unknown as MediaQueryList;
-
-globalThis.ResizeObserver = class {
-  disconnect() {
-    /* Browser fake. */
-  }
-  observe() {
-    /* Browser fake. */
-  }
-  unobserve() {
-    /* Browser fake. */
-  }
-} as typeof ResizeObserver;
-
-const { cleanup, fireEvent, render, screen, waitFor } = await import(
-  "@testing-library/react"
-);
-const { CandidateRecordingJourney } = await import(
-  "../src/recording/candidate-recording-journey"
-);
 
 const baseProps: CandidateRecordingJourneyProps = {
   blockingError: null,
@@ -78,19 +37,19 @@ afterEach(() => {
   cleanup();
 });
 
-test("shows one candidate action for each active primary state", () => {
+it("shows one candidate action for each active primary state", () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, baseProps)
   );
-  assert.ok(
+  expect(
     screen.getByRole("heading", {
       name: "Set up your camera and microphone.",
     })
-  );
-  assert.ok(
+  ).toBeTruthy();
+  expect(
     screen.getByRole("button", { name: "Enable camera and microphone" })
-  );
-  assert.equal(screen.getAllByRole("button").length, 1);
+  ).toBeTruthy();
+  expect(screen.getAllByRole("button").length).toBe(1);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -98,9 +57,11 @@ test("shows one candidate action for each active primary state", () => {
       isReady: true,
     })
   );
-  assert.ok(screen.getByRole("heading", { name: "You’re ready to record." }));
-  assert.ok(screen.getByRole("button", { name: "Start recording" }));
-  assert.equal(screen.getAllByRole("button").length, 1);
+  expect(
+    screen.getByRole("heading", { name: "You’re ready to record." })
+  ).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Start recording" })).toBeTruthy();
+  expect(screen.getAllByRole("button").length).toBe(1);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -109,12 +70,12 @@ test("shows one candidate action for each active primary state", () => {
       isRecording: true,
     })
   );
-  assert.ok(screen.getByText("Recording"));
-  assert.ok(screen.getByRole("button", { name: "Stop recording" }));
-  assert.equal(screen.getAllByRole("button").length, 1);
+  expect(screen.getByText("Recording")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "Stop recording" })).toBeTruthy();
+  expect(screen.getAllByRole("button").length).toBe(1);
 });
 
-test("continues a recovered recording and retries a failed submission", () => {
+it("continues a recovered recording and retries a failed submission", () => {
   let starts = 0;
   let retries = 0;
   const { rerender } = render(
@@ -131,8 +92,8 @@ test("continues a recovered recording and retries a failed submission", () => {
     })
   );
   fireEvent.click(screen.getByRole("button", { name: "Continue recording" }));
-  assert.equal(starts, 1);
-  assert.equal(screen.getAllByRole("button").length, 1);
+  expect(starts).toBe(1);
+  expect(screen.getAllByRole("button").length).toBe(1);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -145,8 +106,8 @@ test("continues a recovered recording and retries a failed submission", () => {
     })
   );
   fireEvent.click(screen.getByRole("button", { name: "Try submitting again" }));
-  assert.equal(retries, 1);
-  assert.equal(screen.getAllByRole("button").length, 1);
+  expect(retries).toBe(1);
+  expect(screen.getAllByRole("button").length).toBe(1);
 });
 
 const stateScenarios: Array<{
@@ -195,14 +156,18 @@ const stateScenarios: Array<{
 ];
 
 for (const scenario of stateScenarios) {
-  test(`renders ${scenario.name}`, () => {
+  it(`renders ${scenario.name}`, () => {
     const { unmount } = render(
       React.createElement(CandidateRecordingJourney, scenario.props)
     );
-    assert.ok(screen.getByRole("heading", { name: scenario.heading }));
+    expect(
+      screen.getByRole("heading", { name: scenario.heading })
+    ).toBeTruthy();
     if (scenario.action) {
-      assert.ok(screen.getByRole("button", { name: scenario.action }));
-      assert.equal(screen.getAllByRole("button").length, 1);
+      expect(
+        screen.getByRole("button", { name: scenario.action })
+      ).toBeTruthy();
+      expect(screen.getAllByRole("button").length).toBe(1);
     } else {
       for (const actionName of [
         "Enable camera and microphone",
@@ -211,18 +176,18 @@ for (const scenario of stateScenarios) {
         "Stop recording",
         "Try submitting again",
       ]) {
-        assert.equal(screen.queryByRole("button", { name: actionName }), null);
+        expect(screen.queryByRole("button", { name: actionName })).toBe(null);
       }
-      assert.equal(screen.queryAllByRole("button").length, 0);
+      expect(screen.queryAllByRole("button").length).toBe(0);
     }
     if (scenario.name === "terminal success") {
-      assert.ok(screen.getByText(CLOSE_TAB_PATTERN));
+      expect(screen.getByText(CLOSE_TAB_PATTERN)).toBeTruthy();
     }
     unmount();
   });
 }
 
-test("uses an alert only for a blocking error", () => {
+it("uses an alert only for a blocking error", () => {
   const { container } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
@@ -230,12 +195,12 @@ test("uses an alert only for a blocking error", () => {
       blockingErrorTitle: "Camera and microphone access blocked",
     })
   );
-  assert.equal(container.querySelectorAll('[role="alert"]').length, 1);
-  assert.ok(screen.getByText("Camera and microphone access blocked"));
-  assert.equal(screen.queryByText("Check your camera and microphone"), null);
+  expect(container.querySelectorAll('[role="alert"]').length).toBe(1);
+  expect(screen.getByText("Camera and microphone access blocked")).toBeTruthy();
+  expect(screen.queryByText("Check your camera and microphone")).toBe(null);
 });
 
-test("labels the controls by the active state heading", () => {
+it("labels the controls by the active state heading", () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, baseProps)
   );
@@ -245,8 +210,8 @@ test("labels the controls by the active state heading", () => {
   let controls = screen.getByRole("complementary", {
     name: "Set up your camera and microphone.",
   });
-  assert.equal(heading.id, "journey-state-heading");
-  assert.equal(controls.getAttribute("aria-labelledby"), heading.id);
+  expect(heading.id).toBe("journey-state-heading");
+  expect(controls.getAttribute("aria-labelledby")).toBe(heading.id);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -258,10 +223,10 @@ test("labels the controls by the active state heading", () => {
   controls = screen.getByRole("complementary", {
     name: "You’re ready to record.",
   });
-  assert.equal(controls.getAttribute("aria-labelledby"), heading.id);
+  expect(controls.getAttribute("aria-labelledby")).toBe(heading.id);
 });
 
-test("keeps saving notices non-alerting and uses the approved copy", () => {
+it("keeps saving notices non-alerting and uses the approved copy", () => {
   for (const [saveState, message] of [
     [
       "offline",
@@ -279,13 +244,13 @@ test("keeps saving notices non-alerting and uses the approved copy", () => {
         saveState,
       })
     );
-    assert.ok(screen.getByText(message));
-    assert.equal(container.querySelector('[role="alert"]'), null);
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(container.querySelector('[role="alert"]')).toBe(null);
     unmount();
   }
 });
 
-test("shows a saving network notice once without a blocking alert", () => {
+it("shows a saving network notice once without a blocking alert", () => {
   const message =
     "Saving needs attention. Keep this tab open and check your connection.";
   const { container } = render(
@@ -294,11 +259,11 @@ test("shows a saving network notice once without a blocking alert", () => {
       savingNotice: message,
     })
   );
-  assert.equal(screen.getAllByText(message).length, 1);
-  assert.equal(container.querySelector('[role="alert"]'), null);
+  expect(screen.getAllByText(message).length).toBe(1);
+  expect(container.querySelector('[role="alert"]')).toBe(null);
 });
 
-test("suppresses a blocking error when submission has failed", () => {
+it("suppresses a blocking error when submission has failed", () => {
   const { container } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
@@ -307,14 +272,13 @@ test("suppresses a blocking error when submission has failed", () => {
       hasStopped: true,
     })
   );
-  assert.equal(
-    screen.queryByText("Camera and microphone access was blocked."),
+  expect(screen.queryByText("Camera and microphone access was blocked.")).toBe(
     null
   );
-  assert.equal(container.querySelectorAll('[role="alert"]').length, 0);
+  expect(container.querySelectorAll('[role="alert"]').length).toBe(0);
 });
 
-test("announces honestly without invented progress or implementation language", () => {
+it("announces honestly without invented progress or implementation language", () => {
   const honestyScenarios: CandidateRecordingJourneyProps[] = [
     baseProps,
     { ...baseProps, isReady: true },
@@ -349,18 +313,17 @@ test("announces honestly without invented progress or implementation language", 
     const liveRegions = container.querySelectorAll(
       '[aria-live="polite"][aria-atomic="true"]'
     );
-    assert.equal(liveRegions.length, 1);
-    assert.equal(screen.queryByRole("progressbar"), null);
-    assert.equal((container.textContent ?? "").includes("%"), false);
-    assert.equal(
-      IMPLEMENTATION_LANGUAGE_PATTERN.test(container.textContent ?? ""),
-      false
-    );
+    expect(liveRegions.length).toBe(1);
+    expect(screen.queryByRole("progressbar")).toBe(null);
+    expect((container.textContent ?? "").includes("%")).toBe(false);
+    expect(
+      IMPLEMENTATION_LANGUAGE_PATTERN.test(container.textContent ?? "")
+    ).toBe(false);
     unmount();
   }
 });
 
-test("moves focus through explicit recording state changes", async () => {
+it("moves focus through explicit recording state changes", async () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, baseProps)
   );
@@ -372,8 +335,7 @@ test("moves focus through explicit recording state changes", async () => {
     })
   );
   await waitFor(() =>
-    assert.equal(
-      document.activeElement,
+    expect(document.activeElement).toBe(
       screen.getByRole("button", { name: "Start recording" })
     )
   );
@@ -386,8 +348,7 @@ test("moves focus through explicit recording state changes", async () => {
     })
   );
   await waitFor(() =>
-    assert.equal(
-      document.activeElement,
+    expect(document.activeElement).toBe(
       screen.getByRole("button", { name: "Stop recording" })
     )
   );
@@ -400,8 +361,7 @@ test("moves focus through explicit recording state changes", async () => {
     })
   );
   await waitFor(() =>
-    assert.equal(
-      document.activeElement,
+    expect(document.activeElement).toBe(
       screen.getByRole("heading", { name: "Submitting your recording." })
     )
   );
@@ -414,17 +374,16 @@ test("moves focus through explicit recording state changes", async () => {
     })
   );
   await waitFor(() =>
-    assert.equal(
-      document.activeElement,
+    expect(document.activeElement).toBe(
       screen.getByRole("heading", {
         name: "Your recording is saved, but we couldn’t finish submitting it.",
       })
     )
   );
-  assert.equal(screen.queryByRole("alert"), null);
+  expect(screen.queryByRole("alert")).toBe(null);
 });
 
-test("focuses Continue recording after recovered media becomes ready", async () => {
+it("focuses Continue recording after recovered media becomes ready", async () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
@@ -439,14 +398,13 @@ test("focuses Continue recording after recovered media becomes ready", async () 
     })
   );
   await waitFor(() =>
-    assert.equal(
-      document.activeElement,
+    expect(document.activeElement).toBe(
       screen.getByRole("button", { name: "Continue recording" })
     )
   );
 });
 
-test("uses finite pending labels and disables each action", () => {
+it("uses finite pending labels and disables each action", () => {
   const pendingScenarios: Array<{
     label: string;
     props: CandidateRecordingJourneyProps;
@@ -484,13 +442,13 @@ test("uses finite pending labels and disables each action", () => {
       React.createElement(CandidateRecordingJourney, scenario.props)
     );
     const button = screen.getByRole("button", { name: scenario.label });
-    assert.equal(button.hasAttribute("disabled"), true);
-    assert.equal(screen.getAllByRole("button").length, 1);
+    expect(button.hasAttribute("disabled")).toBe(true);
+    expect(screen.getAllByRole("button").length).toBe(1);
     unmount();
   }
 });
 
-test("connects a stream to an accessible inline camera preview", () => {
+it("connects a stream to an accessible inline camera preview", () => {
   const stream = {} as MediaStream;
   render(
     React.createElement(CandidateRecordingJourney, {
@@ -502,13 +460,13 @@ test("connects a stream to an accessible inline camera preview", () => {
   const video = screen.getByLabelText(
     "Your camera preview"
   ) as HTMLVideoElement;
-  assert.equal(video.srcObject, stream);
-  assert.equal(video.autoplay, true);
-  assert.equal(video.muted, true);
-  assert.equal(video.playsInline, true);
+  expect(video.srcObject).toBe(stream);
+  expect(video.autoplay).toBe(true);
+  expect(video.muted).toBe(true);
+  expect(video.playsInline).toBe(true);
 });
 
-test("capture ended overrides a stale recording flag and focuses submission", async () => {
+it("capture ended overrides a stale recording flag and focuses submission", async () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
@@ -526,10 +484,10 @@ test("capture ended overrides a stale recording flag and focuses submission", as
   const heading = screen.getByRole("heading", {
     name: "Submitting your recording.",
   });
-  await waitFor(() => assert.equal(document.activeElement, heading));
+  await waitFor(() => expect(document.activeElement).toBe(heading));
 });
 
-test("blocks only Start and Continue when beginning capture is unsafe", () => {
+it("blocks only Start and Continue when beginning capture is unsafe", () => {
   const { rerender } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
@@ -539,13 +497,12 @@ test("blocks only Start and Continue when beginning capture is unsafe", () => {
       isReady: true,
     })
   );
-  assert.equal(
+  expect(
     screen
       .getByRole("button", { name: "Start recording" })
-      .hasAttribute("disabled"),
-    true
-  );
-  assert.ok(screen.getByRole("alert"));
+      .hasAttribute("disabled")
+  ).toBe(true);
+  expect(screen.getByRole("alert")).toBeTruthy();
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -558,11 +515,10 @@ test("blocks only Start and Continue when beginning capture is unsafe", () => {
       recovered: true,
     })
   );
-  assert.equal(
+  expect(
     screen
       .getByRole("button", { name: "Continue recording" })
-      .hasAttribute("disabled"),
-    true
-  );
-  assert.ok(screen.getByRole("alert"));
+      .hasAttribute("disabled")
+  ).toBe(true);
+  expect(screen.getByRole("alert")).toBeTruthy();
 });

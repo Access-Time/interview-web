@@ -24,7 +24,6 @@ const PENDING_ERROR = /pending/i;
 const UPLOAD_ERROR = /upload failed|pending/i;
 const CONFLICT_FINALIZE_ERROR = /conflicting parts and cannot be finalized/;
 const GAP_FINALIZE_ERROR = /missing ordered parts and cannot be finalized/;
-const DRAIN_OR_CONFLICT_ERROR = /conflicting|pending|upload/i;
 const HELLO_CHECKSUM =
   "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 const OTHER_CHECKSUM =
@@ -54,13 +53,20 @@ function manifestParts(
   };
 }
 
-function recoveryHarness(parts: RecordingPart[], session = recordingSession) {
+function recoveryHarness(
+  parts: RecordingPart[],
+  session = recordingSession,
+  storeOptions?: { deleteError?: Error }
+) {
   const stored = [...parts];
   const sessions = [session];
   const deleted: RecordingPart[] = [];
   const calls: Request[] = [];
   const store = {
     delete: (value: RecordingPart) => {
+      if (storeOptions?.deleteError) {
+        return Promise.reject(storeOptions.deleteError);
+      }
       deleted.push(value);
       const index = stored.findIndex(
         (item) =>
@@ -497,7 +503,29 @@ test("lost acknowledgement drops a matching local copy without discarding bytes"
   assert.equal(harnessed.calls.length, 0);
   assert.equal(harnessed.deleted.length, 1);
   assert.equal(harnessed.stored.length, 0);
+  harnessed.box.dispose();
+});
+
+test("reconcile continues when dropping an acknowledged part fails in storage", async () => {
+  const local = { ...part, sequence: 3 };
+  const harnessed = recoveryHarness([local], recordingSession, {
+    deleteError: new Error("IndexedDB delete failed"),
+  });
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(() =>
+    Promise.resolve(
+      manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+        { sequence: 3 },
+      ])
+    )
+  );
+  assert.equal(recovery.recovered, true);
+  assert.equal(recovery.integrity, "ok");
   assert.equal(harnessed.box.pendingCount, 0);
+  assert.equal(harnessed.stored.length, 1);
   harnessed.box.dispose();
 });
 
@@ -540,7 +568,7 @@ test("conflicting checksums retain local media and refuse finalization", async (
   assert.equal(harnessed.box.pendingCount, 1);
   assert.equal(harnessed.box.saveState, "error");
   assert.equal(integrityMessage("conflict")?.includes("conflicting"), true);
-  await assert.rejects(harnessed.box.drain(), DRAIN_OR_CONFLICT_ERROR);
+  await assert.rejects(harnessed.box.drain(), PENDING_ERROR);
   assert.throws(
     () => harnessed.box.assertCanFinalize(),
     CONFLICT_FINALIZE_ERROR

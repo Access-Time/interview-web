@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";
 export type RecordingIntegrity = "ok" | "gap" | "conflict";
@@ -201,21 +207,18 @@ export async function reconcileRecordingParts(input: {
   session: RecordingSession | null;
 }> {
   const remote = acknowledgedChecksums(input.manifest);
-  const checksumEntries = input.manifest
-    ? await Promise.all(
-        input.localParts
-          .filter((part) =>
-            remote.has(partIdentity(part.segmentId, part.sequence))
-          )
-          .map(async (part) => {
-            const checksum = await recordingBlobChecksum(part.blob);
-            return [
-              partIdentity(part.segmentId, part.sequence),
-              checksum,
-            ] as const;
-          })
-      )
-    : [];
+  const checksumEntries: Array<readonly [string, string]> = [];
+  if (input.manifest) {
+    for (const part of input.localParts) {
+      const identity = partIdentity(part.segmentId, part.sequence);
+      if (!remote.has(identity)) {
+        continue;
+      }
+      // biome-ignore lint/performance/noAwaitInLoops: hash acknowledged parts sequentially to bound memory.
+      const checksum = await recordingBlobChecksum(part.blob);
+      checksumEntries.push([identity, checksum]);
+    }
+  }
   const localChecksums = new Map(checksumEntries);
   const drop: RecordingPart[] = [];
   const keep: RecordingPart[] = [];
@@ -517,7 +520,15 @@ export function createLiveRecordingOutbox(
   ) => {
     const { conflicts, drop, integrity: nextIntegrity, session } = result;
     integrity = nextIntegrity;
-    await Promise.all(drop.map((item) => store.delete(item)));
+    await Promise.all(
+      drop.map(async (item) => {
+        try {
+          await store.delete(item);
+        } catch {
+          /* Keep reconcile moving if a single IndexedDB delete fails. */
+        }
+      })
+    );
     for (const item of drop) {
       pending.delete(key(item));
       failed.delete(key(item));
@@ -684,6 +695,30 @@ export function createLiveRecordingOutbox(
   };
 }
 
+interface OutboxSnapshot {
+  integrity: RecordingIntegrity;
+  pendingPartCount: number;
+  saveState: RecordingSaveState;
+}
+
+const IDLE_OUTBOX_SNAPSHOT: OutboxSnapshot = {
+  integrity: "ok",
+  pendingPartCount: 0,
+  saveState: "healthy",
+};
+
+function snapshotOutbox(
+  box: ReturnType<typeof createLiveRecordingOutbox> | null
+): OutboxSnapshot {
+  return box
+    ? {
+        integrity: box.integrity,
+        pendingPartCount: box.pendingCount,
+        saveState: box.saveState,
+      }
+    : IDLE_OUTBOX_SNAPSHOT;
+}
+
 export function useLiveRecording(options: {
   createSession: (input: {
     sessionId: string;
@@ -746,7 +781,20 @@ export function useLiveRecording(options: {
     }>
   >([]);
   const submitSealedRef = useRef<(() => Promise<void>) | null>(null);
-  const [, redraw] = useState(0);
+  const outboxSnapshot = useRef(IDLE_OUTBOX_SNAPSHOT);
+  const outboxListeners = useRef(new Set<() => void>());
+  const subscribeOutbox = useCallback((onStoreChange: () => void) => {
+    outboxListeners.current.add(onStoreChange);
+    return () => {
+      outboxListeners.current.delete(onStoreChange);
+    };
+  }, []);
+  const getOutboxSnapshot = useCallback(() => outboxSnapshot.current, []);
+  const outboxView = useSyncExternalStore(
+    subscribeOutbox,
+    getOutboxSnapshot,
+    () => IDLE_OUTBOX_SNAPSHOT
+  );
 
   const cancelFinalizationPolling = () => {
     pollGeneration.current += 1;
@@ -851,10 +899,25 @@ export function useLiveRecording(options: {
       }
     });
     outbox.current = box;
+    const emitOutbox = () => {
+      const next = snapshotOutbox(box);
+      const { current } = outboxSnapshot;
+      if (
+        current.integrity !== next.integrity ||
+        current.pendingPartCount !== next.pendingPartCount ||
+        current.saveState !== next.saveState
+      ) {
+        outboxSnapshot.current = next;
+      }
+      for (const listener of outboxListeners.current) {
+        listener();
+      }
+    };
     const unsubscribe = box.subscribe(() => {
-      redraw((value) => value + 1);
+      emitOutbox();
       ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
     });
+    emitOutbox();
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: sealed plans are intentionally drained and submitted in order.
     const submitSealed = async () => {
       // biome-ignore lint/suspicious/noUnnecessaryConditions: this ref is a runtime serialization lock.
@@ -916,10 +979,13 @@ export function useLiveRecording(options: {
       }
       if (recovery.session) {
         session.current = recovery.session;
-        ids.current = {
-          segmentId: recovery.session.segments.at(-1)?.segmentId ?? "",
-          sessionId: recovery.session.sessionId,
-        };
+        const lastSegment = recovery.session.segments.at(-1);
+        if (lastSegment) {
+          ids.current = {
+            segmentId: lastSegment.segmentId,
+            sessionId: recovery.session.sessionId,
+          };
+        }
       }
       const message = integrityMessage(recovery.integrity);
       if (message) {
@@ -927,40 +993,53 @@ export function useLiveRecording(options: {
       }
       return recovery;
     };
+    const enqueueRecovery = (task: () => Promise<void>) => {
+      const next = (recoveryPromise.current ?? Promise.resolve())
+        .catch(() => undefined)
+        .then(async () => {
+          if (generation !== recoveryGeneration.current || isDisposed()) {
+            return;
+          }
+          await task();
+        });
+      recoveryPromise.current = next;
+      return next;
+    };
     const online = () => {
       ignorePromise(
-        (async () => {
+        enqueueRecovery(async () => {
           await box.setOnline(true, { flush: false });
           await applyRecovery();
           await submitSealed();
-        })()
+        })
       );
     };
     const offline = () => box.setOnline(false);
     window.addEventListener("online", online);
     window.addEventListener("offline", offline);
     box.setOnline(navigator.onLine, { flush: false });
-    recoveryPromise.current = (async () => {
-      await box.hydrate();
-      if (generation !== recoveryGeneration.current || isDisposed()) {
-        return;
-      }
-      await applyRecovery();
-      if (generation !== recoveryGeneration.current || isDisposed()) {
-        return;
-      }
-      const sessions = await box.getSessions();
-      sealedPlans.current = sessions
-        .filter((item) => item.status === "sealed")
-        .map((item) => ({
-          segments: item.segments,
-          sessionId: item.sessionId,
-        }));
-      if (sealedPlans.current.length) {
-        await submitSealed();
-      }
-    })();
-    ignorePromise(recoveryPromise.current);
+    ignorePromise(
+      enqueueRecovery(async () => {
+        await box.hydrate();
+        if (generation !== recoveryGeneration.current || isDisposed()) {
+          return;
+        }
+        await applyRecovery();
+        if (generation !== recoveryGeneration.current || isDisposed()) {
+          return;
+        }
+        const sessions = await box.getSessions();
+        sealedPlans.current = sessions
+          .filter((item) => item.status === "sealed")
+          .map((item) => ({
+            segments: item.segments,
+            sessionId: item.sessionId,
+          }));
+        if (sealedPlans.current.length) {
+          await submitSealed();
+        }
+      })
+    );
     return () => {
       lifecycle.current = true;
       recoveryGeneration.current += 1;
@@ -1242,13 +1321,13 @@ export function useLiveRecording(options: {
     error,
     finalization,
     initialize,
-    integrity: outbox.current?.integrity ?? "ok",
+    integrity: outboxView.integrity,
     isReady,
     isRecording,
-    pendingPartCount: outbox.current?.pendingCount ?? 0,
+    pendingPartCount: outboxView.pendingPartCount,
     recovered,
     retryFinalization,
-    saveState: outbox.current?.saveState ?? "healthy",
+    saveState: outboxView.saveState,
     start,
     stop,
     stream,

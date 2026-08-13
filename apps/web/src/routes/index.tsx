@@ -503,6 +503,7 @@ function RecordingControls({
       )}
 
       {recording.recovered &&
+      !hasStopped &&
       !recording.isRecording &&
       finalizationState === "idle" ? (
         <p className="mt-3 text-sm text-stone-400 leading-6">
@@ -652,10 +653,10 @@ function HomeComponent() {
   const hasStopped = controls.hasStopped || finalizationState !== "idle";
 
   useEffect(() => {
+    if (recording.pendingPartCount === 0) {
+      return;
+    }
     const warnPending = (event: BeforeUnloadEvent) => {
-      if (recording.pendingPartCount === 0) {
-        return;
-      }
       event.preventDefault();
       event.returnValue = "";
     };

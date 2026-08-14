@@ -1,24 +1,46 @@
-import {
-  createContext,
-  type RecordingBindings,
-} from "@interview-web/api/context";
+import { createContext } from "@interview-web/api/context";
+import { dispatchFinalization } from "@interview-web/api/finalizer";
 import { recordingRouter } from "@interview-web/api/routers/recording";
-import type {
-  AppendRecordingSegmentResult,
-  CreateRecordingSessionResult,
-  RecordingFinalizeResult,
-  RecordingPlaybackCursor,
-  RecordingPlaybackPage,
-  RecordingPlaybackSummary,
-  RecordingStatus,
+import {
+  appendRecordingSegment,
+  createRecordingSession,
+  type Database,
+  finalizeRecording,
+  getRecordingManifest,
+  getRecordingPlaybackSummary,
+  getRecordingStatus,
+  listRecordingPlaybackSummaries,
+  type RecordingPlaybackCursor,
+  type RecordingPlaybackPage,
+  type RecordingPlaybackSummary,
 } from "@interview-web/db";
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
-import { expect, it, vi } from "vitest";
-import { dispatchFinalization } from "@/routes/api/rpc/$";
+import { beforeEach, expect, it, vi } from "vitest";
 
-vi.mock("@interview-web/env/server", () => ({ env: {} }));
+const { finalizerFetch } = vi.hoisted(() => ({
+  finalizerFetch: vi.fn<(request: Request) => Promise<Response>>(),
+}));
+
+vi.mock("@interview-web/env/server", () => ({
+  env: { FINALIZER: { fetch: finalizerFetch } },
+}));
+
+vi.mock("@interview-web/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@interview-web/db")>();
+  return {
+    ...actual,
+    appendRecordingSegment: vi.fn(),
+    createDb: vi.fn(() => ({}) as Database),
+    createRecordingSession: vi.fn(),
+    finalizeRecording: vi.fn(),
+    getRecordingManifest: vi.fn(),
+    getRecordingPlaybackSummary: vi.fn(),
+    getRecordingStatus: vi.fn(),
+    listRecordingPlaybackSummaries: vi.fn(),
+  };
+});
 
 const input = {
   recorderMimeType: "video/webm;codecs=opus",
@@ -43,12 +65,12 @@ const playbackPage: RecordingPlaybackPage = {
   items: [playbackSummary],
   nextCursor: null,
 };
+const db = {} as Database;
+
 interface RecordingClient {
   recording: {
-    appendSegment: (
-      value: typeof input
-    ) => Promise<AppendRecordingSegmentResult>;
-    create: (value: typeof input) => Promise<CreateRecordingSessionResult>;
+    appendSegment: (value: typeof input) => Promise<unknown>;
+    create: (value: typeof input) => Promise<unknown>;
     getManifest: (value: { sessionId: string }) => Promise<typeof manifest>;
     getPlaybackSummary: (value: {
       sessionId: string;
@@ -56,82 +78,23 @@ interface RecordingClient {
     finalize: (value: {
       sessionId: string;
       segments: Array<{ segmentId: string; partCount: number }>;
-    }) => Promise<RecordingFinalizeResult>;
-    getStatus: (value: { sessionId: string }) => Promise<RecordingStatus>;
+    }) => Promise<unknown>;
+    getStatus: (value: { sessionId: string }) => Promise<unknown>;
     listPlaybackSummaries: (value: {
       cursor?: RecordingPlaybackCursor;
     }) => Promise<RecordingPlaybackPage>;
   };
 }
-type PlaybackBindingOverrides = Partial<
-  Pick<
-    RecordingBindings,
-    "getRecordingPlaybackSummary" | "listRecordingPlaybackSummaries"
-  >
->;
 
-function setup(
-  getManifest: RecordingBindings["getRecordingManifest"] = async () => manifest,
-  createRecordingSession: RecordingBindings["createRecordingSession"] = async (
-    value
-  ) => ({
-    recorderMimeType: value.recorderMimeType ?? null,
-    requestedMimeType: value.requestedMimeType ?? null,
-    segmentId: value.segmentId,
-    sessionId: value.sessionId,
-  }),
-  finalizeRecording: RecordingBindings["finalizeRecording"] = async () => ({
-    status: "queued",
-  }),
-  getRecordingStatus: RecordingBindings["getRecordingStatus"] = async () => ({
-    status: "queued",
-  }),
-  enqueueFinalization: RecordingBindings["enqueueFinalization"] = () =>
-    Promise.resolve(),
-  appendRecordingSegment: RecordingBindings["appendRecordingSegment"] = async (
-    value
-  ) => ({
-    index: 1,
-    recorderMimeType: value.recorderMimeType ?? null,
-    requestedMimeType: value.requestedMimeType ?? null,
-    segmentId: value.segmentId,
-    sessionId: value.sessionId,
-  }),
-  playbackBindings: PlaybackBindingOverrides = {}
-) {
-  const createCalls: unknown[] = [];
-  const enqueueCalls: unknown[] = [];
-  const bindings: RecordingBindings = {
-    appendRecordingSegment,
-    createRecordingSession: (value) => {
-      createCalls.push(value);
-      return createRecordingSession(value);
-    },
-    enqueueFinalization: (sessionId) => {
-      enqueueCalls.push({ sessionId });
-      return enqueueFinalization(sessionId);
-    },
-    finalizeRecording,
-    getRecordingManifest: getManifest,
-    getRecordingPlaybackSummary:
-      playbackBindings.getRecordingPlaybackSummary ??
-      (async () => playbackSummary),
-    getRecordingStatus,
-    listRecordingPlaybackSummaries:
-      playbackBindings.listRecordingPlaybackSummaries ??
-      (async () => playbackPage),
-  };
+function createClient() {
   const handler = new RPCHandler({ recording: recordingRouter });
-  const client = createORPCClient(
+  return createORPCClient(
     new RPCLink({
       fetch: (request, init) => {
-        const originalRequest = new Request(request, init);
-        const adaptedRequest = new Request(originalRequest);
+        const adaptedRequest = new Request(new Request(request, init));
         return handler
           .handle(adaptedRequest, {
-            context: createContext({
-              bindings,
-            }),
+            context: createContext(),
             prefix: "/rpc",
           })
           .then(
@@ -141,38 +104,51 @@ function setup(
       url: "https://example.test/rpc",
     })
   ) as unknown as RecordingClient;
-  return {
-    client,
-    createCalls,
-    enqueueCalls,
-  };
 }
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  finalizerFetch.mockResolvedValue(new Response(null, { status: 202 }));
+  vi.mocked(appendRecordingSegment).mockImplementation(async (_db, value) => ({
+    index: 1,
+    recorderMimeType: value.recorderMimeType ?? null,
+    requestedMimeType: value.requestedMimeType ?? null,
+    segmentId: value.segmentId,
+    sessionId: value.sessionId,
+  }));
+  vi.mocked(createRecordingSession).mockImplementation(async (_db, value) => ({
+    recorderMimeType: value.recorderMimeType ?? null,
+    requestedMimeType: value.requestedMimeType ?? null,
+    segmentId: value.segmentId,
+    sessionId: value.sessionId,
+  }));
+  vi.mocked(finalizeRecording).mockResolvedValue({ status: "queued" });
+  vi.mocked(getRecordingManifest).mockResolvedValue(manifest);
+  vi.mocked(getRecordingPlaybackSummary).mockResolvedValue(playbackSummary);
+  vi.mocked(getRecordingStatus).mockResolvedValue({ status: "queued" });
+  vi.mocked(listRecordingPlaybackSummaries).mockResolvedValue(playbackPage);
+});
+
 it("recording.appendSegment is public and returns the appended segment", async () => {
-  const { client } = setup();
+  const client = createClient();
   expect(await client.recording.appendSegment(input)).toEqual({
     ...input,
     index: 1,
   });
+  expect(appendRecordingSegment).toHaveBeenCalledWith(db, input);
 });
 
 it("recording.appendSegment maps conflicts and rejects invalid input", async () => {
-  const { client } = setup(
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    () => {
-      const error = new Error("conflict");
-      error.name = "AppendRecordingSegmentConflictError";
-      return Promise.reject(error);
-    }
-  );
+  const client = createClient();
+  vi.mocked(appendRecordingSegment).mockImplementation(() => {
+    const error = new Error("conflict");
+    error.name = "AppendRecordingSegmentConflictError";
+    return Promise.reject(error);
+  });
   await expect(() =>
     client.recording.appendSegment(input)
   ).rejects.toMatchObject({
-    code: "CONFLICT",
+    code: "SEGMENT_CONFLICT",
     status: 409,
   });
   await expect(() =>
@@ -181,44 +157,44 @@ it("recording.appendSegment maps conflicts and rejects invalid input", async () 
 });
 
 it("recording.finalize and recording.getStatus are public", async () => {
-  const result = setup();
+  const client = createClient();
   expect(
-    await result.client.recording.finalize({
+    await client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
     })
   ).toEqual({ status: "queued" });
   expect(
-    await result.client.recording.getStatus({ sessionId: input.sessionId })
+    await client.recording.getStatus({ sessionId: input.sessionId })
   ).toEqual({ status: "queued" });
 });
 
 it("recording.finalize enqueues once after persistence", async () => {
   const events: string[] = [];
-  const { client, enqueueCalls } = setup(
-    undefined,
-    undefined,
-    () => {
-      events.push("persist");
-      return Promise.resolve({ status: "queued" as const });
-    },
-    undefined,
-    (sessionId) => {
-      events.push(`enqueue:${sessionId}`);
-      return Promise.resolve();
-    }
-  );
+  const client = createClient();
+  vi.mocked(finalizeRecording).mockImplementation(() => {
+    events.push("persist");
+    return Promise.resolve({ status: "queued" as const });
+  });
+  finalizerFetch.mockImplementation(async (request) => {
+    const body = (await request.clone().json()) as { sessionId: string };
+    events.push(`enqueue:${body.sessionId}`);
+    return new Response(null, { status: 202 });
+  });
+
   await client.recording.finalize({
     segments: [{ partCount: 1, segmentId: input.segmentId }],
     sessionId: input.sessionId,
   });
-  expect(enqueueCalls).toEqual([{ sessionId: input.sessionId }]);
+
+  expect(finalizerFetch).toHaveBeenCalledTimes(1);
   expect(events).toEqual(["persist", `enqueue:${input.sessionId}`]);
 });
 
 it("recording.finalize forwards every status result", async () => {
+  const client = createClient();
   for (const status of ["queued", "finalizing", "ready", "failed"] as const) {
-    const { client } = setup(undefined, undefined, async () => ({ status }));
+    vi.mocked(finalizeRecording).mockResolvedValueOnce({ status });
     expect(
       // biome-ignore lint/performance/noAwaitInLoops: statuses are asserted in order.
       await client.recording.finalize({
@@ -230,31 +206,27 @@ it("recording.finalize forwards every status result", async () => {
 });
 
 it("recording.finalize does not enqueue non-queued results", async () => {
+  const client = createClient();
   for (const status of ["finalizing", "ready", "failed"] as const) {
-    const { client, enqueueCalls } = setup(undefined, undefined, async () => ({
-      status,
-    }));
+    vi.mocked(finalizeRecording).mockResolvedValueOnce({ status });
     // biome-ignore lint/performance/noAwaitInLoops: statuses are asserted in order.
     await client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
     });
-    expect(enqueueCalls).toEqual([]);
+    expect(finalizerFetch).not.toHaveBeenCalled();
   }
 });
 
 it("recording.finalize rejects when enqueue fails after persistence", async () => {
   let persisted = false;
-  const { client, enqueueCalls } = setup(
-    undefined,
-    undefined,
-    () => {
-      persisted = true;
-      return Promise.resolve({ status: "queued" as const });
-    },
-    undefined,
-    () => Promise.reject(new Error("queue unavailable"))
-  );
+  const client = createClient();
+  vi.mocked(finalizeRecording).mockImplementation(() => {
+    persisted = true;
+    return Promise.resolve({ status: "queued" as const });
+  });
+  finalizerFetch.mockResolvedValue(new Response(null, { status: 503 }));
+
   await expect(
     client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
@@ -262,7 +234,7 @@ it("recording.finalize rejects when enqueue fails after persistence", async () =
     })
   ).rejects.toThrow();
   expect(persisted).toBe(true);
-  expect(enqueueCalls).toEqual([{ sessionId: input.sessionId }]);
+  expect(finalizerFetch).toHaveBeenCalledTimes(1);
 });
 
 it("dispatchFinalization sends the session through the private binding", async () => {
@@ -292,11 +264,12 @@ it("dispatchFinalization rejects a failed private binding response", async () =>
 });
 
 for (const [name, errorName, status, code] of [
-  ["not found", "RecordingNotFoundError", 404, "NOT_FOUND"],
-  ["conflicts", "RecordingFinalizeConflictError", 409, "CONFLICT"],
+  ["not found", "RecordingNotFoundError", 404, "RECORDING_NOT_FOUND"],
+  ["conflicts", "RecordingFinalizeConflictError", 409, "FINALIZE_CONFLICT"],
 ] as const) {
   it(`recording.finalize maps ${name}`, async () => {
-    const { client } = setup(undefined, undefined, () => {
+    const client = createClient();
+    vi.mocked(finalizeRecording).mockImplementation(() => {
       const error = new Error("database error");
       error.name = errorName;
       return Promise.reject(error);
@@ -311,8 +284,9 @@ for (const [name, errorName, status, code] of [
 }
 
 it("recording.finalize rejects invalid input at the public boundary", async () => {
-  const { client } = setup(undefined, undefined, () =>
-    Promise.reject(new Error("must not be called"))
+  const client = createClient();
+  vi.mocked(finalizeRecording).mockRejectedValue(
+    new Error("must not be called")
   );
   const invalidInputs = [
     {
@@ -359,69 +333,61 @@ it("recording.finalize rejects invalid input at the public boundary", async () =
       status: 400,
     });
   }
+  expect(finalizeRecording).not.toHaveBeenCalled();
 });
 
-it("recording.create is public and calls the injected helper", async () => {
-  const { client, createCalls } = setup();
+it("recording.create is public and calls the session service", async () => {
+  const client = createClient();
   expect(await client.recording.create(input)).toEqual(input);
-  expect(createCalls.length).toBe(1);
+  expect(createRecordingSession).toHaveBeenCalledTimes(1);
 });
 
 it("recording.create forwards and returns MIME metadata", async () => {
-  const { client, createCalls } = setup();
+  const client = createClient();
   expect(await client.recording.create(input)).toEqual(input);
-  expect(createCalls).toEqual([input]);
+  expect(createRecordingSession).toHaveBeenCalledWith(db, input);
 });
 
-it("recording.create maps session conflicts to Conflict", async () => {
-  const setupResult = setup(undefined, () => {
+it("recording.create maps session conflicts to SESSION_CONFLICT", async () => {
+  const client = createClient();
+  vi.mocked(createRecordingSession).mockImplementation(() => {
     const error = new Error("conflict");
     error.name = "CreateRecordingSessionConflictError";
     throw error;
   });
-  await expect(
-    setupResult.client.recording.create(input)
-  ).rejects.toMatchObject({
-    code: "CONFLICT",
+  await expect(client.recording.create(input)).rejects.toMatchObject({
+    code: "SESSION_CONFLICT",
     status: 409,
   });
 });
 
 it("recording.getManifest is public and returns the manifest", async () => {
-  const setupResult = setup();
+  const client = createClient();
   expect(
-    await setupResult.client.recording.getManifest({
+    await client.recording.getManifest({
       sessionId: input.sessionId,
     })
   ).toEqual(manifest);
 });
 
-it("missing manifest maps to Not Found", async () => {
-  const setupResult = setup(async () => null);
+it("missing manifest maps to RECORDING_NOT_FOUND", async () => {
+  const client = createClient();
+  vi.mocked(getRecordingManifest).mockResolvedValue(null);
   await expect(
-    setupResult.client.recording.getManifest({
+    client.recording.getManifest({
       sessionId: "missing",
     })
-  ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+  ).rejects.toMatchObject({ code: "RECORDING_NOT_FOUND", status: 404 });
 });
 
 it("recording.listPlaybackSummaries forwards its cursor and returns only playback fields", async () => {
   const cursor = { createdAt: 1_724_999_999_999, id: "session-0" };
   const received: Array<{ cursor?: RecordingPlaybackCursor }> = [];
-  const { client } = setup(
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    {
-      listRecordingPlaybackSummaries: (value) => {
-        received.push(value);
-        return Promise.resolve(playbackPage);
-      },
-    }
-  );
+  const client = createClient();
+  vi.mocked(listRecordingPlaybackSummaries).mockImplementation((_db, value) => {
+    received.push(value);
+    return Promise.resolve(playbackPage);
+  });
 
   const result = await client.recording.listPlaybackSummaries({ cursor });
 
@@ -438,39 +404,17 @@ it("recording.listPlaybackSummaries forwards its cursor and returns only playbac
   expect(received).toEqual([{}]);
 });
 
-it("recording.getPlaybackSummary maps a missing summary to NOT_FOUND", async () => {
-  const { client } = setup(
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    {
-      getRecordingPlaybackSummary: async () => null,
-    }
-  );
+it("recording.getPlaybackSummary maps a missing summary to RECORDING_NOT_FOUND", async () => {
+  const client = createClient();
+  vi.mocked(getRecordingPlaybackSummary).mockResolvedValue(null);
 
   await expect(
     client.recording.getPlaybackSummary({ sessionId: "missing" })
-  ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+  ).rejects.toMatchObject({ code: "RECORDING_NOT_FOUND", status: 404 });
 });
 
-it("recording playback procedures reject invalid input before calling bindings", async () => {
-  const getPlaybackSummary = vi.fn();
-  const listPlaybackSummaries = vi.fn();
-  const { client } = setup(
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    {
-      getRecordingPlaybackSummary: getPlaybackSummary,
-      listRecordingPlaybackSummaries: listPlaybackSummaries,
-    }
-  );
+it("recording playback procedures reject invalid input before calling services", async () => {
+  const client = createClient();
 
   await expect(
     client.recording.getPlaybackSummary({ sessionId: "" })
@@ -503,6 +447,6 @@ it("recording playback procedures reject invalid input before calling bindings",
     )
   ).rejects.toMatchObject({ status: 400 });
 
-  expect(getPlaybackSummary).not.toHaveBeenCalled();
-  expect(listPlaybackSummaries).not.toHaveBeenCalled();
+  expect(getRecordingPlaybackSummary).not.toHaveBeenCalled();
+  expect(listRecordingPlaybackSummaries).not.toHaveBeenCalled();
 });

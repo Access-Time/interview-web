@@ -11,6 +11,7 @@ import {
   useLiveRecording,
 } from "@/recording/live-recording";
 import { client } from "@/utils/orpc";
+import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export const Route = createFileRoute("/")({
   component: HomeComponent,
@@ -84,14 +85,7 @@ export async function recordingManifestLookup(
       manifest: await getManifest(input),
     };
   } catch (error) {
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed oRPC boundary.
-    if (
-      typeof error === "object" &&
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed boundary guard.
-      error !== null &&
-      "code" in error &&
-      error.code === "NOT_FOUND"
-    ) {
+    if (isRecordingNotFoundError(error)) {
       return { kind: "missing" };
     }
     throw error;

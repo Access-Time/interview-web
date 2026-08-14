@@ -2,6 +2,7 @@ import type {
   RecordingPlaybackStatus,
   RecordingPlaybackSummary,
 } from "@interview-web/db";
+import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export type PlaybackDetailKind = "playable" | "processing" | "unavailable";
 
@@ -71,13 +72,7 @@ export async function playbackSummaryLookup(
       summary: await getSummary(input),
     };
   } catch (error) {
-    if (
-      typeof error === "object" &&
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed oRPC boundary.
-      error !== null &&
-      "code" in error &&
-      error.code === "NOT_FOUND"
-    ) {
+    if (isRecordingNotFoundError(error)) {
       return { kind: "missing" };
     }
     throw error;

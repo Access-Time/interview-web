@@ -1,150 +1,92 @@
-import { ORPCError } from "@orpc/server";
-import z from "zod";
-import type { RecordingBindings } from "../context.ts";
-import { publicProcedure } from "../index.ts";
-
-const sessionInput = z.object({
-  recorderMimeType: z.string().nullable().optional(),
-  requestedMimeType: z.string().nullable().optional(),
-  segmentId: z.string().min(1).max(128),
-  sessionId: z.string().min(1).max(128),
-});
-const recordingId = z.string().min(1).max(128);
-const playbackCursor = z.object({
-  createdAt: z.number().int().nonnegative(),
-  id: recordingId,
-});
-
-const finalizeInput = z.object({
-  segments: z
-    .array(
-      z.object({
-        partCount: z.number().int().positive(),
-        segmentId: recordingId,
-      })
-    )
-    .min(1)
-    .max(5)
-    .superRefine((segments, context) => {
-      if (
-        new Set(segments.map(({ segmentId }) => segmentId)).size !==
-        segments.length
-      ) {
-        context.addIssue({
-          code: "custom",
-          message: "segment IDs must be unique",
-        });
-      }
-    }),
-  sessionId: recordingId,
-});
-
-function requireBindings(context: { bindings: RecordingBindings | undefined }) {
-  if (!context.bindings) {
-    throw new ORPCError("UNAUTHORIZED");
-  }
-  return context.bindings;
-}
-
-function isCreateRecordingSessionConflictError(error: unknown) {
-  return (
-    error instanceof Error &&
-    error.name === "CreateRecordingSessionConflictError"
-  );
-}
-
-function isAppendRecordingSegmentConflictError(error: unknown) {
-  return (
-    error instanceof Error &&
-    error.name === "AppendRecordingSegmentConflictError"
-  );
-}
+import { recordingProcedure } from "../index.ts";
+import { throwServiceError } from "../throw-service-error.ts";
+import {
+  finalizeInputDto,
+  listPlaybackSummariesInputDto,
+  sessionIdInputDto,
+  sessionInputDto,
+} from "./recording.dto.ts";
+import {
+  appendSegmentErrors,
+  createRecordingErrors,
+  finalizeRecordingErrors,
+  getRecordingErrors,
+} from "./recording.error.ts";
+import {
+  appendSegment,
+  createRecording,
+  finalizeSession,
+  getManifest,
+  getPlaybackSummary,
+  getStatus,
+  listPlaybackSummaries,
+} from "./recording.service.ts";
 
 export const recordingRouter = {
-  appendSegment: publicProcedure
-    .input(sessionInput)
-    .handler(async ({ input, context }) => {
-      try {
-        return await requireBindings(context).appendRecordingSegment(input);
-      } catch (error) {
-        if (isAppendRecordingSegmentConflictError(error)) {
-          throw new ORPCError("CONFLICT", { cause: error });
-        }
-        throw error;
+  appendSegment: recordingProcedure
+    .errors(appendSegmentErrors)
+    .input(sessionInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await appendSegment(context.db, input);
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
       }
+      return result.data;
     }),
-  create: publicProcedure
-    .input(sessionInput)
-    .handler(async ({ input, context }) => {
-      const bindings = requireBindings(context);
-      try {
-        return await bindings.createRecordingSession(input);
-      } catch (error) {
-        if (isCreateRecordingSessionConflictError(error)) {
-          throw new ORPCError("CONFLICT", { cause: error });
-        }
-        throw error;
+  create: recordingProcedure
+    .errors(createRecordingErrors)
+    .input(sessionInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await createRecording(context.db, input);
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
       }
+      return result.data;
     }),
-  finalize: publicProcedure
-    .input(finalizeInput)
-    .handler(async ({ input, context }) => {
-      try {
-        const bindings = requireBindings(context);
-        const result = await bindings.finalizeRecording(input);
-        if (result.status === "queued") {
-          await bindings.enqueueFinalization(input.sessionId);
-        }
-        return result;
-      } catch (error) {
-        if (error instanceof Error && error.name === "RecordingNotFoundError") {
-          throw new ORPCError("NOT_FOUND", { cause: error });
-        }
-        if (
-          error instanceof Error &&
-          error.name === "RecordingFinalizeConflictError"
-        ) {
-          throw new ORPCError("CONFLICT", { cause: error });
-        }
-        throw error;
-      }
-    }),
-
-  getManifest: publicProcedure
-    .input(z.object({ sessionId: recordingId }))
-    .handler(async ({ input, context }) => {
-      const bindings = requireBindings(context);
-      const manifest = await bindings.getRecordingManifest(input.sessionId);
-      if (!manifest) {
-        throw new ORPCError("NOT_FOUND");
-      }
-      return manifest;
-    }),
-  getPlaybackSummary: publicProcedure
-    .input(z.object({ sessionId: recordingId }))
-    .handler(async ({ input, context }) => {
-      const summary = await requireBindings(
-        context
-      ).getRecordingPlaybackSummary(input.sessionId);
-      if (!summary) {
-        throw new ORPCError("NOT_FOUND");
-      }
-      return summary;
-    }),
-  getStatus: publicProcedure
-    .input(z.object({ sessionId: recordingId }))
-    .handler(async ({ input, context }) => {
-      const status = await requireBindings(context).getRecordingStatus(
-        input.sessionId
+  finalize: recordingProcedure
+    .errors(finalizeRecordingErrors)
+    .input(finalizeInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await finalizeSession(
+        { db: context.db, finalizer: context.finalizer },
+        input
       );
-      if (!status) {
-        throw new ORPCError("NOT_FOUND");
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
       }
-      return status;
+      return result.data;
     }),
-  listPlaybackSummaries: publicProcedure
-    .input(z.object({ cursor: playbackCursor.optional() }))
-    .handler(({ input, context }) =>
-      requireBindings(context).listRecordingPlaybackSummaries(input)
-    ),
+  getManifest: recordingProcedure
+    .errors(getRecordingErrors)
+    .input(sessionIdInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await getManifest(context.db, input);
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
+      }
+      return result.data;
+    }),
+  getPlaybackSummary: recordingProcedure
+    .errors(getRecordingErrors)
+    .input(sessionIdInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await getPlaybackSummary(context.db, input);
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
+      }
+      return result.data;
+    }),
+  getStatus: recordingProcedure
+    .errors(getRecordingErrors)
+    .input(sessionIdInputDto)
+    .handler(async ({ context, errors, input }) => {
+      const result = await getStatus(context.db, input);
+      if (!result.ok) {
+        return throwServiceError(errors, result.error);
+      }
+      return result.data;
+    }),
+  listPlaybackSummaries: recordingProcedure
+    .input(listPlaybackSummariesInputDto)
+    .handler(({ context, input }) => listPlaybackSummaries(context.db, input)),
 };

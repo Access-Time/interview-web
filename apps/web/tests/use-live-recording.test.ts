@@ -246,9 +246,9 @@ it("normal stop releases tracks after capture and retains submission", async () 
   expect(latest?.stream).toBe(null);
   expect(latest?.isReady).toBe(false);
   expect(events).toEqual([
-    "capture-ended",
     "audio-track-stopped",
     "video-track-stopped",
+    "capture-ended",
   ]);
   expect(latest?.stream).toBe(null);
   expect(latest?.isReady).toBe(false);

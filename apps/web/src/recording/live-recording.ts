@@ -868,6 +868,7 @@ export function useLiveRecording(
   const pollGeneration = useRef(0);
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
+  const captureEndingRef = useRef<Promise<void> | null>(null);
   const finalizationInFlight = useRef<Promise<void> | null>(null);
   const sealedPumpLock = useRef(false);
   const sealedPlans = useRef<
@@ -994,9 +995,7 @@ export function useLiveRecording(
         return;
       }
       setError(cause instanceof Error ? cause.message : String(cause));
-      if (recorder.current?.state !== "inactive") {
-        recorder.current?.stop();
-      }
+      ignorePromise(endCapture(cause));
     });
     outbox.current = box;
     const emitOutbox = () => {
@@ -1214,7 +1213,6 @@ export function useLiveRecording(
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
     revokeRecoveryReset();
-    setCaptureEnded(false);
     await recoveryPromise.current;
     if (sealedPlans.current.length) {
       throw new Error("The previous recording is still being finalized");
@@ -1239,6 +1237,8 @@ export function useLiveRecording(
     const instance = requested
       ? new MediaRecorder(stream, { mimeType: requested })
       : new MediaRecorder(stream);
+    captureEndingRef.current = null;
+    setCaptureEnded(false);
     cancelFinalizationPolling();
     finalizationAttempted.current = false;
     finalizationInput.current = null;
@@ -1317,9 +1317,10 @@ export function useLiveRecording(
         }
       );
     };
-    instance.onerror = () => {
+    instance.onerror = (event) => {
       if (lifecycle.current !== true) {
         setError("Recording failed while capturing media");
+        ignorePromise(endCapture(event));
       }
     };
     instance.onstop = () => {
@@ -1335,71 +1336,116 @@ export function useLiveRecording(
       }
     }
   };
-  const stop = async () => {
-    revokeRecoveryReset();
-    if (recorder.current?.state !== "recording") {
-      return;
-    }
-    const instance = recorder.current;
-    await new Promise<void>((resolve) => {
-      const done = () => resolve();
-      instance.addEventListener("stop", done, { once: true });
-      instance.stop();
-    });
-    setCaptureEnded(true);
-    try {
-      const activeStream = streamRef.current;
-      for (const track of activeStream?.getTracks() ?? []) {
+  const endCapture = (cause?: unknown): Promise<void> => {
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: capture shutdown serializes media, persistence, and finalization failures.
+    captureEndingRef.current ??= (async () => {
+      setCaptureEnded(true);
+      setRecording(false);
+
+      for (const track of streamRef.current?.getTracks() ?? []) {
         track.stop();
       }
       streamRef.current = null;
       setStream(null);
       setReady(false);
-      while (processing.current.length) {
-        // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
-        await Promise.all(processing.current);
+
+      try {
+        const instance = recorder.current;
+        if (instance === undefined) {
+          // No recorder was created before capture shutdown.
+        } else if (instance.state !== "inactive") {
+          await new Promise<void>((resolve) => {
+            const done = () => resolve();
+            instance.addEventListener("stop", done, { once: true });
+            instance.stop();
+          });
+        }
+
+        while (processing.current.length) {
+          // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
+          await Promise.all(processing.current);
+        }
+
+        const currentIds = ids.current;
+        const box = outbox.current;
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: refs can be empty after an interrupted capture.
+        if (!(currentIds && box)) {
+          throw new Error(
+            "Recording session is unavailable; press Start to retry"
+          );
+        }
+        const plan = {
+          segments: session.current?.segments ?? [
+            { partCount: sequence.current, segmentId: currentIds.segmentId },
+          ],
+          sessionId: currentIds.sessionId,
+        };
+        const currentSession = session.current;
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: persistence may fail before a session is established.
+        if (!currentSession) {
+          throw new Error(
+            "Recording session is unavailable; press Start to retry"
+          );
+        }
+        if (plan.segments.some((segment) => segment.partCount === 0)) {
+          session.current = { ...currentSession, status: "recording" };
+          await box.saveSession(session.current);
+          throw new Error(
+            "Recording stopped before any media data was captured; press Start to retry"
+          );
+        }
+        box.assertCanFinalize();
+        session.current = {
+          ...currentSession,
+          segments: plan.segments,
+          status: "sealed",
+        };
+        await box.saveSession(session.current);
+        sealedPlans.current.push(plan);
+        finalizationInput.current ??= plan;
+        setFinalizationState({ error: null, state: "queued" });
+        await submitSealedRef.current?.();
+
+        const finalizationState = finalizationRef.current?.state;
+        if (finalizationState === "failed") {
+          setJourneyOutcome("manual-retry");
+        } else if (
+          finalizationState &&
+          isPendingFinalizationState(finalizationState)
+        ) {
+          setJourneyOutcome("automatic-retry");
+        }
+      } catch (failure) {
+        const failureCause = cause ?? failure;
+        if (failure instanceof Error) {
+          setError(failure.message);
+        }
+        if (
+          isRetryableRecordingFailure(failureCause) ||
+          outbox.current?.saveState === "offline"
+        ) {
+          setJourneyOutcome("automatic-retry");
+        } else if (finalizationRef.current?.state === "failed") {
+          setJourneyOutcome("manual-retry");
+        } else {
+          setJourneyOutcome("terminal-restart");
+        }
+        throw failure;
       }
-      const { current } = ids;
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: recording IDs are established before capture.
-      if (!(current && outbox.current)) {
-        setCaptureEnded(false);
-        return;
-      }
-      const plan = {
-        segments: session.current?.segments ?? [
-          { partCount: sequence.current, segmentId: current.segmentId },
-        ],
-        sessionId: current.sessionId,
-      };
-      const currentSession = session.current;
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: a recording session is established before stop.
-      if (!currentSession) {
-        throw new Error(
-          "Recording session is unavailable; press Start to retry"
-        );
-      }
-      if (plan.segments.some((segment) => segment.partCount === 0)) {
-        session.current = { ...currentSession, status: "recording" };
-        await outbox.current.saveSession(session.current);
-        throw new Error(
-          "Recording stopped before any media data was captured; press Start to retry"
-        );
-      }
-      outbox.current.assertCanFinalize();
-      session.current = {
-        ...currentSession,
-        segments: plan.segments,
-        status: "sealed",
-      };
-      await outbox.current.saveSession(session.current);
-      sealedPlans.current.push(plan);
-      finalizationInput.current ??= plan;
-      setFinalizationState({ error: null, state: "queued" });
-      await submitSealedRef.current?.();
-    } catch (cause) {
-      setCaptureEnded(false);
-      throw cause;
+    })();
+    return captureEndingRef.current;
+  };
+
+  const stop = () => {
+    revokeRecoveryReset();
+    const ending = captureEndingRef.current;
+    if (ending !== null) {
+      return ending;
     }
+    if (recorder.current?.state !== "recording") {
+      return Promise.resolve();
+    }
+    return endCapture();
   };
   const finalize = async (input: {
     sessionId: string;

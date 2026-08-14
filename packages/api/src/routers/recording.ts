@@ -10,6 +10,10 @@ const sessionInput = z.object({
   sessionId: z.string().min(1).max(128),
 });
 const recordingId = z.string().min(1).max(128);
+const playbackCursor = z.object({
+  createdAt: z.number().int().nonnegative(),
+  id: recordingId,
+});
 
 const finalizeInput = z.object({
   segments: z
@@ -116,6 +120,17 @@ export const recordingRouter = {
       }
       return manifest;
     }),
+  getPlaybackSummary: publicProcedure
+    .input(z.object({ sessionId: recordingId }))
+    .handler(async ({ input, context }) => {
+      const summary = await requireBindings(
+        context
+      ).getRecordingPlaybackSummary(input.sessionId);
+      if (!summary) {
+        throw new ORPCError("NOT_FOUND");
+      }
+      return summary;
+    }),
   getStatus: publicProcedure
     .input(z.object({ sessionId: recordingId }))
     .handler(async ({ input, context }) => {
@@ -127,4 +142,9 @@ export const recordingRouter = {
       }
       return status;
     }),
+  listPlaybackSummaries: publicProcedure
+    .input(z.object({ cursor: playbackCursor.optional() }))
+    .handler(({ input, context }) =>
+      requireBindings(context).listRecordingPlaybackSummaries(input)
+    ),
 };

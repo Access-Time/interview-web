@@ -1,5 +1,5 @@
 import { env } from "@interview-web/env/server";
-import { and, asc, eq, gt, isNull, lt, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, lt, ne, or, sql } from "drizzle-orm";
 import { type DrizzleD1Database, drizzle } from "drizzle-orm/d1";
 import {
   recordingSegment,
@@ -117,6 +117,33 @@ export interface RecordingStatus {
     hasOutput: boolean;
   };
   status: "queued" | "finalizing" | "ready" | "failed";
+}
+
+export type RecordingPlaybackStatus =
+  | "recording"
+  | "queued"
+  | "finalizing"
+  | "ready"
+  | "failed"
+  | "deleting";
+
+export interface RecordingPlaybackCursor {
+  createdAt: number;
+  id: string;
+}
+
+export interface RecordingPlaybackSummary {
+  createdAt: number;
+  hasOutput: boolean;
+  id: string;
+  outputByteSize: number | null;
+  outputMediaType: string | null;
+  status: RecordingPlaybackStatus;
+}
+
+export interface RecordingPlaybackPage {
+  items: RecordingPlaybackSummary[];
+  nextCursor: RecordingPlaybackCursor | null;
 }
 export interface RecordingFinalizeInput {
   segments: Array<{ segmentId: string; partCount: number }>;
@@ -550,6 +577,91 @@ export async function getRecordingStatus(
       : {}),
   };
 }
+
+const PLAYBACK_PAGE_SIZE = 25;
+
+interface PlaybackSummaryRow {
+  createdAt: number;
+  id: string;
+  outputByteSize: number | null;
+  outputMediaType: string | null;
+  outputObjectKey: string | null;
+  status: string;
+}
+
+const playbackSummaryColumns = {
+  createdAt: recordingSession.createdAt,
+  id: recordingSession.id,
+  outputByteSize: recordingSession.outputByteSize,
+  outputMediaType: recordingSession.outputMediaType,
+  outputObjectKey: recordingSession.outputObjectKey,
+  status: recordingSession.status,
+};
+
+function toRecordingPlaybackSummary(
+  row: PlaybackSummaryRow
+): RecordingPlaybackSummary {
+  return {
+    createdAt: row.createdAt,
+    hasOutput: Boolean(row.outputObjectKey),
+    id: row.id,
+    outputByteSize: row.outputByteSize,
+    outputMediaType: row.outputMediaType,
+    status: row.status as RecordingPlaybackStatus,
+  };
+}
+
+export async function getRecordingPlaybackSummary(
+  db: Database,
+  sessionId: string
+): Promise<RecordingPlaybackSummary | null> {
+  const row = await db
+    .select(playbackSummaryColumns)
+    .from(recordingSession)
+    .where(eq(recordingSession.id, sessionId))
+    .get();
+
+  return row ? toRecordingPlaybackSummary(row) : null;
+}
+
+export async function listRecordingPlaybackSummaries(
+  db: Database,
+  input: { cursor?: RecordingPlaybackCursor }
+): Promise<RecordingPlaybackPage> {
+  const rows = input.cursor
+    ? await db
+        .select(playbackSummaryColumns)
+        .from(recordingSession)
+        .where(
+          or(
+            lt(recordingSession.createdAt, input.cursor.createdAt),
+            and(
+              eq(recordingSession.createdAt, input.cursor.createdAt),
+              lt(recordingSession.id, input.cursor.id)
+            )
+          )
+        )
+        .orderBy(desc(recordingSession.createdAt), desc(recordingSession.id))
+        .limit(PLAYBACK_PAGE_SIZE + 1)
+    : await db
+        .select(playbackSummaryColumns)
+        .from(recordingSession)
+        .orderBy(desc(recordingSession.createdAt), desc(recordingSession.id))
+        .limit(PLAYBACK_PAGE_SIZE + 1);
+  const items = rows
+    .slice(0, PLAYBACK_PAGE_SIZE)
+    .map(toRecordingPlaybackSummary);
+  const lastItem = items.at(-1);
+
+  return {
+    items,
+    nextCursor:
+      rows.length > PLAYBACK_PAGE_SIZE && lastItem
+        ? { createdAt: lastItem.createdAt, id: lastItem.id }
+        : null,
+  };
+}
+
 export async function claimRecordingFinalization(
   db: Database,
   sessionId: string,

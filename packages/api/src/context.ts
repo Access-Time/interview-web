@@ -6,6 +6,9 @@ import type {
   RecordingFinalizeInput,
   RecordingFinalizeResult,
   RecordingManifest,
+  RecordingPlaybackCursor,
+  RecordingPlaybackPage,
+  RecordingPlaybackSummary,
   RecordingStatus,
 } from "@interview-web/db";
 
@@ -23,7 +26,13 @@ export interface RecordingBindings {
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;
+  getRecordingPlaybackSummary: (
+    sessionId: string
+  ) => Promise<RecordingPlaybackSummary | null>;
   getRecordingStatus: (sessionId: string) => Promise<RecordingStatus | null>;
+  listRecordingPlaybackSummaries: (input: {
+    cursor?: RecordingPlaybackCursor;
+  }) => Promise<RecordingPlaybackPage>;
 }
 
 export function createContext(options: {

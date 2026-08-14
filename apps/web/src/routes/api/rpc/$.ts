@@ -6,7 +6,9 @@ import {
   createRecordingSession,
   finalizeRecording,
   getRecordingManifest,
+  getRecordingPlaybackSummary,
   getRecordingStatus,
+  listRecordingPlaybackSummaries,
 } from "@interview-web/db";
 import { env } from "@interview-web/env/server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
@@ -69,8 +71,12 @@ async function handle({ request }: { request: Request }) {
       finalizeRecording: (input) => finalizeRecording(createDb(), input),
       getRecordingManifest: (sessionId) =>
         getRecordingManifest(createDb(), sessionId),
+      getRecordingPlaybackSummary: (sessionId) =>
+        getRecordingPlaybackSummary(createDb(), sessionId),
       getRecordingStatus: (sessionId) =>
         getRecordingStatus(createDb(), sessionId),
+      listRecordingPlaybackSummaries: (input) =>
+        listRecordingPlaybackSummaries(createDb(), input),
     },
   });
   const rpcResult = await rpcHandler.handle(request, {

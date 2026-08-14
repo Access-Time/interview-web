@@ -15,8 +15,8 @@ const schema = {
   recordingUploadPart,
 };
 
-export function createDb() {
-  return drizzle(env.DB, { schema });
+export function createDb(db: D1Database = env.DB): Database {
+  return drizzle(db, { schema });
 }
 
 export class RecordingUploadPartConflictError extends Error {

@@ -30,13 +30,6 @@ async function startRecording(page: Page) {
       (database) => database.name === "live-recording-outbox"
     )
   );
-  await page.waitForFunction(() => {
-    const button = document.querySelector("button");
-    return Boolean(
-      button &&
-        Object.keys(button).some((key) => key.startsWith("__reactProps"))
-    );
-  });
   await page.evaluate(() => {
     const streamKey = Symbol("test-src-object");
     Object.defineProperty(HTMLMediaElement.prototype, "srcObject", {

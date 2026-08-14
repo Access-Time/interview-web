@@ -344,6 +344,49 @@ export interface FinalizerEnv {
   FINALIZER: DurableObjectNamespace<RecordingFinalizerContainer>;
   RECORDINGS: FinalizerBucket;
 }
+
+const FINALIZATION_DISPATCH_PATH = "/internal/finalizations";
+
+export async function dispatchFinalizationRequest(
+  request: Request,
+  env: Pick<FinalizerEnv, "FINALIZATION_QUEUE">
+): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response(null, { status: 405 });
+  }
+
+  if (new URL(request.url).pathname !== FINALIZATION_DISPATCH_PATH) {
+    return new Response(null, { status: 404 });
+  }
+
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return new Response(null, { status: 400 });
+  }
+
+  if (
+    !body ||
+    typeof body !== "object" ||
+    Array.isArray(body) ||
+    !("sessionId" in body) ||
+    typeof body.sessionId !== "string" ||
+    body.sessionId.length < 1 ||
+    body.sessionId.length > 128
+  ) {
+    return new Response(null, { status: 400 });
+  }
+
+  try {
+    await env.FINALIZATION_QUEUE.send({ sessionId: body.sessionId });
+  } catch {
+    return new Response(null, { status: 503 });
+  }
+
+  return new Response(null, { status: 202 });
+}
+
 export async function handleQueueMessage(
   message: { body: { sessionId: string }; ack?: () => void },
   env: FinalizerEnv
@@ -354,7 +397,7 @@ export async function handleQueueMessage(
         deterministicJobName(message.body.sessionId, attempt).then((name) =>
           getContainer(env.FINALIZER, name)
         ),
-      db: createDb(),
+      db: createDb(env.DB),
       recordings: env.RECORDINGS,
       sessionId: message.body.sessionId,
     });
@@ -374,6 +417,9 @@ export async function reconciliationBatch(db: FinalizerDb) {
   );
 }
 export default {
+  fetch(request: Request, env: FinalizerEnv) {
+    return dispatchFinalizationRequest(request, env);
+  },
   async queue(
     batch: {
       messages: Array<{ body: { sessionId: string }; ack: () => void }>;
@@ -386,7 +432,7 @@ export default {
     }
   },
   async scheduled(_event: ScheduledEvent, env: FinalizerEnv) {
-    for (const message of await reconciliationBatch(createDb())) {
+    for (const message of await reconciliationBatch(createDb(env.DB))) {
       // biome-ignore lint/performance/noAwaitInLoops: queue sends are intentionally ordered and bounded.
       await env.FINALIZATION_QUEUE.send(message);
     }

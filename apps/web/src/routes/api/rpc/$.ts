@@ -37,6 +37,26 @@ const apiHandler = new OpenAPIHandler(appRouter, {
   ],
 });
 
+export interface FinalizerDispatcher {
+  fetch: (request: Request) => Promise<Response>;
+}
+
+export async function dispatchFinalization(
+  finalizer: FinalizerDispatcher,
+  sessionId: string
+): Promise<void> {
+  const response = await finalizer.fetch(
+    new Request("https://finalizer/internal/finalizations", {
+      body: JSON.stringify({ sessionId }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    })
+  );
+  if (!response.ok) {
+    throw new Error("Finalization dispatch failed");
+  }
+}
+
 async function handle({ request }: { request: Request }) {
   const context = await createContext({
     bindings: {
@@ -44,9 +64,8 @@ async function handle({ request }: { request: Request }) {
         appendRecordingSegment(createDb(), input),
       createRecordingSession: (input) =>
         createRecordingSession(createDb(), input),
-      enqueueFinalization: async (sessionId) => {
-        await env.FINALIZATION_QUEUE.send({ sessionId });
-      },
+      enqueueFinalization: (sessionId) =>
+        dispatchFinalization(env.FINALIZER, sessionId),
       finalizeRecording: (input) => finalizeRecording(createDb(), input),
       getRecordingManifest: (sessionId) =>
         getRecordingManifest(createDb(), sessionId),

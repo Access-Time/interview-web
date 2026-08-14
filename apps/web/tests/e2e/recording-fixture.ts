@@ -13,6 +13,8 @@ import z from "zod";
 declare global {
   interface Window {
     __recordingTestState: { stoppedTracks: number };
+    __recordingTestStorage?: { quota: number; usage: number };
+    __testMediaRecorder?: { emitPart: (value?: string) => void };
   }
 }
 
@@ -154,7 +156,8 @@ function createCandidateRecordingRouter(fixture: CandidateBindingFixture) {
 export async function installRecordingApi(
   page: Page,
   fixture: CandidateBindingFixture,
-  uploadStatus = 204
+  uploadStatus = 204,
+  upload?: { mode: UploadMode }
 ) {
   const handler = new RPCHandler({
     recording: createCandidateRecordingRouter(fixture),
@@ -185,9 +188,189 @@ export async function installRecordingApi(
     });
   });
 
-  await page.route("**/api/recordings/**/parts/**", (route) =>
-    route.fulfill({ status: uploadStatus })
+  await page.route("**/api/recordings/**/parts/**", (route) => {
+    if (route.request().method() === "OPTIONS") {
+      return route.fulfill({
+        body: "",
+        headers: {
+          "Access-Control-Allow-Headers": "*",
+          "Access-Control-Allow-Methods": "PUT, OPTIONS",
+          "Access-Control-Allow-Origin": "*",
+        },
+        status: 204,
+      });
+    }
+    let mode = upload?.mode;
+    if (!mode) {
+      if (uploadStatus >= 500) {
+        mode = "retryable";
+      } else if (uploadStatus >= 400) {
+        mode = "fatal";
+      } else {
+        mode = "success";
+      }
+    }
+    if (mode === "offline") {
+      return;
+    }
+    if (mode === "retryable") {
+      return route.fulfill({ status: 503 });
+    }
+    if (mode === "fatal") {
+      return route.fulfill({
+        status: uploadStatus >= 400 ? uploadStatus : 409,
+      });
+    }
+    return route.fulfill({ body: "", status: 201 });
+  });
+}
+
+export interface RecordingFixtureOptions {
+  finalization?: "failed" | "pending" | "ready";
+  storage?: {
+    persistResult?: boolean;
+    persisted?: boolean;
+    probeFails?: boolean;
+    quota?: number;
+    usage?: number;
+    writeFailsAfterPart?: number;
+  };
+  upload?: {
+    mode?: "fatal" | "offline" | "retryable" | "success";
+  };
+}
+
+type UploadMode = NonNullable<
+  NonNullable<RecordingFixtureOptions["upload"]>["mode"]
+>;
+
+const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
+
+export async function installRecordingStorage(
+  page: Page,
+  storage: RecordingFixtureOptions["storage"] = {}
+) {
+  await page.addInitScript(
+    ({
+      persistResult,
+      persisted,
+      probeFails,
+      probeKey,
+      quota,
+      usage,
+      writeFailsAfterPart,
+    }) => {
+      const estimate = {
+        quota: quota ?? 1_000_000_000,
+        usage: usage ?? 10,
+      };
+      window.__recordingTestStorage = estimate;
+      const storageMock = {
+        estimate: async () => window.__recordingTestStorage ?? estimate,
+        persist: async () => persistResult ?? true,
+        persisted: async () => persisted ?? true,
+      };
+      const existing = navigator.storage as StorageManager | undefined;
+      if (existing) {
+        existing.estimate = storageMock.estimate;
+        existing.persist = storageMock.persist;
+        existing.persisted = storageMock.persisted;
+      }
+      Object.defineProperty(navigator, "storage", {
+        configurable: true,
+        value: existing ?? storageMock,
+      });
+
+      if (probeFails || writeFailsAfterPart !== undefined) {
+        const store = IDBObjectStore.prototype;
+        const originalPut = store.put;
+        let successfulPartWrites = 0;
+        store.put = function putWithFixture(value: unknown) {
+          const record = value as {
+            id?: string;
+            sequence?: number;
+            sessionId?: string;
+          };
+          if (probeFails && record.id === probeKey) {
+            throw new Error("probe failed");
+          }
+          if (
+            writeFailsAfterPart !== undefined &&
+            record.sessionId &&
+            typeof record.sequence === "number" &&
+            record.id !== probeKey
+          ) {
+            if (successfulPartWrites >= writeFailsAfterPart) {
+              throw new Error("IndexedDB write failed");
+            }
+            successfulPartWrites += 1;
+          }
+          return originalPut.call(this, value);
+        };
+      }
+    },
+    {
+      persisted: storage.persisted ?? true,
+      persistResult: storage.persistResult ?? true,
+      probeFails: storage.probeFails ?? false,
+      probeKey: PREFLIGHT_PROBE_KEY,
+      quota: storage.quota ?? 1_000_000_000,
+      usage: storage.usage ?? 10,
+      writeFailsAfterPart: storage.writeFailsAfterPart,
+    }
   );
+}
+
+export function createUploadController(initial: UploadMode = "success") {
+  let mode = initial;
+  return {
+    get mode() {
+      return mode;
+    },
+    setMode(next: UploadMode) {
+      mode = next;
+    },
+  };
+}
+
+export async function installRecordingFixture(
+  page: Page,
+  options: RecordingFixtureOptions = {}
+) {
+  await page.addInitScript(() => {
+    if (!navigator.mediaDevices) {
+      Object.defineProperty(navigator, "mediaDevices", {
+        configurable: true,
+        value: {},
+      });
+    }
+  });
+  await installRecordingStorage(page, options.storage);
+  await installMediaRecorder(page);
+  const fixture = createCandidateBindings();
+  if (options.finalization === "failed") {
+    fixture.bindings.finalizeRecording = () =>
+      Promise.reject(new Error("finalization unavailable"));
+  }
+  const upload = createUploadController(options.upload?.mode ?? "success");
+  let uploadStatus = 204;
+  if (options.upload?.mode === "fatal") {
+    uploadStatus = 409;
+  } else if (options.upload?.mode === "retryable") {
+    uploadStatus = 503;
+  }
+  await installRecordingApi(page, fixture, uploadStatus, upload);
+  return { fixture, upload };
+}
+
+export async function reconnectRecordingFixture(
+  page: Page,
+  upload?: { setMode: (mode: UploadMode) => void }
+) {
+  upload?.setMode("success");
+  await page.evaluate(() => {
+    window.dispatchEvent(new Event("online"));
+  });
 }
 
 export async function installMediaRecorder(page: Page) {
@@ -215,14 +398,25 @@ export async function installMediaRecorder(page: Page) {
       static isTypeSupported() {
         return true;
       }
+      audioBitsPerSecond = 128_000;
       mimeType = "video/webm;codecs=opus";
       state: RecordingState = "inactive";
+      videoBitsPerSecond = 1_000_000;
       ondataavailable: ((event: BlobEvent) => void) | null = null;
       onerror: ((event: Event) => void) | null = null;
       onstop: (() => void) | null = null;
 
+      emitPart(value = "candidate recording") {
+        const event = new BlobEvent("dataavailable", {
+          data: new Blob([value], { type: this.mimeType }),
+        });
+        this.ondataavailable?.(event);
+        this.dispatchEvent(event);
+      }
+
       start() {
         this.state = "recording";
+        window.__testMediaRecorder = this;
       }
 
       stop() {

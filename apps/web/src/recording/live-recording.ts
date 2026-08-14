@@ -447,9 +447,10 @@ export const runRecordingPreflight = async (
     if (!(Number.isFinite(quota) && Number.isFinite(usage))) {
       return { state: "blocked" };
     }
+    const freeBytes = Number(quota) - Number(usage);
 
     await dependencies.probe();
-    return quota - usage > policy.recoveryTargetBytes + policy.safetyMarginBytes
+    return freeBytes > policy.recoveryTargetBytes + policy.safetyMarginBytes
       ? { policy, state: "ready" }
       : { state: "blocked" };
   } catch {
@@ -992,9 +993,11 @@ export function createLiveRecordingOutbox(
       onChange = undefined;
     },
     async drain() {
+      await Promise.resolve();
       if (flushPromise) {
         await flushPromise;
-      } else {
+      }
+      if (pending.size && online && !retryTimer) {
         await flush();
       }
       if (pending.size) {

@@ -370,7 +370,17 @@ const RECORDING_TIMESLICE_MS = 5000;
 const RECOVERY_TARGET_SECONDS = 30 * 60;
 const RECOVERY_SAFETY_MARGIN = 0.25;
 const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
-const RETRY_DELAY = 1000;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 30_000;
+
+export interface RecordingOutboxSnapshot {
+  deliveryPhase: RecordingDeliveryPhase;
+  hasUnsentMedia: boolean;
+  integrity: RecordingIntegrity;
+  pendingBytes: number;
+  pendingPartCount: number;
+  saveState: RecordingSaveState;
+}
 
 export const getRecordingStoragePolicy = (
   audioBitsPerSecond: number,
@@ -582,21 +592,134 @@ export function createLiveRecordingOutbox(
   request: typeof fetch = fetch,
   onError?: (error: unknown) => void
 ) {
-  const active = new Set<string>();
   const pending = new Map<string, RecordingPart>();
-  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  const segmentRankBySession = new Map<string, Map<string, number>>();
   const failed = new Set<string>();
   const failureByKey = new Map<string, unknown>();
   const terminal = new Set<string>();
+  let pendingBytes = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let retryAttempt = 0;
+  let flushPromise: Promise<void> | undefined;
+  let inFlightPartKey: string | null = null;
   let persistenceFailed = false;
   let disposed = false;
   let online = true;
+  let reconnecting = false;
   let integrity: RecordingIntegrity = "ok";
   let onChange: (() => void) | undefined;
 
-  const key = (part: RecordingPart) =>
+  const getPartKey = (part: RecordingPart) =>
     `${part.sessionId}:${part.segmentId}:${part.sequence}`;
-  const send = async (part: RecordingPart) => {
+  const emit = () => {
+    if (!disposed) {
+      onChange?.();
+    }
+  };
+  const rememberSessionOrder = (session: RecordingSession) => {
+    segmentRankBySession.set(
+      session.sessionId,
+      new Map(
+        session.segments.map((segment, index) => [segment.segmentId, index])
+      )
+    );
+  };
+  const rememberPendingPart = (part: RecordingPart) => {
+    const partKey = getPartKey(part);
+    if (!pending.has(partKey)) {
+      pendingBytes += part.blob.size;
+    }
+    pending.set(partKey, part);
+  };
+  const acknowledgePendingPart = async (part: RecordingPart) => {
+    await store.delete(part);
+    const partKey = getPartKey(part);
+    if (pending.delete(partKey)) {
+      pendingBytes -= part.blob.size;
+    }
+    failed.delete(partKey);
+    failureByKey.delete(partKey);
+    emit();
+  };
+  const getShorterRetryAfterMs = (response?: Response) => {
+    const header = response?.headers.get("Retry-After");
+    if (!header) {
+      return;
+    }
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return seconds * 1000;
+    }
+    const timestamp = Date.parse(header);
+    if (Number.isFinite(timestamp)) {
+      const delayMs = timestamp - Date.now();
+      return delayMs >= 0 ? delayMs : undefined;
+    }
+  };
+  const scheduleRetry = (response?: Response) => {
+    const retryDelayMs = Math.min(
+      MAX_RETRY_DELAY_MS,
+      INITIAL_RETRY_DELAY_MS * 2 ** retryAttempt
+    );
+    const delayMs = Math.min(
+      retryDelayMs,
+      getShorterRetryAfterMs(response) ?? retryDelayMs
+    );
+    retryAttempt += 1;
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      ignorePromise(flush());
+    }, delayMs);
+    emit();
+  };
+  const getNextOrderedPart = () => {
+    const candidates = [...pending.values()].filter((item) => {
+      const partKey = getPartKey(item);
+      return partKey !== inFlightPartKey && !terminal.has(partKey);
+    });
+    if (candidates.length === 0) {
+      return;
+    }
+    candidates.sort((left, right) => {
+      const sessionCmp = left.sessionId.localeCompare(right.sessionId);
+      if (sessionCmp !== 0) {
+        return sessionCmp;
+      }
+      const leftRank =
+        segmentRankBySession.get(left.sessionId)?.get(left.segmentId) ??
+        Number.MAX_SAFE_INTEGER;
+      const rightRank =
+        segmentRankBySession.get(right.sessionId)?.get(right.segmentId) ??
+        Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) {
+        return leftRank - rightRank;
+      }
+      return left.sequence - right.sequence;
+    });
+    return candidates[0];
+  };
+  const recordFailure = (
+    partKey: string,
+    error: unknown,
+    kind: RecordingFailure["recordingFailure"],
+    response?: Response
+  ): "retryable" | "fatal" => {
+    const failure = markRecordingFailure(error, kind);
+    failed.add(partKey);
+    failureByKey.set(partKey, failure);
+    if (kind === "fatal") {
+      terminal.add(partKey);
+    } else {
+      scheduleRetry(response);
+    }
+    onError?.(failure);
+    emit();
+    return kind;
+  };
+  const send = async (
+    part: RecordingPart
+  ): Promise<"acknowledged" | "retryable" | "fatal"> => {
+    const partKey = getPartKey(part);
     let response: Response;
     try {
       const checksum = await recordingBlobChecksum(part.blob);
@@ -612,75 +735,69 @@ export function createLiveRecordingOutbox(
         }
       );
     } catch (error) {
-      throw markRecordingFailure(error, "retryable");
+      return recordFailure(partKey, error, "retryable");
     }
     if (!response.ok) {
-      throw markRecordingFailure(
-        `Recording part upload failed (${response.status})`,
+      const retryable =
         response.status === 408 ||
-          response.status === 429 ||
-          response.status >= 500
-          ? "retryable"
-          : "fatal"
+        response.status === 429 ||
+        response.status >= 500;
+      return recordFailure(
+        partKey,
+        `Recording part upload failed (${response.status})`,
+        retryable ? "retryable" : "fatal",
+        response
       );
     }
     try {
-      await store.delete(part);
+      await acknowledgePendingPart(part);
     } catch (error) {
-      throw markRecordingFailure(error, "fatal");
+      return recordFailure(partKey, error, "fatal");
     }
-    if (!disposed) {
-      pending.delete(key(part));
-      failed.delete(key(part));
-      failureByKey.delete(key(part));
-      onChange?.();
-    }
+    retryAttempt = 0;
+    return "acknowledged";
   };
-  const flush = async () => {
-    if (disposed || !online) {
-      return;
+  const flush = (): Promise<void> => {
+    if (flushPromise) {
+      return flushPromise;
     }
-    const attempts: Promise<void>[] = [];
-    for (const part of pending.values()) {
-      const partKey = key(part);
-      if (active.has(partKey) || terminal.has(partKey)) {
-        continue;
+    if (disposed || !online || retryTimer) {
+      return Promise.resolve();
+    }
+
+    flushPromise = (async () => {
+      while (online && !disposed) {
+        const nextPart = getNextOrderedPart();
+        if (!nextPart) {
+          return;
+        }
+        inFlightPartKey = getPartKey(nextPart);
+        // biome-ignore lint/performance/noAwaitInLoops: a single in-flight upload must finish before the next starts.
+        const outcome = await send(nextPart);
+        inFlightPartKey = null;
+        if (outcome !== "acknowledged") {
+          return;
+        }
       }
-      active.add(partKey);
-      const attempt = send(part)
-        .catch((error: unknown) => {
-          if (disposed) {
-            return;
-          }
-          failed.add(partKey);
-          failureByKey.set(partKey, error);
-          const retryable = isRetryableRecordingFailure(error);
-          if (!retryable) {
-            terminal.add(partKey);
-          }
-          onError?.(error);
-          if (online && retryable && !retryTimer) {
-            retryTimer = setTimeout(() => {
-              retryTimer = undefined;
-              ignorePromise(flush());
-            }, RETRY_DELAY);
-          }
-        })
-        .finally(() => {
-          if (!disposed) {
-            active.delete(partKey);
-            onChange?.();
-          }
-        });
-      attempts.push(attempt);
-    }
-    await Promise.all(attempts);
+    })().finally(() => {
+      inFlightPartKey = null;
+      flushPromise = undefined;
+    });
+
+    return flushPromise;
   };
   const hydrate = async () => {
-    const parts = (await store.listParts?.()) ?? [];
-    for (const item of parts) {
-      pending.set(key(item), item);
+    const [parts, sessions] = await Promise.all([
+      store.listParts?.() ?? Promise.resolve([]),
+      store.listSessions?.() ?? Promise.resolve([]),
+    ]);
+    for (const item of sessions) {
+      rememberSessionOrder(item);
     }
+    for (const item of parts) {
+      rememberPendingPart(item);
+    }
+    emit();
   };
   const applyReconcile = async (
     result: Awaited<ReturnType<typeof reconcileRecordingParts>>
@@ -697,59 +814,109 @@ export function createLiveRecordingOutbox(
       })
     );
     for (const item of drop) {
-      pending.delete(key(item));
-      failed.delete(key(item));
-      failureByKey.delete(key(item));
+      const partKey = getPartKey(item);
+      if (pending.delete(partKey)) {
+        pendingBytes -= item.blob.size;
+      }
+      failed.delete(partKey);
+      failureByKey.delete(partKey);
     }
     for (const item of conflicts) {
-      terminal.add(key(item));
+      terminal.add(getPartKey(item));
     }
     if (session) {
+      rememberSessionOrder(session);
       await store.putSession?.(session);
     }
-    if (!disposed) {
-      onChange?.();
-    }
+    emit();
   };
   const recover = async (lookup?: RecordingManifestLookup) => {
-    const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
-    const [stored] = sessions
-      .filter((item) => item.status === "recording")
-      .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-    if (stored && lookup && online) {
-      if (lookup.kind === "missing") {
-        const session = (await store.getSession?.(stored.sessionId)) ?? stored;
-        return { integrity, missing: true, recovered: true, session };
-      }
-      const localParts = [...pending.values()].filter(
-        (item) => item.sessionId === stored.sessionId
-      );
-      await applyReconcile(
-        await reconcileRecordingParts({
-          localParts,
-          localSession: stored,
-          manifest: lookup.manifest,
-        })
-      );
+    if (online) {
+      reconnecting = true;
+      emit();
     }
-    await flush();
-    const session =
-      stored === undefined
-        ? null
-        : ((await store.getSession?.(stored.sessionId)) ?? stored);
-    return {
-      integrity,
-      missing: false,
-      recovered: Boolean(stored),
-      session,
-    };
+    try {
+      const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
+      const [stored] = sessions
+        .filter((item) => item.status === "recording")
+        .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
+      if (stored) {
+        rememberSessionOrder(stored);
+      }
+      if (stored && lookup && online) {
+        if (lookup.kind === "missing") {
+          const session =
+            (await store.getSession?.(stored.sessionId)) ?? stored;
+          return { integrity, missing: true, recovered: true, session };
+        }
+        const localParts = [...pending.values()].filter(
+          (item) => item.sessionId === stored.sessionId
+        );
+        await applyReconcile(
+          await reconcileRecordingParts({
+            localParts,
+            localSession: stored,
+            manifest: lookup.manifest,
+          })
+        );
+      }
+      reconnecting = false;
+      emit();
+      await flush();
+      const session =
+        stored === undefined
+          ? null
+          : ((await store.getSession?.(stored.sessionId)) ?? stored);
+      return {
+        integrity,
+        missing: false,
+        recovered: Boolean(stored),
+        session,
+      };
+    } finally {
+      reconnecting = false;
+      emit();
+    }
   };
+  const recoverAndFlush = recover;
   const assertCanFinalize = () => {
     const message = integrityMessage(integrity);
     if (message) {
       throw markRecordingFailure(message, "fatal");
     }
   };
+  const currentDeliveryPhase = (): RecordingDeliveryPhase => {
+    if (!online) {
+      return "offline";
+    }
+    if (reconnecting) {
+      return "reconnecting";
+    }
+    if (retryTimer) {
+      return "retrying";
+    }
+    if (pending.size > 0) {
+      return "saving";
+    }
+    return "idle";
+  };
+  const currentSaveState = (): RecordingSaveState => {
+    if (terminal.size || persistenceFailed) {
+      return "error";
+    }
+    if (!online) {
+      return "offline";
+    }
+    return failed.size || retryTimer ? "retrying" : "healthy";
+  };
+  const snapshot = (): RecordingOutboxSnapshot => ({
+    deliveryPhase: currentDeliveryPhase(),
+    hasUnsentMedia: pending.size > 0,
+    integrity,
+    pendingBytes,
+    pendingPartCount: pending.size,
+    saveState: currentSaveState(),
+  });
   return {
     async add(part: RecordingPart) {
       try {
@@ -763,8 +930,9 @@ export function createLiveRecordingOutbox(
       if (disposed) {
         return;
       }
-      pending.set(key(part), part);
-      await flush();
+      rememberPendingPart(part);
+      emit();
+      ignorePromise(flush());
     },
     assertCanFinalize,
     async deleteSession(sessionId: string) {
@@ -795,12 +963,16 @@ export function createLiveRecordingOutbox(
         }
       }
       for (const partKey of keys) {
-        pending.delete(partKey);
+        const item = pending.get(partKey);
+        if (item && pending.delete(partKey)) {
+          pendingBytes -= item.blob.size;
+        }
         failed.delete(partKey);
         failureByKey.delete(partKey);
         terminal.delete(partKey);
       }
-      onChange?.();
+      segmentRankBySession.delete(sessionId);
+      emit();
     },
     dispose() {
       disposed = true;
@@ -811,7 +983,11 @@ export function createLiveRecordingOutbox(
       onChange = undefined;
     },
     async drain() {
-      await flush();
+      if (flushPromise) {
+        await flushPromise;
+      } else {
+        await flush();
+      }
       if (pending.size) {
         const failure = failureByKey.values().next().value;
         throw markRecordingFailure(
@@ -836,6 +1012,7 @@ export function createLiveRecordingOutbox(
       return pending.size;
     },
     recover,
+    recoverAndFlush,
     async savePartAndSession(part: RecordingPart, session: RecordingSession) {
       try {
         if (store.putPartAndSession) {
@@ -850,20 +1027,17 @@ export function createLiveRecordingOutbox(
         onError?.(failure);
         throw failure;
       }
-      pending.set(key(part), part);
-      await flush();
+      rememberSessionOrder(session);
+      rememberPendingPart(part);
+      emit();
+      ignorePromise(flush());
     },
     async saveSession(session: RecordingSession) {
+      rememberSessionOrder(session);
       await store.putSession?.(session);
     },
     get saveState(): RecordingSaveState {
-      if (terminal.size || persistenceFailed) {
-        return "error";
-      }
-      if (!online) {
-        return "offline";
-      }
-      return failed.size ? "retrying" : "healthy";
+      return currentSaveState();
     },
     async setOnline(value: boolean, options?: { flush?: boolean }) {
       online = value;
@@ -874,9 +1048,10 @@ export function createLiveRecordingOutbox(
       if (value && options?.flush !== false) {
         await flush();
       }
-      if (!disposed) {
-        onChange?.();
-      }
+      emit();
+    },
+    get snapshot(): RecordingOutboxSnapshot {
+      return snapshot();
     },
     subscribe(callback: () => void) {
       onChange = callback;

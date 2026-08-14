@@ -7,6 +7,9 @@ import type {
   AppendRecordingSegmentResult,
   CreateRecordingSessionResult,
   RecordingFinalizeResult,
+  RecordingPlaybackCursor,
+  RecordingPlaybackPage,
+  RecordingPlaybackSummary,
   RecordingStatus,
 } from "@interview-web/db";
 import { createORPCClient } from "@orpc/client";
@@ -28,6 +31,18 @@ const manifest = {
   segments: [],
   sessionId: input.sessionId,
 };
+const playbackSummary: RecordingPlaybackSummary = {
+  createdAt: 1_725_000_000_000,
+  hasOutput: true,
+  id: "session-1",
+  outputByteSize: 1024,
+  outputMediaType: "video/webm",
+  status: "ready",
+};
+const playbackPage: RecordingPlaybackPage = {
+  items: [playbackSummary],
+  nextCursor: null,
+};
 interface RecordingClient {
   recording: {
     appendSegment: (
@@ -35,13 +50,25 @@ interface RecordingClient {
     ) => Promise<AppendRecordingSegmentResult>;
     create: (value: typeof input) => Promise<CreateRecordingSessionResult>;
     getManifest: (value: { sessionId: string }) => Promise<typeof manifest>;
+    getPlaybackSummary: (value: {
+      sessionId: string;
+    }) => Promise<RecordingPlaybackSummary>;
     finalize: (value: {
       sessionId: string;
       segments: Array<{ segmentId: string; partCount: number }>;
     }) => Promise<RecordingFinalizeResult>;
     getStatus: (value: { sessionId: string }) => Promise<RecordingStatus>;
+    listPlaybackSummaries: (value: {
+      cursor?: RecordingPlaybackCursor;
+    }) => Promise<RecordingPlaybackPage>;
   };
 }
+type PlaybackBindingOverrides = Partial<
+  Pick<
+    RecordingBindings,
+    "getRecordingPlaybackSummary" | "listRecordingPlaybackSummaries"
+  >
+>;
 
 function setup(
   getManifest: RecordingBindings["getRecordingManifest"] = async () => manifest,
@@ -69,7 +96,8 @@ function setup(
     requestedMimeType: value.requestedMimeType ?? null,
     segmentId: value.segmentId,
     sessionId: value.sessionId,
-  })
+  }),
+  playbackBindings: PlaybackBindingOverrides = {}
 ) {
   const createCalls: unknown[] = [];
   const enqueueCalls: unknown[] = [];
@@ -85,7 +113,13 @@ function setup(
     },
     finalizeRecording,
     getRecordingManifest: getManifest,
+    getRecordingPlaybackSummary:
+      playbackBindings.getRecordingPlaybackSummary ??
+      (async () => playbackSummary),
     getRecordingStatus,
+    listRecordingPlaybackSummaries:
+      playbackBindings.listRecordingPlaybackSummaries ??
+      (async () => playbackPage),
   };
   const handler = new RPCHandler({ recording: recordingRouter });
   const client = createORPCClient(
@@ -369,4 +403,106 @@ it("missing manifest maps to Not Found", async () => {
       sessionId: "missing",
     })
   ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+});
+
+it("recording.listPlaybackSummaries forwards its cursor and returns only playback fields", async () => {
+  const cursor = { createdAt: 1_724_999_999_999, id: "session-0" };
+  const received: Array<{ cursor?: RecordingPlaybackCursor }> = [];
+  const { client } = setup(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      listRecordingPlaybackSummaries: (value) => {
+        received.push(value);
+        return Promise.resolve(playbackPage);
+      },
+    }
+  );
+
+  const result = await client.recording.listPlaybackSummaries({ cursor });
+
+  expect(received).toEqual([{ cursor }]);
+  expect(result).toEqual(playbackPage);
+  expect(result.items[0]).not.toHaveProperty("outputObjectKey");
+  expect(result.items[0]).not.toHaveProperty("outputChecksum");
+  expect(result.items[0]).not.toHaveProperty("failureCode");
+  expect(result.items[0]).not.toHaveProperty("finalizePlan");
+  expect(result.items[0]).not.toHaveProperty("leaseExpiresAt");
+
+  received.length = 0;
+  await client.recording.listPlaybackSummaries({});
+  expect(received).toEqual([{}]);
+});
+
+it("recording.getPlaybackSummary maps a missing summary to NOT_FOUND", async () => {
+  const { client } = setup(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      getRecordingPlaybackSummary: async () => null,
+    }
+  );
+
+  await expect(
+    client.recording.getPlaybackSummary({ sessionId: "missing" })
+  ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
+});
+
+it("recording playback procedures reject invalid input before calling bindings", async () => {
+  const getPlaybackSummary = vi.fn();
+  const listPlaybackSummaries = vi.fn();
+  const { client } = setup(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      getRecordingPlaybackSummary: getPlaybackSummary,
+      listRecordingPlaybackSummaries: listPlaybackSummaries,
+    }
+  );
+
+  await expect(
+    client.recording.getPlaybackSummary({ sessionId: "" })
+  ).rejects.toMatchObject({ status: 400 });
+  await expect(
+    client.recording.getPlaybackSummary({ sessionId: "x".repeat(129) })
+  ).rejects.toMatchObject({ status: 400 });
+  await expect(
+    client.recording.listPlaybackSummaries({
+      cursor: { createdAt: -1, id: "session-1" },
+    })
+  ).rejects.toMatchObject({ status: 400 });
+  await expect(
+    client.recording.listPlaybackSummaries({
+      cursor: { createdAt: 1, id: "" },
+    })
+  ).rejects.toMatchObject({ status: 400 });
+  await expect(
+    client.recording.listPlaybackSummaries({
+      cursor: { createdAt: 1, id: "x".repeat(129) },
+    })
+  ).rejects.toMatchObject({ status: 400 });
+
+  const invalidCreatedAt: unknown = {
+    cursor: { createdAt: 1.25, id: "session-1" },
+  };
+  await expect(
+    client.recording.listPlaybackSummaries(
+      invalidCreatedAt as { cursor?: RecordingPlaybackCursor }
+    )
+  ).rejects.toMatchObject({ status: 400 });
+
+  expect(getPlaybackSummary).not.toHaveBeenCalled();
+  expect(listPlaybackSummaries).not.toHaveBeenCalled();
 });

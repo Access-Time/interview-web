@@ -76,8 +76,11 @@ export function createCandidateBindings(): CandidateBindingFixture {
       },
       getRecordingManifest: (sessionId) =>
         Promise.resolve(manifests.get(sessionId) ?? null),
+      getRecordingPlaybackSummary: () => Promise.resolve(null),
       getRecordingStatus: (sessionId) =>
         Promise.resolve(statuses.get(sessionId) ?? null),
+      listRecordingPlaybackSummaries: () =>
+        Promise.resolve({ items: [], nextCursor: null }),
     },
     markAllReady: () => {
       for (const sessionId of statuses.keys()) {

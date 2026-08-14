@@ -114,18 +114,6 @@ export type RecordingJourneyOutcome =
   | "terminal-restart"
   | "missing-recovery";
 
-function normalizeManifestLookup(
-  result: RecordingManifestLookup | RecordingManifestView | null
-): RecordingManifestLookup {
-  if (result === null) {
-    return { kind: "missing" };
-  }
-  if ("kind" in result) {
-    return result;
-  }
-  return { kind: "found", manifest: result };
-}
-
 const partIdentity = (segmentId: string, sequence: number) =>
   `${segmentId}:${sequence}`;
 
@@ -605,15 +593,14 @@ export function createLiveRecordingOutbox(
   const recover = async (
     getManifest?: (input: {
       sessionId: string;
-    }) => Promise<RecordingManifestLookup | RecordingManifestView | null>
+    }) => Promise<RecordingManifestLookup>
   ) => {
     const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
     const [stored] = sessions
       .filter((item) => item.status === "recording")
       .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
     if (stored && getManifest && online) {
-      const result = await getManifest({ sessionId: stored.sessionId });
-      const lookup = normalizeManifestLookup(result);
+      const lookup = await getManifest({ sessionId: stored.sessionId });
       if (lookup.kind === "missing") {
         const session = (await store.getSession?.(stored.sessionId)) ?? stored;
         return { integrity, missing: true, recovered: true, session };
@@ -667,15 +654,35 @@ export function createLiveRecordingOutbox(
     async deleteSession(sessionId: string) {
       await store.deleteSession?.(sessionId);
     },
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: cleanup covers every in-memory failure index.
     async discardSession(sessionId: string) {
       await store.discardSession(sessionId);
+      const keys = new Set<string>();
       for (const [partKey, item] of pending) {
         if (item.sessionId === sessionId) {
-          pending.delete(partKey);
-          failed.delete(partKey);
-          failureByKey.delete(partKey);
-          terminal.delete(partKey);
+          keys.add(partKey);
         }
+      }
+      for (const partKey of failed) {
+        if (partKey.startsWith(`${sessionId}:`)) {
+          keys.add(partKey);
+        }
+      }
+      for (const partKey of failureByKey.keys()) {
+        if (partKey.startsWith(`${sessionId}:`)) {
+          keys.add(partKey);
+        }
+      }
+      for (const partKey of terminal) {
+        if (partKey.startsWith(`${sessionId}:`)) {
+          keys.add(partKey);
+        }
+      }
+      for (const partKey of keys) {
+        pending.delete(partKey);
+        failed.delete(partKey);
+        failureByKey.delete(partKey);
+        terminal.delete(partKey);
       }
       onChange?.();
     },
@@ -790,14 +797,14 @@ function snapshotOutbox(
     : IDLE_OUTBOX_SNAPSHOT;
 }
 
-export function useLiveRecording(options: {
-  createSession: (input: {
+export interface UseLiveRecordingOptions {
+  appendSegment: (input: {
     sessionId: string;
     segmentId: string;
     requestedMimeType: string | null;
     recorderMimeType: string | null;
   }) => Promise<unknown>;
-  appendSegment: (input: {
+  createSession: (input: {
     sessionId: string;
     segmentId: string;
     requestedMimeType: string | null;
@@ -812,8 +819,21 @@ export function useLiveRecording(options: {
   }) => Promise<RecordingFinalizationStatus>;
   getManifest?: (input: {
     sessionId: string;
-  }) => Promise<RecordingManifestLookup | RecordingManifestView | null>;
-}): UseLiveRecordingResult {
+  }) => Promise<RecordingManifestLookup>;
+}
+
+type LegacyLiveRecordingOptions = Omit<
+  UseLiveRecordingOptions,
+  "getManifest"
+> & {
+  getManifest?: (input: {
+    sessionId: string;
+  }) => Promise<RecordingManifestView | null>;
+};
+
+export function useLiveRecording(
+  options: UseLiveRecordingOptions | LegacyLiveRecordingOptions
+): UseLiveRecordingResult {
   const outbox = useRef<ReturnType<typeof createLiveRecordingOutbox> | null>(
     null
   );
@@ -884,6 +904,10 @@ export function useLiveRecording(options: {
   const setFinalizationState = (value: RecordingFinalizationResult | null) => {
     finalizationRef.current = value;
     setFinalization(value);
+  };
+  const revokeRecoveryReset = () => {
+    setJourneyOutcome("none");
+    setCanResetRecoveredRecording(false);
   };
 
   const completeReadyFinalization = async (input: {
@@ -1050,11 +1074,14 @@ export function useLiveRecording(options: {
       const { getManifest } = options;
       const manifestLookup = getManifest
         ? async (input: { sessionId: string }) => {
-            const lookup = await getManifest(input);
-            if (!lookup) {
-              throw new Error("Recording manifest lookup unavailable");
+            const result = await getManifest(input);
+            if (result === null) {
+              return { kind: "missing" } as const;
             }
-            return lookup;
+            if ("kind" in result) {
+              return result;
+            }
+            return { kind: "found", manifest: result } as const;
           }
         : undefined;
       const recovery = await box.recover(manifestLookup);
@@ -1082,6 +1109,8 @@ export function useLiveRecording(options: {
       } else if (recovery.missing) {
         setJourneyOutcome("missing-recovery");
         setCanResetRecoveredRecording(Boolean(recovery.session && ids.current));
+      } else {
+        revokeRecoveryReset();
       }
       return recovery;
     };
@@ -1184,6 +1213,7 @@ export function useLiveRecording(options: {
   };
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
+    revokeRecoveryReset();
     setCaptureEnded(false);
     await recoveryPromise.current;
     if (sealedPlans.current.length) {
@@ -1306,6 +1336,7 @@ export function useLiveRecording(options: {
     }
   };
   const stop = async () => {
+    revokeRecoveryReset();
     if (recorder.current?.state !== "recording") {
       return;
     }
@@ -1374,6 +1405,7 @@ export function useLiveRecording(options: {
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
   }) => {
+    revokeRecoveryReset();
     outbox.current?.assertCanFinalize();
     cancelFinalizationPolling();
     setFinalizationState({ error: null, state: "finalizing" });

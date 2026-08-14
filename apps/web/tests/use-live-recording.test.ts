@@ -2,6 +2,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { afterEach, expect, it } from "vitest";
 import {
+  type RecordingManifestLookup,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "../src/recording/live-recording.ts";
@@ -166,7 +167,7 @@ class FakeMediaRecorder extends EventTarget {
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
 let resolveFinalization: (() => void) | null = null;
-let manifestLookup: (() => Promise<{ kind: "missing" }>) | undefined;
+let manifestLookup: (() => Promise<RecordingManifestLookup>) | undefined;
 
 function RecordingHost() {
   latest = useLiveRecording({
@@ -221,6 +222,9 @@ it("normal stop releases tracks after capture and retains submission", async () 
 
   render(React.createElement(RecordingHost));
   await waitFor(() => expect(latest).not.toBe(null));
+  await expect(latest?.resetRecoveredRecording()).rejects.toThrow(
+    "cannot be reset"
+  );
 
   await act(async () => {
     await latest?.initialize();
@@ -286,4 +290,61 @@ it("durably resets a typed missing recovered recording", async () => {
   expect(latest?.journeyOutcome).toBe("none");
   expect(latest?.recovered).toBe(false);
   expect(latest?.canResetRecoveredRecording).toBe(false);
+});
+
+it("revokes reset after a successful lookup and preserves it after transport failure", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: {
+        segments: [
+          {
+            id: "segment",
+            parts: [{ checksum: "checksum", sequence: 0 }],
+          },
+        ],
+        sessionId: "session-1",
+      },
+    });
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("none");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  manifestLookup = () => {
+    throw new Error("deployment unavailable");
+  };
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
 });

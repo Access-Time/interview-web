@@ -195,14 +195,17 @@ let manifestLookup: (() => Promise<RecordingManifestLookup>) | undefined;
 
 function RecordingHost() {
   latest = useLiveRecording({
-    appendSegment: () => Promise.resolve(),
-    createSession: () => Promise.resolve(),
-    finalizeSession: async () => {
+    appendSegment: (_input, { onSuccess }) => {
+      onSuccess(undefined);
+    },
+    createSession: (_input, { onSuccess }) => {
+      onSuccess(undefined);
+    },
+    finalizeSession: (_input, { onSuccess }) => {
       finalizeCalls += 1;
-      await new Promise<void>((resolve) => {
-        resolveFinalization = resolve;
-      });
-      return { status: "ready" };
+      resolveFinalization = () => {
+        onSuccess({ status: "ready" });
+      };
     },
     getManifest: manifestLookup
       ? async () => manifestLookup?.() ?? { kind: "missing" }

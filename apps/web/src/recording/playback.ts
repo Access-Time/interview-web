@@ -2,6 +2,7 @@ import type {
   RecordingPlaybackStatus,
   RecordingPlaybackSummary,
 } from "@interview-web/db";
+import type { ApiErrors } from "@/utils/orpc";
 import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export type PlaybackDetailKind = "playable" | "processing" | "unavailable";
@@ -60,21 +61,19 @@ export function recordingSubmissionUrl(sessionId: string): string {
   return `/api/recordings/${encodeURIComponent(sessionId)}/submission`;
 }
 
-export async function playbackSummaryLookup(
+export function playbackSummaryLookup(
   getSummary: (input: {
     sessionId: string;
   }) => Promise<RecordingPlaybackSummary>,
   input: { sessionId: string }
 ): Promise<RecordingPlaybackSummaryLookup> {
-  try {
-    return {
-      kind: "found",
-      summary: await getSummary(input),
-    };
-  } catch (error) {
-    if (isRecordingNotFoundError(error)) {
-      return { kind: "missing" };
+  return getSummary(input).then(
+    (summary) => ({ kind: "found", summary }),
+    (error: ApiErrors["recording"]["getPlaybackSummary"]) => {
+      if (isRecordingNotFoundError(error)) {
+        return { kind: "missing" };
+      }
+      throw error;
     }
-    throw error;
-  }
+  );
 }

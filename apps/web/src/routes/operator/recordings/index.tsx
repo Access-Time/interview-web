@@ -1,14 +1,12 @@
-import type {
-  RecordingPlaybackCursor,
-  RecordingPlaybackSummary,
-} from "@interview-web/db";
+import type { RecordingPlaybackCursor } from "@interview-web/db";
+import { useInfiniteQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback } from "react";
 import {
   type PlaybackListErrorKind,
   RecordingPlaybackList,
 } from "@/recording/playback-view";
-import { client } from "@/utils/orpc";
+import { orpc } from "@/utils/orpc";
 
 export const Route = createFileRoute("/operator/recordings/")({
   component: RecordingsIndexRoute,
@@ -29,75 +27,37 @@ function listErrorKind(
 }
 
 function RecordingsIndexRoute() {
-  const [items, setItems] = useState<RecordingPlaybackSummary[]>([]);
-  const [nextCursor, setNextCursor] = useState<RecordingPlaybackCursor | null>(
-    null
+  const listQuery = useInfiniteQuery(
+    orpc.recording.listPlaybackSummaries.infiniteOptions({
+      getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+      initialPageParam: undefined as RecordingPlaybackCursor | undefined,
+      input: (cursor: RecordingPlaybackCursor | undefined) => ({ cursor }),
+    })
   );
-  const [isLoading, setIsLoading] = useState(true);
-  const [initialError, setInitialError] = useState(false);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [loadMoreError, setLoadMoreError] = useState(false);
-  const loadGeneration = useRef(0);
 
-  const loadFirstPage = useCallback(() => {
-    const generation = loadGeneration.current + 1;
-    loadGeneration.current = generation;
-    setIsLoading(true);
-    setInitialError(false);
-
-    client.recording
-      .listPlaybackSummaries({})
-      .then((page) => {
-        if (loadGeneration.current !== generation) {
-          return;
-        }
-        setItems(page.items);
-        setNextCursor(page.nextCursor);
-        setLoadMoreError(false);
-        setIsLoading(false);
-      })
-      .catch(() => {
-        if (loadGeneration.current !== generation) {
-          return;
-        }
-        setInitialError(true);
-        setIsLoading(false);
-      });
-  }, []);
-
-  useEffect(() => {
-    loadFirstPage();
-  }, [loadFirstPage]);
-
+  const items = listQuery.data?.pages.flatMap((page) => page.items) ?? [];
+  const nextCursor = listQuery.data?.pages.at(-1)?.nextCursor ?? null;
   const onLoadMore = useCallback(() => {
-    if (!nextCursor || isLoadingMore) {
-      return;
+    if (listQuery.hasNextPage && !listQuery.isFetchingNextPage) {
+      listQuery.fetchNextPage();
     }
-    setIsLoadingMore(true);
-    setLoadMoreError(false);
-    client.recording
-      .listPlaybackSummaries({ cursor: nextCursor })
-      .then((page) => {
-        setItems((current) => [...current, ...page.items]);
-        setNextCursor(page.nextCursor);
-        setLoadMoreError(false);
-        setIsLoadingMore(false);
-      })
-      .catch(() => {
-        setLoadMoreError(true);
-        setIsLoadingMore(false);
-      });
-  }, [isLoadingMore, nextCursor]);
+  }, [listQuery]);
+  const onRetry = useCallback(() => {
+    listQuery.refetch();
+  }, [listQuery]);
 
   return (
     <RecordingPlaybackList
-      errorKind={listErrorKind(initialError, loadMoreError)}
-      isLoading={isLoading}
-      isLoadingMore={isLoadingMore}
+      errorKind={listErrorKind(
+        listQuery.isError && !listQuery.data,
+        listQuery.isFetchNextPageError
+      )}
+      isLoading={listQuery.isPending}
+      isLoadingMore={listQuery.isFetchingNextPage}
       items={items}
       nextCursor={nextCursor}
       onLoadMore={onLoadMore}
-      onRetry={loadFirstPage}
+      onRetry={onRetry}
     />
   );
 }

@@ -123,6 +123,10 @@ function installBrowserGlobals() {
       Object.getOwnPropertyDescriptor(globalThis, property)
     );
   }
+  Object.defineProperty(globalThis.navigator, "onLine", {
+    configurable: true,
+    value: true,
+  });
   return installIndexedDb();
 }
 
@@ -132,6 +136,8 @@ const tracks = [
   { kind: "video", stop: () => events.push("video-track-stopped") },
 ] as unknown as MediaStreamTrack[];
 const stream = { getTracks: () => tracks } as unknown as MediaStream;
+let uploadStatus = 201;
+let uploadCalls = 0;
 
 class FakeMediaRecorder extends EventTarget {
   static isTypeSupported() {
@@ -144,8 +150,11 @@ class FakeMediaRecorder extends EventTarget {
   onstop: ((event: Event) => void) | null = null;
   state: RecordingState = "inactive";
 
+  static last: FakeMediaRecorder | null = null;
+
   constructor(_stream: MediaStream, _options?: MediaRecorderOptions) {
     super();
+    FakeMediaRecorder.last = this;
   }
 
   start() {
@@ -154,13 +163,28 @@ class FakeMediaRecorder extends EventTarget {
 
   stop() {
     this.state = "inactive";
-    this.ondataavailable?.({
-      data: new Blob(["captured"], { type: this.mimeType }),
-    } as BlobEvent);
+    this.emitData("captured");
     events.push("capture-ended");
     const stopEvent = new NodeEvent("stop");
     this.dispatchEvent(stopEvent);
     this.onstop?.(stopEvent);
+  }
+
+  emitError() {
+    this.state = "inactive";
+    const errorEvent = new NodeEvent("error");
+    this.onerror?.(errorEvent);
+    this.onerror?.(errorEvent);
+    this.emitData("terminal");
+    const stopEvent = new NodeEvent("stop");
+    this.dispatchEvent(stopEvent);
+    this.onstop?.(stopEvent);
+  }
+
+  emitData(value: string) {
+    this.ondataavailable?.({
+      data: new Blob([value], { type: this.mimeType }),
+    } as BlobEvent);
   }
 }
 
@@ -203,6 +227,9 @@ afterEach(() => {
   finalizeCalls = 0;
   resolveFinalization = null;
   manifestLookup = undefined;
+  uploadStatus = 201;
+  uploadCalls = 0;
+  FakeMediaRecorder.last = null;
 });
 
 it("normal stop releases tracks after capture and retains submission", async () => {
@@ -217,7 +244,7 @@ it("normal stop releases tracks after capture and retains submission", async () 
   });
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
-    value: async () => new Response(null, { status: 201 }),
+    value: () => Promise.resolve(new Response(null, { status: uploadStatus })),
   });
 
   render(React.createElement(RecordingHost));
@@ -256,6 +283,89 @@ it("normal stop releases tracks after capture and retains submission", async () 
     resolveFinalization?.();
     await stopPromise;
   });
+});
+
+it("releases media and stays terminal after a fatal upload", async () => {
+  installBrowserGlobals();
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: FakeMediaRecorder,
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+  uploadStatus = 400;
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: () => {
+      uploadCalls += 1;
+      return Promise.resolve(new Response(null, { status: uploadStatus }));
+    },
+  });
+
+  render(React.createElement(RecordingHost));
+  await act(async () => {
+    await latest?.initialize();
+  });
+  await waitFor(() => expect(latest?.isReady).toBe(true));
+  await act(async () => {
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("captured");
+  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
+  await waitFor(() => expect(latest?.saveState).toBe("error"));
+  await waitFor(() => expect(latest?.journeyOutcome).toBe("terminal-restart"));
+  let stopPromise: Promise<void> | undefined;
+  await act(async () => {
+    stopPromise = latest?.stop();
+    await Promise.resolve();
+  });
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.isReady).toBe(false);
+  expect(latest?.stream).toBe(null);
+  expect(
+    events.filter((event) => event.includes("track-stopped"))
+  ).toHaveLength(2);
+  await stopPromise;
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.journeyOutcome).toBe("terminal-restart");
+});
+
+it("handles duplicate recorder errors with one physical cleanup", async () => {
+  installBrowserGlobals();
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: FakeMediaRecorder,
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: async () => new Response(null, { status: 201 }),
+  });
+
+  render(React.createElement(RecordingHost));
+  await act(async () => {
+    await latest?.initialize();
+  });
+  await waitFor(() => expect(latest?.isReady).toBe(true));
+  await act(async () => {
+    await latest?.start();
+    FakeMediaRecorder.last?.emitError();
+    await Promise.resolve();
+  });
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.isReady).toBe(false);
+  expect(latest?.stream).toBe(null);
+  expect(
+    events.filter((event) => event.includes("track-stopped"))
+  ).toHaveLength(2);
+  expect(events.filter((event) => event === "capture-ended")).toHaveLength(0);
+  resolveFinalization?.();
+  await waitFor(() => expect(latest?.captureEnded).toBe(true));
 });
 
 it("durably resets a typed missing recovered recording", async () => {

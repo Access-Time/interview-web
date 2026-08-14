@@ -328,6 +328,13 @@ export function isRetryableRecordingFailure(
   );
 }
 
+function isFatalRecordingFailure(error: unknown): error is RecordingFailure {
+  return (
+    error instanceof Error &&
+    (error as Partial<RecordingFailure>).recordingFailure === "fatal"
+  );
+}
+
 const MIME_TYPES = [
   "video/webm;codecs=vp9,opus",
   "video/webm;codecs=vp8,opus",
@@ -843,6 +850,11 @@ export function useLiveRecording(
   const ids = useRef<{ sessionId: string; segmentId: string } | null>(null);
   const session = useRef<RecordingSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const terminalDataRef = useRef<{
+    awaiting: boolean;
+    promise: Promise<void>;
+    resolve: () => void;
+  } | null>(null);
   const lifecycle = useRef<boolean | undefined>(undefined);
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [isReady, setReady] = useState(false);
@@ -869,6 +881,7 @@ export function useLiveRecording(
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
   const captureEndingRef = useRef<Promise<void> | null>(null);
+  const captureCauseRef = useRef<unknown>(undefined);
   const finalizationInFlight = useRef<Promise<void> | null>(null);
   const sealedPumpLock = useRef(false);
   const sealedPlans = useRef<
@@ -994,7 +1007,9 @@ export function useLiveRecording(
       if (isRetryableRecordingFailure(cause)) {
         return;
       }
+      captureCauseRef.current = cause;
       setError(cause instanceof Error ? cause.message : String(cause));
+      setJourneyOutcome("terminal-restart");
       ignorePromise(endCapture(cause));
     });
     outbox.current = box;
@@ -1237,8 +1252,6 @@ export function useLiveRecording(
     const instance = requested
       ? new MediaRecorder(stream, { mimeType: requested })
       : new MediaRecorder(stream);
-    captureEndingRef.current = null;
-    setCaptureEnded(false);
     cancelFinalizationPolling();
     finalizationAttempted.current = false;
     finalizationInput.current = null;
@@ -1246,6 +1259,15 @@ export function useLiveRecording(
     ids.current = { segmentId, sessionId };
     sequence.current = 0;
     recorder.current = instance;
+    let resolveTerminalData!: () => void;
+    const terminalData = new Promise<void>((resolve) => {
+      resolveTerminalData = resolve;
+    });
+    terminalDataRef.current = {
+      awaiting: false,
+      promise: terminalData,
+      resolve: resolveTerminalData,
+    };
     const metadata = {
       recorderMimeType: instance.mimeType || null,
       requestedMimeType: requested,
@@ -1274,6 +1296,9 @@ export function useLiveRecording(
       return;
     }
     instance.ondataavailable = (event) => {
+      if (terminalDataRef.current?.awaiting) {
+        terminalDataRef.current.resolve();
+      }
       if (!(event.data.size && ids.current && outbox.current)) {
         return;
       }
@@ -1319,6 +1344,7 @@ export function useLiveRecording(
     };
     instance.onerror = (event) => {
       if (lifecycle.current !== true) {
+        captureCauseRef.current = event;
         setError("Recording failed while capturing media");
         ignorePromise(endCapture(event));
       }
@@ -1329,6 +1355,9 @@ export function useLiveRecording(
       }
     };
     instance.start(5000);
+    captureEndingRef.current = null;
+    captureCauseRef.current = undefined;
+    setCaptureEnded(false);
     if (lifecycle.current === false || lifecycle.current === undefined) {
       setRecording(true);
       if (outbox.current?.integrity === "ok") {
@@ -1351,14 +1380,22 @@ export function useLiveRecording(
 
       try {
         const instance = recorder.current;
-        if (instance === undefined) {
-          // No recorder was created before capture shutdown.
-        } else if (instance.state !== "inactive") {
+        const terminalData = terminalDataRef.current;
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: the recorder may end before its terminal listener is installed.
+        if (terminalData) {
+          terminalData.awaiting = true;
+        }
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: shutdown can race recorder creation.
+        if (instance && instance.state !== "inactive") {
           await new Promise<void>((resolve) => {
             const done = () => resolve();
             instance.addEventListener("stop", done, { once: true });
             instance.stop();
           });
+        }
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: the terminal promise is optional before a valid capture.
+        if (terminalData) {
+          await terminalData.promise;
         }
 
         while (processing.current.length) {
@@ -1410,23 +1447,32 @@ export function useLiveRecording(
         if (finalizationState === "failed") {
           setJourneyOutcome("manual-retry");
         } else if (
+          isFatalRecordingFailure(captureCauseRef.current) ||
+          box.saveState === "error"
+        ) {
+          setJourneyOutcome("terminal-restart");
+        } else if (
           finalizationState &&
           isPendingFinalizationState(finalizationState)
         ) {
           setJourneyOutcome("automatic-retry");
         }
       } catch (failure) {
-        const failureCause = cause ?? failure;
-        if (failure instanceof Error) {
+        const failureCause = cause ?? captureCauseRef.current ?? failure;
+        if (cause === undefined && failure instanceof Error) {
           setError(failure.message);
         }
-        if (
+        if (finalizationRef.current?.state === "failed") {
+          setJourneyOutcome("manual-retry");
+        } else if (isFatalRecordingFailure(failureCause)) {
+          setJourneyOutcome("terminal-restart");
+        } else if (outbox.current?.saveState === "error") {
+          setJourneyOutcome("terminal-restart");
+        } else if (
           isRetryableRecordingFailure(failureCause) ||
           outbox.current?.saveState === "offline"
         ) {
           setJourneyOutcome("automatic-retry");
-        } else if (finalizationRef.current?.state === "failed") {
-          setJourneyOutcome("manual-retry");
         } else {
           setJourneyOutcome("terminal-restart");
         }
@@ -1437,11 +1483,11 @@ export function useLiveRecording(
   };
 
   const stop = () => {
-    revokeRecoveryReset();
     const ending = captureEndingRef.current;
     if (ending !== null) {
       return ending;
     }
+    revokeRecoveryReset();
     if (recorder.current?.state !== "recording") {
       return Promise.resolve();
     }

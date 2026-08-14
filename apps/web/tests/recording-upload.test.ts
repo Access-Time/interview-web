@@ -1,5 +1,4 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import { expect, it } from "vitest";
 import { handleRecordingUploadPart } from "../src/server/recording-upload.ts";
 
 const checksum = "a".repeat(64);
@@ -55,7 +54,7 @@ const request = (contentChecksum = checksum, mediaType?: string) =>
     method: "PUT",
   } as RequestInit);
 
-test("missing or malformed checksum skips storage", async () => {
+it("missing or malformed checksum skips storage", async () => {
   await Promise.all(
     [null, "bad", "a".repeat(63), "g".repeat(64)].map(async (value) => {
       const { env, puts } = setup();
@@ -73,28 +72,27 @@ test("missing or malformed checksum skips storage", async () => {
         params,
         env
       );
-      assert.equal(result.status, 400);
-      assert.equal(puts.length, 0);
+      expect(result.status).toBe(400);
+      expect(puts.length).toBe(0);
     })
   );
 });
 
-test("success streams and passes conditional R2 metadata", async () => {
+it("success streams and passes conditional R2 metadata", async () => {
   const { env, puts } = setup();
   const response = await handleRecordingUploadPart(request(), params, env);
-  assert.equal(response.status, 201);
-  assert.ok(puts[0]?.body instanceof ReadableStream);
-  assert.equal(
-    puts[0]?.key,
+  expect(response.status).toBe(201);
+  expect(puts[0]?.body instanceof ReadableStream).toBeTruthy();
+  expect(puts[0]?.key).toBe(
     `recordings/s1/segments/g1/parts/2/sha256/${checksum}`
   );
-  assert.deepEqual(puts[0]?.options, {
+  expect(puts[0]?.options).toEqual({
     onlyIf: { etagDoesNotMatch: "*" },
     sha256: checksum,
   });
 });
 
-test("passes Content-Type to acknowledgement and returns authoritative media type", async () => {
+it("passes Content-Type to acknowledgement and returns authoritative media type", async () => {
   let acknowledgedMediaType: string | null = null;
   const { env } = setup({
     acknowledge: (input) => {
@@ -111,23 +109,24 @@ test("passes Content-Type to acknowledgement and returns authoritative media typ
     params,
     env
   );
-  assert.equal(acknowledgedMediaType, "video/webm");
+  expect(acknowledgedMediaType).toBe("video/webm");
   const body: unknown = await response.json();
-  assert.ok(body && typeof body === "object" && "mediaType" in body);
-  assert.equal(body.mediaType, "video/webm;codecs=opus");
+  if (!body || typeof body !== "object" || !("mediaType" in body)) {
+    throw new Error("Expected upload response to include mediaType");
+  }
+  expect(body.mediaType).toBe("video/webm;codecs=opus");
 });
 
-test("compatible retry returns 200", async () => {
+it("compatible retry returns 200", async () => {
   const { env } = setup({
     acknowledge: async (input) => ({ id: "existing", ...input }),
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     200
   );
 });
 
-test("missing Content-Type is acknowledged as null", async () => {
+it("missing Content-Type is acknowledged as null", async () => {
   let mediaType: string | null = "unexpected";
   const { env } = setup({
     acknowledge: (input) => {
@@ -136,22 +135,21 @@ test("missing Content-Type is acknowledged as null", async () => {
     },
   });
   await handleRecordingUploadPart(request(), params, env);
-  assert.equal(mediaType, null);
+  expect(mediaType).toBe(null);
 });
 
-test("generic acknowledgement failure retains the new object", async () => {
+it("generic acknowledgement failure retains the new object", async () => {
   const { env } = setup({
     acknowledge: () => {
       throw new Error("db");
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     500
   );
 });
 
-test("new-object manifest conflict retains the candidate for race safety", async () => {
+it("new-object manifest conflict retains the candidate for race safety", async () => {
   const { deletes, env, puts } = setup({
     acknowledge: () => {
       const error = new Error("conflict");
@@ -159,16 +157,15 @@ test("new-object manifest conflict retains the candidate for race safety", async
       throw error;
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     409
   );
-  assert.equal(puts.length, 1);
+  expect(puts.length).toBe(1);
   // A concurrent acknowledgement may have made this object authoritative in D1.
-  assert.deepEqual(deletes, []);
+  expect(deletes).toEqual([]);
 });
 
-test("new-object invalid ownership retains the candidate and returns 404", async () => {
+it("new-object invalid ownership retains the candidate and returns 404", async () => {
   const { deletes, env, puts } = setup({
     acknowledge: () => {
       const error = new Error("ownership");
@@ -176,15 +173,14 @@ test("new-object invalid ownership retains the candidate and returns 404", async
       throw error;
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     404
   );
-  assert.equal(puts.length, 1);
-  assert.deepEqual(deletes, []);
+  expect(puts.length).toBe(1);
+  expect(deletes).toEqual([]);
 });
 
-test("pre-existing invalid ownership returns 404", async () => {
+it("pre-existing invalid ownership returns 404", async () => {
   const base = setup();
   const { env, puts } = setup({
     acknowledge: () => {
@@ -202,14 +198,13 @@ test("pre-existing invalid ownership returns 404", async () => {
       put: async () => null,
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     404
   );
-  assert.equal(puts.length, 0);
+  expect(puts.length).toBe(0);
 });
 
-test("pre-existing-object manifest conflict returns 409", async () => {
+it("pre-existing-object manifest conflict returns 409", async () => {
   const base = setup();
   const { deletes, env } = setup({
     acknowledge: () => {
@@ -227,14 +222,13 @@ test("pre-existing-object manifest conflict returns 409", async () => {
       put: async () => null,
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     409
   );
-  assert.equal(deletes.length, 0);
+  expect(deletes.length).toBe(0);
 });
 
-test("new-object conflict does not attempt candidate deletion", async () => {
+it("new-object conflict does not attempt candidate deletion", async () => {
   const { deletes, env } = setup({
     acknowledge: () => {
       const error = new Error("conflict");
@@ -249,14 +243,13 @@ test("new-object conflict does not attempt candidate deletion", async () => {
       },
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     409
   );
-  assert.deepEqual(deletes, []);
+  expect(deletes).toEqual([]);
 });
 
-test("matching existing R2 retry returns 200 without deleting", async () => {
+it("matching existing R2 retry returns 200 without deleting", async () => {
   const base = setup();
   const { env } = setup({
     storage: {
@@ -269,13 +262,12 @@ test("matching existing R2 retry returns 200 without deleting", async () => {
       put: async () => null,
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     201
   );
 });
 
-test("matching binary existing R2 checksums return 200", async () => {
+it("matching binary existing R2 checksums return 200", async () => {
   const bytes = Uint8Array.from(checksum.match(/../g) ?? [], (byte) =>
     Number.parseInt(byte, 16)
   );
@@ -293,15 +285,14 @@ test("matching binary existing R2 checksums return 200", async () => {
           put: async () => null,
         },
       });
-      assert.equal(
-        (await handleRecordingUploadPart(request(), params, env)).status,
-        201
-      );
+      expect(
+        (await handleRecordingUploadPart(request(), params, env)).status
+      ).toBe(201);
     })
   );
 });
 
-test("mismatching binary existing R2 checksum returns 409", async () => {
+it("mismatching binary existing R2 checksum returns 409", async () => {
   const { env } = setup({
     storage: {
       ...setup().env.storage,
@@ -313,13 +304,12 @@ test("mismatching binary existing R2 checksum returns 409", async () => {
       put: async () => null,
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     409
   );
 });
 
-test("mismatching existing R2 retry returns 409 without deleting", async () => {
+it("mismatching existing R2 retry returns 409 without deleting", async () => {
   const base = setup();
   const { env } = setup({
     storage: {
@@ -332,23 +322,21 @@ test("mismatching existing R2 retry returns 409 without deleting", async () => {
       put: async () => null,
     },
   });
-  assert.equal(
-    (await handleRecordingUploadPart(request(), params, env)).status,
+  expect((await handleRecordingUploadPart(request(), params, env)).status).toBe(
     409
   );
 });
 
-test("malformed sequence is rejected", async () => {
+it("malformed sequence is rejected", async () => {
   const { env, puts } = setup();
-  assert.equal(
+  expect(
     (
       await handleRecordingUploadPart(
         request(),
         { ...params, sequence: "-1.5" },
         env
       )
-    ).status,
-    400
-  );
-  assert.equal(puts.length, 0);
+    ).status
+  ).toBe(400);
+  expect(puts.length).toBe(0);
 });

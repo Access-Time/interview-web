@@ -1,10 +1,8 @@
-import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-// @ts-expect-error jsdom ships no declarations in this workspace.
-import { JSDOM } from "jsdom";
 import React from "react";
+import { afterEach, expect, it } from "vitest";
 import {
+  type RecordingManifestLookup,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "../src/recording/live-recording.ts";
@@ -12,15 +10,11 @@ import {
 const originalDescriptors = new Map<string, PropertyDescriptor | undefined>();
 const NodeEvent = Event;
 const globalProperties = [
-  "window",
-  "document",
-  "HTMLElement",
   "Event",
   "navigator",
   "indexedDB",
   "MediaRecorder",
   "fetch",
-  "IS_REACT_ACT_ENVIRONMENT",
 ];
 
 function installIndexedDb() {
@@ -116,42 +110,24 @@ function installIndexedDb() {
     configurable: true,
     value: { open } as unknown as IDBFactory,
   });
+  return {
+    parts: records.parts,
+    sessions: records.sessions,
+  };
 }
 
 function installBrowserGlobals() {
-  const dom = new JSDOM("<!doctype html><html><body></body></html>", {
-    url: "http://localhost",
-  });
   for (const property of globalProperties) {
     originalDescriptors.set(
       property,
       Object.getOwnPropertyDescriptor(globalThis, property)
     );
   }
-  for (const [property, value] of Object.entries({
-    document: dom.window.document,
-    Event: dom.window.Event,
-    HTMLElement: dom.window.HTMLElement,
-    navigator: dom.window.navigator,
-    window: dom.window,
-  })) {
-    Object.defineProperty(globalThis, property, {
-      configurable: true,
-      value,
-      writable: true,
-    });
-  }
-  Object.defineProperty(dom.window.navigator, "onLine", {
+  Object.defineProperty(globalThis.navigator, "onLine", {
     configurable: true,
     value: true,
   });
-  Object.defineProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT", {
-    configurable: true,
-    value: true,
-    writable: true,
-  });
-  installIndexedDb();
-  return dom;
+  return installIndexedDb();
 }
 
 const events: string[] = [];
@@ -160,6 +136,8 @@ const tracks = [
   { kind: "video", stop: () => events.push("video-track-stopped") },
 ] as unknown as MediaStreamTrack[];
 const stream = { getTracks: () => tracks } as unknown as MediaStream;
+let uploadStatus = 201;
+let uploadCalls = 0;
 
 class FakeMediaRecorder extends EventTarget {
   static isTypeSupported() {
@@ -172,8 +150,11 @@ class FakeMediaRecorder extends EventTarget {
   onstop: ((event: Event) => void) | null = null;
   state: RecordingState = "inactive";
 
+  static last: FakeMediaRecorder | null = null;
+
   constructor(_stream: MediaStream, _options?: MediaRecorderOptions) {
     super();
+    FakeMediaRecorder.last = this;
   }
 
   start() {
@@ -182,27 +163,50 @@ class FakeMediaRecorder extends EventTarget {
 
   stop() {
     this.state = "inactive";
-    this.ondataavailable?.({
-      data: new Blob(["captured"], { type: this.mimeType }),
-    } as BlobEvent);
+    this.emitData("captured");
     events.push("capture-ended");
     const stopEvent = new NodeEvent("stop");
     this.dispatchEvent(stopEvent);
     this.onstop?.(stopEvent);
   }
+
+  emitError() {
+    this.state = "inactive";
+    const errorEvent = new NodeEvent("error");
+    this.onerror?.(errorEvent);
+    this.onerror?.(errorEvent);
+    this.emitData("terminal");
+    const stopEvent = new NodeEvent("stop");
+    this.dispatchEvent(stopEvent);
+    this.onstop?.(stopEvent);
+  }
+
+  emitData(value: string) {
+    this.ondataavailable?.({
+      data: new Blob([value], { type: this.mimeType }),
+    } as BlobEvent);
+  }
 }
 
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
+let resolveFinalization: (() => void) | null = null;
+let manifestLookup: (() => Promise<RecordingManifestLookup>) | undefined;
 
 function RecordingHost() {
   latest = useLiveRecording({
     appendSegment: () => Promise.resolve(),
     createSession: () => Promise.resolve(),
-    finalizeSession: () => {
+    finalizeSession: async () => {
       finalizeCalls += 1;
-      return Promise.resolve({ status: "ready" });
+      await new Promise<void>((resolve) => {
+        resolveFinalization = resolve;
+      });
+      return { status: "ready" };
     },
+    getManifest: manifestLookup
+      ? async () => manifestLookup?.() ?? { kind: "missing" }
+      : undefined,
   });
   return null;
 }
@@ -221,9 +225,122 @@ afterEach(() => {
   events.length = 0;
   latest = null;
   finalizeCalls = 0;
+  resolveFinalization = null;
+  manifestLookup = undefined;
+  uploadStatus = 201;
+  uploadCalls = 0;
+  FakeMediaRecorder.last = null;
 });
 
-test("normal stop releases tracks after capture and retains submission", async () => {
+it("normal stop releases tracks after capture and retains submission", async () => {
+  installBrowserGlobals();
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: FakeMediaRecorder,
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: () => Promise.resolve(new Response(null, { status: uploadStatus })),
+  });
+
+  render(React.createElement(RecordingHost));
+  await waitFor(() => expect(latest).not.toBe(null));
+  await expect(latest?.resetRecoveredRecording()).rejects.toThrow(
+    "cannot be reset"
+  );
+
+  await act(async () => {
+    await latest?.initialize();
+  });
+  await waitFor(() => expect(latest?.isReady).toBe(true));
+
+  await act(async () => {
+    await latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+
+  let stopPromise: Promise<void> | undefined;
+  await act(async () => {
+    stopPromise = latest?.stop();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.stream).toBe(null);
+  expect(latest?.isReady).toBe(false);
+  expect(events).toEqual([
+    "audio-track-stopped",
+    "video-track-stopped",
+    "capture-ended",
+  ]);
+  expect(latest?.stream).toBe(null);
+  expect(latest?.isReady).toBe(false);
+  await act(async () => {
+    resolveFinalization?.();
+    await stopPromise;
+  });
+});
+
+it("releases media and stays terminal after a fatal upload", async () => {
+  installBrowserGlobals();
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: FakeMediaRecorder,
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+  uploadStatus = 400;
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value: () => {
+      uploadCalls += 1;
+      return Promise.resolve(new Response(null, { status: uploadStatus }));
+    },
+  });
+
+  render(React.createElement(RecordingHost));
+  await act(async () => {
+    await latest?.initialize();
+  });
+  await waitFor(() => expect(latest?.isReady).toBe(true));
+  await act(async () => {
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("captured");
+  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
+  await waitFor(() => expect(latest?.saveState).toBe("error"));
+  let stopPromise: Promise<void> | undefined;
+  await act(async () => {
+    stopPromise = latest?.stop();
+    await Promise.resolve();
+  });
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.isReady).toBe(false);
+  expect(latest?.stream).toBe(null);
+  expect(
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
+  await stopPromise;
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.journeyOutcome).toBe("terminal-restart");
+  expect(
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
+});
+
+it("handles duplicate recorder errors with one physical cleanup", async () => {
   installBrowserGlobals();
   Object.defineProperty(globalThis, "MediaRecorder", {
     configurable: true,
@@ -239,28 +356,198 @@ test("normal stop releases tracks after capture and retains submission", async (
   });
 
   render(React.createElement(RecordingHost));
-  await waitFor(() => assert.notEqual(latest, null));
-
   await act(async () => {
     await latest?.initialize();
   });
-  await waitFor(() => assert.equal(latest?.isReady, true));
-
+  await waitFor(() => expect(latest?.isReady).toBe(true));
+  let stopPromise: Promise<void> | undefined;
   await act(async () => {
     await latest?.start();
+    FakeMediaRecorder.last?.emitError();
+    stopPromise = latest?.stop();
+    await Promise.resolve();
   });
-  await waitFor(() => assert.equal(latest?.isRecording, true));
-
+  expect(latest?.captureEnded).toBe(true);
+  expect(latest?.isReady).toBe(false);
+  expect(latest?.stream).toBe(null);
+  expect(
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
+  expect(events.filter((event) => event === "capture-ended")).toHaveLength(0);
+  await waitFor(() => expect(finalizeCalls).toBe(1));
   await act(async () => {
-    await latest?.stop();
+    resolveFinalization?.();
+    await stopPromise;
   });
+  expect(latest?.captureEnded).toBe(true);
+  expect(
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
+});
 
-  await waitFor(() => assert.equal(finalizeCalls, 1));
-  assert.deepEqual(events, [
-    "capture-ended",
-    "audio-track-stopped",
-    "video-track-stopped",
-  ]);
-  assert.equal(latest?.stream, null);
-  assert.equal(latest?.isReady, false);
+it("durably resets a typed missing recovered recording", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  storage.parts.set("session-1:segment:0", {
+    blob: new Blob(["captured"], { type: "video/webm" }),
+    id: "session-1:segment:0",
+    mediaType: "video/webm",
+    segmentId: "segment",
+    sequence: 0,
+    sessionId: "session-1",
+  });
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
+  await act(async () => {
+    await latest?.resetRecoveredRecording();
+  });
+  expect(storage.sessions.size).toBe(0);
+  expect(storage.parts.size).toBe(0);
+  expect(latest?.journeyOutcome).toBe("none");
+  expect(latest?.recovered).toBe(false);
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+});
+
+it("revokes reset after a successful lookup and preserves it after transport failure", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: {
+        segments: [
+          {
+            id: "segment",
+            parts: [{ checksum: "checksum", sequence: 0 }],
+          },
+        ],
+        sessionId: "session-1",
+      },
+    });
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("none");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  manifestLookup = () => {
+    throw new Error("deployment unavailable");
+  };
+  await act(async () => {
+    window.dispatchEvent(new Event("online"));
+    await Promise.resolve();
+  });
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
+});
+
+it("allows reset for terminal recovery with a retained session", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: { segments: [], sessionId: "session-1" },
+    });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("terminal-restart");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
+  await act(async () => {
+    await latest?.resetRecoveredRecording();
+  });
+  expect(storage.sessions.size).toBe(0);
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+});
+
+it("does not offer reset for terminal recovery without a complete session", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  storage.parts.set("session-1:segment:0", {
+    blob: new Blob(["captured"], { type: "video/webm" }),
+    id: "session-1:segment:0",
+    mediaType: "video/webm",
+    segmentId: "segment",
+    sequence: 0,
+    sessionId: "session-1",
+  });
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: {
+        segments: [
+          {
+            id: "segment",
+            parts: [{ checksum: "conflicting", sequence: 0 }],
+          },
+        ],
+        sessionId: "session-1",
+      },
+    });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("terminal-restart");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+  await expect(latest?.resetRecoveredRecording()).rejects.toThrow(
+    "cannot be reset"
+  );
+  expect(storage.sessions.size).toBe(1);
+  expect(storage.parts.size).toBe(1);
 });

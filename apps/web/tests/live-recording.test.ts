@@ -1,5 +1,4 @@
-import assert from "node:assert/strict";
-import test from "node:test";
+import { expect, it } from "vitest";
 import {
   createLiveRecordingOutbox,
   integrityMessage,
@@ -56,7 +55,7 @@ function manifestParts(
 function recoveryHarness(
   parts: RecordingPart[],
   session = recordingSession,
-  storeOptions?: { deleteError?: Error }
+  storeOptions?: { deleteError?: Error; discardError?: Error }
 ) {
   const stored = [...parts];
   const sessions = [session];
@@ -76,6 +75,23 @@ function recoveryHarness(
       );
       if (index >= 0) {
         stored.splice(index, 1);
+      }
+      return Promise.resolve();
+    },
+    discardSession: (sessionId: string) => {
+      if (storeOptions?.discardError) {
+        return Promise.reject(storeOptions.discardError);
+      }
+      for (let index = stored.length - 1; index >= 0; index -= 1) {
+        if (stored[index]?.sessionId === sessionId) {
+          stored.splice(index, 1);
+        }
+      }
+      const sessionIndex = sessions.findIndex(
+        (item) => item.sessionId === sessionId
+      );
+      if (sessionIndex >= 0) {
+        sessions.splice(sessionIndex, 1);
       }
       return Promise.resolve();
     },
@@ -99,11 +115,15 @@ function recoveryHarness(
       return Promise.resolve();
     },
   };
-  const request = (input: RequestInfo | URL, init?: RequestInit) => {
+  const request = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestInit =
+      init?.body instanceof Blob
+        ? { ...init, body: await init.body.arrayBuffer() }
+        : init;
     calls.push(
-      new Request(new URL(input.toString(), "http://localhost"), init)
+      new Request(new URL(input.toString(), "http://localhost"), requestInit)
     );
-    return Promise.resolve(new Response(null, { status: 201 }));
+    return new Response(null, { status: 201 });
   };
   return {
     box: createLiveRecordingOutbox(store, request),
@@ -127,6 +147,7 @@ function harness(
       deleted.push(value);
       return Promise.resolve();
     },
+    discardSession: () => Promise.resolve(),
     put: (value: RecordingPart) => {
       events.push("persist");
       stored.push(value);
@@ -134,9 +155,13 @@ function harness(
     },
   };
   const request = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestInit =
+      init?.body instanceof Blob
+        ? { ...init, body: await init.body.arrayBuffer() }
+        : init;
     events.push("request");
     calls.push(
-      new Request(new URL(input.toString(), "http://localhost"), init)
+      new Request(new URL(input.toString(), "http://localhost"), requestInit)
     );
     return await response;
   };
@@ -149,68 +174,70 @@ function harness(
   };
 }
 
-test("persists before PUT and deletes only after a 2xx response", async () => {
+it("persists before PUT and deletes only after a 2xx response", async () => {
   const harnessed = harness();
   await harnessed.box.add(part);
-  assert.equal(harnessed.stored.length, 1);
-  assert.equal(harnessed.deleted.length, 1);
-  assert.deepEqual(harnessed.events, ["persist", "request", "delete"]);
-  assert.equal(harnessed.box.saveState, "healthy");
-  assert.equal(
-    harnessed.calls[0]?.url,
+  expect(harnessed.stored.length).toBe(1);
+  expect(harnessed.deleted.length).toBe(1);
+  expect(harnessed.events).toEqual(["persist", "request", "delete"]);
+  expect(harnessed.box.saveState).toBe("healthy");
+  expect(harnessed.calls[0]?.url).toBe(
     "http://localhost/api/recordings/session/segments/segment/parts/3"
   );
 });
 
-test("retryable 503 retains the local part and reports retrying", async () => {
+it("retryable 503 retains the local part and reports retrying", async () => {
   const harnessed = harness(new Response("no", { status: 503 }));
   await harnessed.box.add(part);
-  assert.equal(harnessed.stored.length, 1);
-  assert.equal(harnessed.deleted.length, 0);
-  assert.equal(harnessed.box.saveState, "retrying");
+  expect(harnessed.stored.length).toBe(1);
+  expect(harnessed.deleted.length).toBe(0);
+  expect(harnessed.box.saveState).toBe("retrying");
   harnessed.box.dispose();
 });
 
-test("network failures are classified retryable and report retrying", async () => {
+it("network failures are classified retryable and report retrying", async () => {
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     () => {
       throw new Error("network unavailable");
     },
     (error) => errors.push(error)
   );
   await box.add(part);
-  assert.equal(isRetryableRecordingFailure(errors[0]), true);
-  assert.equal(box.saveState, "retrying");
+  expect(isRetryableRecordingFailure(errors[0])).toBe(true);
+  expect(box.saveState).toBe("retrying");
   box.dispose();
 });
 
-test("uses exact blob checksum and upload headers", async () => {
+it("uses exact blob checksum and upload headers", async () => {
   const harnessed = harness();
   await harnessed.box.add(part);
   const [request] = harnessed.calls;
-  assert.ok(request);
-  assert.equal(request.method, "PUT");
-  assert.equal(request.headers.get("Content-Type"), "video/webm");
-  assert.equal(
-    request.headers.get("X-Content-SHA256"),
+  expect(request).toBeTruthy();
+  expect(request.method).toBe("PUT");
+  expect(request.headers.get("Content-Type")).toBe("video/webm");
+  expect(request.headers.get("X-Content-SHA256")).toBe(
     "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
   );
-  assert.equal(await request.text(), "hello");
+  expect(await request.text()).toBe("hello");
 });
 
-test("several parts can be persisted and uploaded while active", async () => {
+it("several parts can be persisted and uploaded while active", async () => {
   const harnessed = harness();
   await Promise.all(
     [1, 2, 3].map((sequence) => harnessed.box.add({ ...part, sequence }))
   );
-  assert.equal(harnessed.stored.length, 3);
-  assert.equal(harnessed.deleted.length, 3);
-  assert.equal(harnessed.calls.length, 3);
+  expect(harnessed.stored.length).toBe(3);
+  expect(harnessed.deleted.length).toBe(3);
+  expect(harnessed.calls.length).toBe(3);
 });
 
-test("a successful part does not clear retrying for another failed part", async () => {
+it("a successful part does not clear retrying for another failed part", async () => {
   const requests: Request[] = [];
   const deleted: RecordingPart[] = [];
   const stored: RecordingPart[] = [];
@@ -220,15 +247,20 @@ test("a successful part does not clear retrying for another failed part", async 
         deleted.push(value);
         return Promise.resolve();
       },
+      discardSession: () => Promise.resolve(),
       put: (value) => {
         stored.push(value);
         return Promise.resolve();
       },
     },
     async (input, init) => {
+      const requestInit =
+        init?.body instanceof Blob
+          ? { ...init, body: await init.body.arrayBuffer() }
+          : init;
       const request = new Request(
         new URL(input.toString(), "http://localhost"),
-        init
+        requestInit
       );
       requests.push(request);
       await Promise.resolve();
@@ -241,14 +273,14 @@ test("a successful part does not clear retrying for another failed part", async 
   await box.add({ ...part, sequence: 1 });
   await box.add({ ...part, sequence: 2 });
   await box.setOnline(true);
-  assert.equal(requests.length, 2);
-  assert.equal(stored.length, 2);
-  assert.equal(deleted.length, 1);
-  assert.equal(box.saveState, "retrying");
+  expect(requests.length).toBe(2);
+  expect(stored.length).toBe(2);
+  expect(deleted.length).toBe(1);
+  expect(box.saveState).toBe("retrying");
   box.dispose();
 });
 
-test("dispose prevents retry after an in-flight retryable failure", async () => {
+it("dispose prevents retry after an in-flight retryable failure", async () => {
   let rejectRequest!: (error: Error) => void;
   let resolveStarted!: () => void;
   let requests = 0;
@@ -257,6 +289,7 @@ test("dispose prevents retry after an in-flight retryable failure", async () => 
   });
   const store = {
     delete: () => Promise.resolve(),
+    discardSession: () => Promise.resolve(),
     put: () => Promise.resolve(),
   };
   const box = createLiveRecordingOutbox(store, () => {
@@ -275,15 +308,16 @@ test("dispose prevents retry after an in-flight retryable failure", async () => 
   await flushing;
   await Promise.resolve();
   await Promise.resolve();
-  assert.equal(requests, 1);
-  assert.equal(box.pendingCount, 1);
+  expect(requests).toBe(1);
+  expect(box.pendingCount).toBe(1);
 });
 
-test("persistence failures reject and never request", async () => {
+it("persistence failures reject and never request", async () => {
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       put: () => {
         throw new Error("storage unavailable");
       },
@@ -291,17 +325,21 @@ test("persistence failures reject and never request", async () => {
     fetch,
     (error) => errors.push(error)
   );
-  await assert.rejects(box.add(part), STORAGE_ERROR);
-  assert.equal((errors[0] as Error).message, "storage unavailable");
-  assert.equal(isRetryableRecordingFailure(errors[0]), false);
-  assert.equal(box.saveState, "error");
+  await expect(box.add(part)).rejects.toThrow(STORAGE_ERROR);
+  expect((errors[0] as Error).message).toBe("storage unavailable");
+  expect(isRetryableRecordingFailure(errors[0])).toBe(false);
+  expect(box.saveState).toBe("error");
 });
 
-test("terminal upload failure is retained and does not retry when online", async () => {
+it("terminal upload failure is retained and does not retry when online", async () => {
   let requests = 0;
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     async () => {
       requests += 1;
       await Promise.resolve();
@@ -312,34 +350,38 @@ test("terminal upload failure is retained and does not retry when online", async
   await box.add(part);
   await box.setOnline(false);
   await box.setOnline(true);
-  assert.equal(requests, 1);
-  assert.equal(box.pendingCount, 1);
-  assert.equal(box.saveState, "error");
-  assert.equal(errors.length, 1);
+  expect(requests).toBe(1);
+  expect(box.pendingCount).toBe(1);
+  expect(box.saveState).toBe("error");
+  expect(errors.length).toBe(1);
   box.dispose();
 });
 
-test("drain does not resolve while offline work is pending", async () => {
+it("drain does not resolve while offline work is pending", async () => {
   const h = harness();
   await h.box.setOnline(false);
   await h.box.add(part);
-  await assert.rejects(h.box.drain(), PENDING_ERROR);
+  await expect(h.box.drain()).rejects.toThrow(PENDING_ERROR);
   await h.box.setOnline(true);
   await h.box.drain();
-  assert.equal(h.box.pendingCount, 0);
+  expect(h.box.pendingCount).toBe(0);
 });
 
-test("drain rejects terminal failures", async () => {
+it("drain rejects terminal failures", async () => {
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     async () => new Response(null, { status: 409 })
   );
   await box.add(part);
-  await assert.rejects(box.drain(), UPLOAD_ERROR);
+  await expect(box.drain()).rejects.toThrow(UPLOAD_ERROR);
   box.dispose();
 });
 
-test("reuses zero-tail intent metadata for remote retry", () => {
+it("reuses zero-tail intent metadata for remote retry", () => {
   const session: RecordingSession = {
     recorderMimeType: "video/webm;codecs=vp8,opus",
     requestedMimeType: "video/webm",
@@ -347,19 +389,18 @@ test("reuses zero-tail intent metadata for remote retry", () => {
     sessionId: "session",
     status: "recording",
   };
-  assert.deepEqual(
+  expect(
     recordingIntentMetadata(session, {
       recorderMimeType: "video/mp4",
       requestedMimeType: "video/mp4",
-    }),
-    {
-      recorderMimeType: session.recorderMimeType,
-      requestedMimeType: session.requestedMimeType,
-    }
-  );
+    })
+  ).toEqual({
+    recorderMimeType: session.recorderMimeType,
+    requestedMimeType: session.requestedMimeType,
+  });
 });
 
-test("selects create for an initial tail and append for later tails", () => {
+it("selects create for an initial tail and append for later tails", () => {
   const initial: RecordingSession = {
     recorderMimeType: null,
     requestedMimeType: null,
@@ -371,13 +412,13 @@ test("selects create for an initial tail and append for later tails", () => {
     ...initial,
     segments: [...initial.segments, { partCount: 0, segmentId: "later" }],
   };
-  assert.equal(recordingRemoteAction(initial, true), "create");
-  assert.equal(recordingRemoteAction(later, true), "append");
-  assert.equal(recordingRemoteAction(undefined, false), "create");
-  assert.equal(recordingRemoteAction(later, false), "append");
+  expect(recordingRemoteAction(initial, true)).toBe("create");
+  expect(recordingRemoteAction(later, true)).toBe("append");
+  expect(recordingRemoteAction(undefined, false)).toBe("create");
+  expect(recordingRemoteAction(later, false)).toBe("append");
 });
 
-test("allows retrying an empty fifth tail but not adding a sixth", () => {
+it("allows retrying an empty fifth tail but not adding a sixth", () => {
   const fifth: RecordingSession = {
     recorderMimeType: null,
     requestedMimeType: null,
@@ -388,12 +429,12 @@ test("allows retrying an empty fifth tail but not adding a sixth", () => {
     sessionId: "session",
     status: "recording",
   };
-  assert.equal(fifth.segments.at(-1)?.partCount, 0);
-  assert.equal(recordingRemoteAction(fifth, true), "append");
-  assert.equal(fifth.segments.length, 5);
+  expect(fifth.segments.at(-1)?.partCount).toBe(0);
+  expect(recordingRemoteAction(fifth, true)).toBe("append");
+  expect(fifth.segments.length).toBe(5);
 });
 
-test("keeps orphan parts without fabricating session metadata", async () => {
+it("keeps orphan parts without fabricating session metadata", async () => {
   const sessions: RecordingSession[] = [];
   const parts = [
     { ...part, segmentId: "a1", sequence: 0, sessionId: "a" },
@@ -403,6 +444,7 @@ test("keeps orphan parts without fabricating session metadata", async () => {
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       listParts: () => Promise.resolve(parts),
       listSessions: () => Promise.resolve(sessions),
       put: () => Promise.resolve(),
@@ -414,37 +456,37 @@ test("keeps orphan parts without fabricating session metadata", async () => {
     async () => new Response(null, { status: 503 })
   );
   await box.hydrate();
-  assert.deepEqual(sessions, []);
-  assert.equal(box.pendingCount, 3);
+  expect(sessions).toEqual([]);
+  expect(box.pendingCount).toBe(3);
   box.dispose();
 });
 
-test("savePartAndSession reports durable persistence failure", async () => {
+it("savePartAndSession reports durable persistence failure", async () => {
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       put: () => Promise.resolve(),
       putPartAndSession: () => Promise.reject(new Error("storage unavailable")),
     },
     fetch,
     (error) => errors.push(error)
   );
-  await assert.rejects(
+  await expect(
     box.savePartAndSession(part, {
       recorderMimeType: "video/webm",
       requestedMimeType: "video/webm",
       segments: [{ partCount: 4, segmentId: part.segmentId }],
       sessionId: part.sessionId,
       status: "recording",
-    }),
-    STORAGE_ERROR
-  );
-  assert.equal(box.saveState, "error");
-  assert.equal(errors.length, 1);
+    })
+  ).rejects.toThrow(STORAGE_ERROR);
+  expect(box.saveState).toBe("error");
+  expect(errors.length).toBe(1);
 });
 
-test("reconcile drops matching acknowledgements and keeps missing parts", async () => {
+it("reconcile drops matching acknowledgements and keeps missing parts", async () => {
   const acked = { ...part, sequence: 1 };
   const missing = { ...part, sequence: 3 };
   const result = await reconcileRecordingParts({
@@ -456,143 +498,194 @@ test("reconcile drops matching acknowledgements and keeps missing parts", async 
       { sequence: 2 },
     ]),
   });
-  assert.deepEqual(
-    result.drop.map((item) => item.sequence),
-    [1]
-  );
-  assert.deepEqual(
-    result.keep.map((item) => item.sequence),
-    [3]
-  );
-  assert.equal(result.integrity, "ok");
-  assert.equal(result.session?.segments[0]?.partCount, 4);
+  expect(result.drop.map((item) => item.sequence)).toEqual([1]);
+  expect(result.keep.map((item) => item.sequence)).toEqual([3]);
+  expect(result.integrity).toBe("ok");
+  expect(result.session?.segments[0]?.partCount).toBe(4);
 });
 
-test("reload recovers acknowledged parts without duplicating uploads", async () => {
+it("reload recovers acknowledged parts without duplicating uploads", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
-    )
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+      ]),
+    })
   );
-  assert.equal(recovery.recovered, true);
-  assert.equal(recovery.integrity, "ok");
-  assert.equal(harnessed.calls.length, 1);
-  assert.equal(harnessed.calls[0]?.url.endsWith("/parts/3"), true);
-  assert.equal(harnessed.deleted.length, 1);
-  assert.equal(harnessed.box.pendingCount, 0);
+  expect(recovery.recovered).toBe(true);
+  expect(recovery.integrity).toBe("ok");
+  expect(harnessed.calls.length).toBe(1);
+  expect(harnessed.calls[0]?.url.endsWith("/parts/3")).toBe(true);
+  expect(harnessed.deleted.length).toBe(1);
+  expect(harnessed.box.pendingCount).toBe(0);
   harnessed.box.dispose();
 });
 
-test("lost acknowledgement drops a matching local copy without discarding bytes", async () => {
+it("retains local recovery when manifest lookup fails", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.hydrate();
+  await expect(
+    harnessed.box.recover(() => {
+      throw new Error("deployment unavailable");
+    })
+  ).rejects.toThrow("deployment unavailable");
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  harnessed.box.dispose();
+});
+
+it("marks a typed missing recording without deleting it", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(async () => ({
+    kind: "missing",
+  }));
+  expect(recovery.missing).toBe(true);
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  harnessed.box.dispose();
+});
+
+it("preserves durable and in-memory state when discard fails", async () => {
+  const harnessed = recoveryHarness(
+    [{ ...part, sequence: 3 }],
+    recordingSession,
+    {
+      discardError: new Error("storage unavailable"),
+    }
+  );
+  await harnessed.box.hydrate();
+  await expect(harnessed.box.discardSession("session")).rejects.toThrow(
+    "storage unavailable"
+  );
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  expect(harnessed.box.pendingCount).toBe(1);
+});
+
+it("lost acknowledgement drops a matching local copy without discarding bytes", async () => {
   const local = { ...part, sequence: 3 };
   const harnessed = recoveryHarness([local]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { sequence: 2 },
         { sequence: 3 },
-      ])
-    )
+      ]),
+    })
   );
-  assert.equal(recovery.integrity, "ok");
-  assert.equal(harnessed.calls.length, 0);
-  assert.equal(harnessed.deleted.length, 1);
-  assert.equal(harnessed.stored.length, 0);
+  expect(recovery.integrity).toBe("ok");
+  expect(harnessed.calls.length).toBe(0);
+  expect(harnessed.deleted.length).toBe(1);
+  expect(harnessed.stored.length).toBe(0);
   harnessed.box.dispose();
 });
 
-test("reconcile continues when dropping an acknowledged part fails in storage", async () => {
+it("reconcile continues when dropping an acknowledged part fails in storage", async () => {
   const local = { ...part, sequence: 3 };
   const harnessed = recoveryHarness([local], recordingSession, {
     deleteError: new Error("IndexedDB delete failed"),
   });
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { sequence: 2 },
         { sequence: 3 },
-      ])
-    )
+      ]),
+    })
   );
-  assert.equal(recovery.recovered, true);
-  assert.equal(recovery.integrity, "ok");
-  assert.equal(harnessed.box.pendingCount, 0);
-  assert.equal(harnessed.stored.length, 1);
+  expect(recovery.recovered).toBe(true);
+  expect(recovery.integrity).toBe("ok");
+  expect(harnessed.box.pendingCount).toBe(0);
+  expect(harnessed.stored.length).toBe(1);
   harnessed.box.dispose();
 });
 
-test("offline hydrate retains parts and reconciles after reconnect", async () => {
+it("offline hydrate retains parts and reconciles after reconnect", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.setOnline(false);
   await harnessed.box.hydrate();
   const offline = await harnessed.box.recover(() => {
     throw new Error("manifest should not be fetched offline");
   });
-  assert.equal(offline.recovered, true);
-  assert.equal(harnessed.calls.length, 0);
-  assert.equal(harnessed.box.pendingCount, 1);
+  expect(offline.recovered).toBe(true);
+  expect(harnessed.calls.length).toBe(0);
+  expect(harnessed.box.pendingCount).toBe(1);
   await harnessed.box.setOnline(true, { flush: false });
   await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
-    )
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+      ]),
+    })
   );
-  assert.equal(harnessed.calls.length, 1);
-  assert.equal(harnessed.box.pendingCount, 0);
+  expect(harnessed.calls.length).toBe(1);
+  expect(harnessed.box.pendingCount).toBe(0);
   harnessed.box.dispose();
 });
 
-test("conflicting checksums retain local media and refuse finalization", async () => {
+it("conflicting checksums retain local media and refuse finalization", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 2 }]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { checksum: OTHER_CHECKSUM, sequence: 2 },
-      ])
-    )
+      ]),
+    })
   );
-  assert.equal(recovery.integrity, "conflict");
-  assert.equal(harnessed.deleted.length, 0);
-  assert.equal(harnessed.stored.length, 1);
-  assert.equal(harnessed.box.pendingCount, 1);
-  assert.equal(harnessed.box.saveState, "error");
-  assert.equal(integrityMessage("conflict")?.includes("conflicting"), true);
-  await assert.rejects(harnessed.box.drain(), PENDING_ERROR);
-  assert.throws(
-    () => harnessed.box.assertCanFinalize(),
+  expect(recovery.integrity).toBe("conflict");
+  expect(harnessed.deleted.length).toBe(0);
+  expect(harnessed.stored.length).toBe(1);
+  expect(harnessed.box.pendingCount).toBe(1);
+  expect(harnessed.box.saveState).toBe("error");
+  expect(integrityMessage("conflict")?.includes("conflicting")).toBe(true);
+  await expect(harnessed.box.drain()).rejects.toThrow(PENDING_ERROR);
+  expect(() => harnessed.box.assertCanFinalize()).toThrow(
     CONFLICT_FINALIZE_ERROR
   );
   harnessed.box.dispose();
 });
 
-test("missing ordered parts refuse misleading finalization", async () => {
+it("missing ordered parts refuse misleading finalization", async () => {
   const harnessed = recoveryHarness([], {
     ...recordingSession,
     segments: [{ partCount: 3, segmentId: "segment" }],
   });
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(manifestParts([{ sequence: 0 }, { sequence: 1 }]))
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([{ sequence: 0 }, { sequence: 1 }]),
+    })
   );
-  assert.equal(recovery.integrity, "gap");
-  assert.equal(harnessed.calls.length, 0);
+  expect(recovery.integrity).toBe("gap");
+  expect(harnessed.calls.length).toBe(0);
   await harnessed.box.drain();
-  assert.throws(() => harnessed.box.assertCanFinalize(), GAP_FINALIZE_ERROR);
+  expect(() => harnessed.box.assertCanFinalize()).toThrow(GAP_FINALIZE_ERROR);
   harnessed.box.dispose();
 });
 
-test("selects append after recovering a non-empty tail", () => {
+it("selects append after recovering a non-empty tail", () => {
   const recovered: RecordingSession = {
     recorderMimeType: "video/webm",
     requestedMimeType: "video/webm",
@@ -601,6 +694,6 @@ test("selects append after recovering a non-empty tail", () => {
     status: "recording",
   };
   const resumeTail = recovered.segments.at(-1)?.partCount === 0;
-  assert.equal(resumeTail, false);
-  assert.equal(recordingRemoteAction(recovered, resumeTail), "append");
+  expect(resumeTail).toBe(false);
+  expect(recordingRemoteAction(recovered, resumeTail)).toBe("append");
 });

@@ -1,15 +1,21 @@
-import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import { afterEach, expect, it } from "vitest";
 import { createFinalizerServer } from "./server.js";
 
 const sha = (body) => crypto.createHash("sha256").update(body).digest("hex");
 const FILE_PREFIX = /^file '/;
 const FILE_SUFFIX = /'$/;
+const harnesses = [];
+
+afterEach(async () => {
+  await Promise.all(
+    harnesses.splice(0).map((serverHarness) => serverHarness.close())
+  );
+});
 async function harness(
   run = async () => ({
     code: 0,
@@ -61,33 +67,30 @@ function upload(h, segment, part, text, headers = {}) {
   });
 }
 
-test("parts accept checksummed content and exact repeats are idempotent", async (t) => {
+it("parts accept checksummed content and exact repeats are idempotent", async () => {
   const h = await harness();
-  t.after(() => h.close());
+  harnesses.push(h);
   const body = Buffer.from("part");
   const headers = {
     "content-length": body.length,
     "x-content-sha256": sha(body),
   };
-  assert.equal(
-    (await h.request("PUT", "/jobs/job/parts/0/0", body, headers)).status,
-    201
-  );
-  assert.equal(
-    (await h.request("PUT", "/jobs/job/parts/0/0", body, headers)).status,
-    200
-  );
-  assert.equal(
+  expect(
+    (await h.request("PUT", "/jobs/job/parts/0/0", body, headers)).status
+  ).toEqual(201);
+  expect(
+    (await h.request("PUT", "/jobs/job/parts/0/0", body, headers)).status
+  ).toEqual(200);
+  expect(
     (
       await h.request("PUT", "/jobs/job/parts/0/0", Buffer.from("other"), {
         "x-content-sha256": sha("other"),
       })
-    ).status,
-    409
-  );
+    ).status
+  ).toEqual(409);
 });
 
-test("finalize rejects missing parts and normalizes each segment before final concat", async (t) => {
+it("finalize rejects missing parts and normalizes each segment before final concat", async () => {
   const calls = [];
   const h = await harness(async (program, args, options) => {
     calls.push([program, args]);
@@ -99,7 +102,7 @@ test("finalize rejects missing parts and normalizes each segment before final co
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
+  harnesses.push(h);
   const missing = await h.request(
     "POST",
     "/jobs/job/finalize",
@@ -109,7 +112,7 @@ test("finalize rejects missing parts and normalizes each segment before final co
     }),
     { "content-type": "application/json" }
   );
-  assert.equal(missing.status, 409);
+  expect(missing.status).toEqual(409);
   for (const [partNumber, body] of [0, 1].map((value) => [
     value,
     Buffer.from(`p${value}`),
@@ -123,7 +126,7 @@ test("finalize rejects missing parts and normalizes each segment before final co
         "x-content-sha256": sha(body),
       }
     );
-    assert.equal(response.status, 201);
+    expect(response.status).toEqual(201);
   }
   const done = await h.request(
     "POST",
@@ -137,12 +140,12 @@ test("finalize rejects missing parts and normalizes each segment before final co
     }),
     { "content-type": "application/json" }
   );
-  assert.equal(done.status, 200);
-  assert.equal(calls.filter(([p]) => p === "ffmpeg").length, 3);
-  assert.equal((await h.request("GET", "/jobs/job/output")).status, 200);
+  expect(done.status).toEqual(200);
+  expect(calls.filter(([p]) => p === "ffmpeg").length).toEqual(3);
+  expect((await h.request("GET", "/jobs/job/output")).status).toEqual(200);
 });
 
-test("reconstructs parts within segments but keeps segments separate", async (t) => {
+it("reconstructs parts within segments but keeps segments separate", async () => {
   const inputs = [];
   const h = await harness(async (program, args, options) => {
     if (program === "ffmpeg") {
@@ -159,11 +162,11 @@ test("reconstructs parts within segments but keeps segments separate", async (t)
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
-  assert.equal((await upload(h, 0, 0, "a")).status, 201);
-  assert.equal((await upload(h, 0, 1, "b")).status, 201);
-  assert.equal((await upload(h, 1, 0, "c")).status, 201);
-  assert.equal(
+  harnesses.push(h);
+  expect((await upload(h, 0, 0, "a")).status).toEqual(201);
+  expect((await upload(h, 0, 1, "b")).status).toEqual(201);
+  expect((await upload(h, 1, 0, "c")).status).toEqual(201);
+  expect(
     (
       await h.request(
         "POST",
@@ -174,38 +177,36 @@ test("reconstructs parts within segments but keeps segments separate", async (t)
         ]),
         { "content-type": "application/json" }
       )
-    ).status,
-    200
-  );
+    ).status
+  ).toEqual(200);
   const segmentLists = inputs.slice(0, 2).map(({ list }) =>
     list
       .trim()
       .split("\n")
       .map((line) => line.replace(FILE_PREFIX, "").replace(FILE_SUFFIX, ""))
   );
-  assert.deepEqual(
+  expect(
     await Promise.all(
       segmentLists.map((list) =>
         Promise.all(
           list.map((name) => fs.readFile(path.join(h.root, "job", name)))
         )
       )
-    ),
-    [[Buffer.from("a"), Buffer.from("b")], [Buffer.from("c")]]
-  );
-  assert.ok(
+    )
+  ).toEqual([[Buffer.from("a"), Buffer.from("b")], [Buffer.from("c")]]);
+  expect(
     inputs.every(({ args }) => args[args.indexOf("-f") + 1] === "concat")
-  );
-  assert.ok(inputs.every(({ input }) => input.endsWith(".txt")));
-  assert.notEqual(inputs[0].input, inputs[1].input);
+  ).toBe(true);
+  expect(inputs.every(({ input }) => input.endsWith(".txt"))).toBe(true);
+  expect(inputs[0].input).not.toBe(inputs[1].input);
 });
 
-test("failed ffmpeg never exposes output", async (t) => {
+it("failed ffmpeg never exposes output", async () => {
   const h = await harness(async (program) => ({
     code: program === "ffmpeg" ? 1 : 0,
     stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
   }));
-  t.after(() => h.close());
+  harnesses.push(h);
   const body = Buffer.from("p");
   await h.request("PUT", "/jobs/job/parts/0/0", body, {
     "x-content-sha256": sha(body),
@@ -219,19 +220,19 @@ test("failed ffmpeg never exposes output", async (t) => {
     }),
     { "content-type": "application/json" }
   );
-  assert.equal(result.status, 422);
-  assert.equal((await h.request("GET", "/jobs/job/output")).status, 409);
+  expect(result.status).toEqual(422);
+  expect((await h.request("GET", "/jobs/job/output")).status).toEqual(409);
 });
 
-test("private binding allows health and job routes without authorization", async (t) => {
+it("private binding allows health and job routes without authorization", async () => {
   const h = await harness();
-  t.after(() => h.close());
-  assert.equal((await h.request("GET", "/health")).status, 204);
+  harnesses.push(h);
+  expect((await h.request("GET", "/health")).status).toEqual(204);
   const body = Buffer.from("x");
-  assert.equal((await upload(h, 0, 0, body)).status, 201);
+  expect((await upload(h, 0, 0, body)).status).toEqual(201);
 });
 
-test("concurrent finalization permits exactly one runner", async (t) => {
+it("concurrent finalization permits exactly one runner", async () => {
   let release;
   const blocked = new Promise((resolve) => {
     release = resolve;
@@ -246,26 +247,25 @@ test("concurrent finalization permits exactly one runner", async (t) => {
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
-  assert.equal((await upload(h, 0, 0, "x")).status, 201);
+  harnesses.push(h);
+  expect((await upload(h, 0, 0, "x")).status).toEqual(201);
   const body = finalizeBody();
   const first = h.request("POST", "/jobs/job/finalize", body, {
     "content-type": "application/json",
   });
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal(
+  expect(
     (
       await h.request("POST", "/jobs/job/finalize", body, {
         "content-type": "application/json",
       })
-    ).status,
-    409
-  );
+    ).status
+  ).toEqual(409);
   release();
-  assert.equal((await first).status, 200);
+  expect((await first).status).toEqual(200);
 });
 
-test("finalize plan is exact and segment-aware", async (t) => {
+it("finalize plan is exact and segment-aware", async () => {
   const h = await harness(async (program, args, options) => {
     if (program === "ffmpeg") {
       await fs.writeFile(path.join(options.cwd, args.at(-1)), "media");
@@ -275,9 +275,9 @@ test("finalize plan is exact and segment-aware", async (t) => {
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
-  assert.equal((await upload(h, 0, 0, "a")).status, 201);
-  assert.equal((await upload(h, 1, 0, "b")).status, 201);
+  harnesses.push(h);
+  expect((await upload(h, 0, 0, "a")).status).toEqual(201);
+  expect((await upload(h, 1, 0, "b")).status).toEqual(201);
   const duplicate = await h.request(
     "POST",
     "/jobs/job/finalize",
@@ -287,14 +287,14 @@ test("finalize plan is exact and segment-aware", async (t) => {
     ]),
     { "content-type": "application/json" }
   );
-  assert.equal(duplicate.status, 400);
+  expect(duplicate.status).toEqual(400);
   const omitted = await h.request(
     "POST",
     "/jobs/job/finalize",
     finalizeBody([{ partIndexes: [0], segmentIndex: 0 }]),
     { "content-type": "application/json" }
   );
-  assert.equal(omitted.status, 409);
+  expect(omitted.status).toEqual(409);
   const accepted = await h.request(
     "POST",
     "/jobs/job/finalize",
@@ -304,10 +304,10 @@ test("finalize plan is exact and segment-aware", async (t) => {
     ]),
     { "content-type": "application/json" }
   );
-  assert.equal(accepted.status, 200);
+  expect(accepted.status).toEqual(200);
 });
 
-test("upload racing sealing is rejected and leaves no temporary file", async (t) => {
+it("upload racing sealing is rejected and leaves no temporary file", async () => {
   let release;
   const blocked = new Promise((resolve) => {
     release = resolve;
@@ -322,47 +322,45 @@ test("upload racing sealing is rejected and leaves no temporary file", async (t)
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
-  assert.equal((await upload(h, 0, 0, "a")).status, 201);
+  harnesses.push(h);
+  expect((await upload(h, 0, 0, "a")).status).toEqual(201);
   const finalizing = h.request("POST", "/jobs/job/finalize", finalizeBody(), {
     "content-type": "application/json",
   });
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal((await upload(h, 0, 1, "b")).status, 409);
+  expect((await upload(h, 0, 1, "b")).status).toEqual(409);
   release();
   await finalizing;
-  assert.equal(
+  expect(
     (await fs.readdir(path.join(h.root, "job"))).filter((name) =>
       name.startsWith(".upload-")
-    ).length,
-    0
-  );
+    ).length
+  ).toEqual(0);
 });
 
-test("part byte limit returns 413 without accepting the part", async (t) => {
+it("part byte limit returns 413 without accepting the part", async () => {
   const h = await harness(undefined, { maxPartBytes: 2 });
-  t.after(() => h.close());
+  harnesses.push(h);
   const body = Buffer.from("abc");
-  assert.equal((await upload(h, 0, 0, body)).status, 413);
-  assert.equal(
+  expect((await upload(h, 0, 0, body)).status).toEqual(413);
+  expect(
     (
       await h.request("POST", "/jobs/job/finalize", finalizeBody(), {
         "content-type": "application/json",
       })
-    ).status,
-    409
-  );
+    ).status
+  ).toEqual(409);
 });
 
-test("DELETE cleanup is idempotent and removes output", async (t) => {
+it("DELETE cleanup is idempotent and removes output", async () => {
   const h = await harness();
-  t.after(() => h.close());
-  assert.equal((await h.request("DELETE", "/jobs/job")).status, 204);
-  assert.equal((await h.request("DELETE", "/jobs/job")).status, 204);
-  assert.equal((await h.request("GET", "/jobs/job/output")).status, 404);
+  harnesses.push(h);
+  expect((await h.request("DELETE", "/jobs/job")).status).toEqual(204);
+  expect((await h.request("DELETE", "/jobs/job")).status).toEqual(204);
+  expect((await h.request("GET", "/jobs/job/output")).status).toEqual(404);
 });
 
-test("missing output cannot produce a successful complete response", async (t) => {
+it("missing output cannot produce a successful complete response", async () => {
   const h = await harness(async (program, args, options) => {
     if (program === "ffmpeg") {
       await fs.writeFile(path.join(options.cwd, args.at(-1)), "media");
@@ -372,17 +370,16 @@ test("missing output cannot produce a successful complete response", async (t) =
       stdout: JSON.stringify({ streams: [{ codec_type: "video" }] }),
     };
   });
-  t.after(() => h.close());
-  assert.equal((await upload(h, 0, 0, "x")).status, 201);
-  assert.equal(
+  harnesses.push(h);
+  expect((await upload(h, 0, 0, "x")).status).toEqual(201);
+  expect(
     (
       await h.request("POST", "/jobs/job/finalize", finalizeBody(), {
         "content-type": "application/json",
       })
-    ).status,
-    200
-  );
+    ).status
+  ).toEqual(200);
   await fs.rm(path.join(h.root, "job"), { recursive: true });
   const response = await h.request("GET", "/jobs/job/output");
-  assert.notEqual(response.status, 200);
+  expect(response.status).not.toBe(200);
 });

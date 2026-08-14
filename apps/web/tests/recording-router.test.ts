@@ -1,5 +1,3 @@
-import assert from "node:assert/strict";
-import test from "node:test";
 import {
   createContext,
   type RecordingBindings,
@@ -14,6 +12,7 @@ import type {
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
+import { expect, it } from "vitest";
 
 const input = {
   recorderMimeType: "video/webm;codecs=opus",
@@ -112,15 +111,15 @@ function setup(
   };
 }
 
-test("recording.appendSegment is public and returns the appended segment", async () => {
+it("recording.appendSegment is public and returns the appended segment", async () => {
   const { client } = setup();
-  assert.deepEqual(await client.recording.appendSegment(input), {
+  expect(await client.recording.appendSegment(input)).toEqual({
     ...input,
     index: 1,
   });
 });
 
-test("recording.appendSegment maps conflicts and rejects invalid input", async () => {
+it("recording.appendSegment maps conflicts and rejects invalid input", async () => {
   const { client } = setup(
     undefined,
     undefined,
@@ -133,32 +132,31 @@ test("recording.appendSegment maps conflicts and rejects invalid input", async (
       return Promise.reject(error);
     }
   );
-  await assert.rejects(() => client.recording.appendSegment(input), {
+  await expect(() =>
+    client.recording.appendSegment(input)
+  ).rejects.toMatchObject({
     code: "CONFLICT",
     status: 409,
   });
-  await assert.rejects(
-    () => client.recording.appendSegment({ ...input, sessionId: "" }),
-    { status: 400 }
-  );
+  await expect(() =>
+    client.recording.appendSegment({ ...input, sessionId: "" })
+  ).rejects.toMatchObject({ status: 400 });
 });
 
-test("recording.finalize and recording.getStatus are public", async () => {
+it("recording.finalize and recording.getStatus are public", async () => {
   const result = setup();
-  assert.deepEqual(
+  expect(
     await result.client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
-    }),
-    { status: "queued" }
-  );
-  assert.deepEqual(
-    await result.client.recording.getStatus({ sessionId: input.sessionId }),
-    { status: "queued" }
-  );
+    })
+  ).toEqual({ status: "queued" });
+  expect(
+    await result.client.recording.getStatus({ sessionId: input.sessionId })
+  ).toEqual({ status: "queued" });
 });
 
-test("recording.finalize enqueues once after persistence", async () => {
+it("recording.finalize enqueues once after persistence", async () => {
   const events: string[] = [];
   const { client, enqueueCalls } = setup(
     undefined,
@@ -177,25 +175,24 @@ test("recording.finalize enqueues once after persistence", async () => {
     segments: [{ partCount: 1, segmentId: input.segmentId }],
     sessionId: input.sessionId,
   });
-  assert.deepEqual(enqueueCalls, [{ sessionId: input.sessionId }]);
-  assert.deepEqual(events, ["persist", `enqueue:${input.sessionId}`]);
+  expect(enqueueCalls).toEqual([{ sessionId: input.sessionId }]);
+  expect(events).toEqual(["persist", `enqueue:${input.sessionId}`]);
 });
 
-test("recording.finalize forwards every status result", async () => {
+it("recording.finalize forwards every status result", async () => {
   for (const status of ["queued", "finalizing", "ready", "failed"] as const) {
     const { client } = setup(undefined, undefined, async () => ({ status }));
-    assert.deepEqual(
+    expect(
       // biome-ignore lint/performance/noAwaitInLoops: statuses are asserted in order.
       await client.recording.finalize({
         segments: [{ partCount: 1, segmentId: input.segmentId }],
         sessionId: input.sessionId,
-      }),
-      { status }
-    );
+      })
+    ).toEqual({ status });
   }
 });
 
-test("recording.finalize does not enqueue non-queued results", async () => {
+it("recording.finalize does not enqueue non-queued results", async () => {
   for (const status of ["finalizing", "ready", "failed"] as const) {
     const { client, enqueueCalls } = setup(undefined, undefined, async () => ({
       status,
@@ -205,11 +202,11 @@ test("recording.finalize does not enqueue non-queued results", async () => {
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
     });
-    assert.deepEqual(enqueueCalls, []);
+    expect(enqueueCalls).toEqual([]);
   }
 });
 
-test("recording.finalize returns queued when enqueue fails after persistence", async () => {
+it("recording.finalize returns queued when enqueue fails after persistence", async () => {
   let persisted = false;
   const { client, enqueueCalls } = setup(
     undefined,
@@ -221,53 +218,36 @@ test("recording.finalize returns queued when enqueue fails after persistence", a
     undefined,
     () => Promise.reject(new Error("queue unavailable"))
   );
-  assert.deepEqual(
+  expect(
     await client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
-    }),
-    { status: "queued" }
-  );
-  assert.equal(persisted, true);
-  assert.deepEqual(enqueueCalls, [{ sessionId: input.sessionId }]);
+    })
+  ).toEqual({ status: "queued" });
+  expect(persisted).toBe(true);
+  expect(enqueueCalls).toEqual([{ sessionId: input.sessionId }]);
 });
 
 for (const [name, errorName, status, code] of [
   ["not found", "RecordingNotFoundError", 404, "NOT_FOUND"],
   ["conflicts", "RecordingFinalizeConflictError", 409, "CONFLICT"],
 ] as const) {
-  test(`recording.finalize maps ${name}`, async () => {
+  it(`recording.finalize maps ${name}`, async () => {
     const { client } = setup(undefined, undefined, () => {
       const error = new Error("database error");
       error.name = errorName;
       return Promise.reject(error);
     });
-    await assert.rejects(
-      () =>
-        client.recording.finalize({
-          segments: [{ partCount: 1, segmentId: input.segmentId }],
-          sessionId: input.sessionId,
-        }),
-      (error: unknown) => {
-        assert.equal(
-          error && typeof error === "object" && "status" in error
-            ? error.status
-            : undefined,
-          status
-        );
-        assert.equal(
-          error && typeof error === "object" && "code" in error
-            ? error.code
-            : undefined,
-          code
-        );
-        return true;
-      }
-    );
+    await expect(
+      client.recording.finalize({
+        segments: [{ partCount: 1, segmentId: input.segmentId }],
+        sessionId: input.sessionId,
+      })
+    ).rejects.toMatchObject({ code, status });
   });
 }
 
-test("recording.finalize rejects invalid input at the public boundary", async () => {
+it("recording.finalize rejects invalid input at the public boundary", async () => {
   const { client } = setup(undefined, undefined, () =>
     Promise.reject(new Error("must not be called"))
   );
@@ -310,81 +290,54 @@ test("recording.finalize rejects invalid input at the public boundary", async ()
   ];
   for (const invalidInput of invalidInputs) {
     // biome-ignore lint/performance/noAwaitInLoops: each invalid input is asserted independently.
-    await assert.rejects(() => client.recording.finalize(invalidInput), {
+    await expect(() =>
+      client.recording.finalize(invalidInput)
+    ).rejects.toMatchObject({
       status: 400,
     });
   }
 });
 
-test("recording.create is public and calls the injected helper", async () => {
+it("recording.create is public and calls the injected helper", async () => {
   const { client, createCalls } = setup();
-  assert.deepEqual(await client.recording.create(input), input);
-  assert.equal(createCalls.length, 1);
+  expect(await client.recording.create(input)).toEqual(input);
+  expect(createCalls.length).toBe(1);
 });
 
-test("recording.create forwards and returns MIME metadata", async () => {
+it("recording.create forwards and returns MIME metadata", async () => {
   const { client, createCalls } = setup();
-  assert.deepEqual(await client.recording.create(input), input);
-  assert.deepEqual(createCalls, [input]);
+  expect(await client.recording.create(input)).toEqual(input);
+  expect(createCalls).toEqual([input]);
 });
 
-test("recording.create maps session conflicts to Conflict", async () => {
+it("recording.create maps session conflicts to Conflict", async () => {
   const setupResult = setup(undefined, () => {
     const error = new Error("conflict");
     error.name = "CreateRecordingSessionConflictError";
     throw error;
   });
-  await assert.rejects(
-    () => setupResult.client.recording.create(input),
-    (error: unknown) => {
-      assert.equal(
-        error && typeof error === "object" && "status" in error
-          ? error.status
-          : undefined,
-        409
-      );
-      assert.equal(
-        error && typeof error === "object" && "code" in error
-          ? error.code
-          : undefined,
-        "CONFLICT"
-      );
-      return true;
-    }
-  );
+  await expect(
+    setupResult.client.recording.create(input)
+  ).rejects.toMatchObject({
+    code: "CONFLICT",
+    status: 409,
+  });
 });
 
-test("recording.getManifest is public and returns the manifest", async () => {
+it("recording.getManifest is public and returns the manifest", async () => {
   const setupResult = setup();
-  assert.deepEqual(
+  expect(
     await setupResult.client.recording.getManifest({
       sessionId: input.sessionId,
-    }),
-    manifest
-  );
+    })
+  ).toEqual(manifest);
 });
 
-test("missing manifest maps to Not Found", async () => {
+it("missing manifest maps to Not Found", async () => {
   const setupResult = setup(async () => null);
-  await assert.rejects(
-    () =>
-      setupResult.client.recording.getManifest({
-        sessionId: "missing",
-      }),
-    (error: unknown) => {
-      assert.equal(
-        error && typeof error === "object" && "status" in error
-          ? error.status
-          : undefined,
-        404
-      );
-      assert.equal(
-        error && typeof error === "object" && "code" in error
-          ? error.code
-          : undefined,
-        "NOT_FOUND"
-      );
-      return true;
-    }
-  );
+  await expect(
+    setupResult.client.recording.getManifest({
+      sessionId: "missing",
+    })
+  ).rejects.toMatchObject({ code: "NOT_FOUND", status: 404 });
 });

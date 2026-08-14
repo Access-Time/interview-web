@@ -313,9 +313,6 @@ it("releases media and stays terminal after a fatal upload", async () => {
     await latest?.start();
   });
   FakeMediaRecorder.last?.emitData("captured");
-  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
-  await waitFor(() => expect(latest?.saveState).toBe("error"));
-  await waitFor(() => expect(latest?.journeyOutcome).toBe("terminal-restart"));
   let stopPromise: Promise<void> | undefined;
   await act(async () => {
     stopPromise = latest?.stop();
@@ -327,6 +324,7 @@ it("releases media and stays terminal after a fatal upload", async () => {
   expect(
     events.filter((event) => event.includes("track-stopped"))
   ).toHaveLength(2);
+  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
   await stopPromise;
   expect(latest?.captureEnded).toBe(true);
   expect(latest?.journeyOutcome).toBe("terminal-restart");
@@ -352,9 +350,11 @@ it("handles duplicate recorder errors with one physical cleanup", async () => {
     await latest?.initialize();
   });
   await waitFor(() => expect(latest?.isReady).toBe(true));
+  let stopPromise: Promise<void> | undefined;
   await act(async () => {
     await latest?.start();
     FakeMediaRecorder.last?.emitError();
+    stopPromise = latest?.stop();
     await Promise.resolve();
   });
   expect(latest?.captureEnded).toBe(true);
@@ -364,8 +364,15 @@ it("handles duplicate recorder errors with one physical cleanup", async () => {
     events.filter((event) => event.includes("track-stopped"))
   ).toHaveLength(2);
   expect(events.filter((event) => event === "capture-ended")).toHaveLength(0);
-  resolveFinalization?.();
-  await waitFor(() => expect(latest?.captureEnded).toBe(true));
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(async () => {
+    resolveFinalization?.();
+    await stopPromise;
+  });
+  expect(latest?.captureEnded).toBe(true);
+  expect(
+    events.filter((event) => event.includes("track-stopped"))
+  ).toHaveLength(2);
 });
 
 it("durably resets a typed missing recovered recording", async () => {

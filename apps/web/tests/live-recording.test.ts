@@ -112,11 +112,15 @@ function recoveryHarness(
       return Promise.resolve();
     },
   };
-  const request = (input: RequestInfo | URL, init?: RequestInit) => {
+  const request = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestInit =
+      init?.body instanceof Blob
+        ? { ...init, body: await init.body.arrayBuffer() }
+        : init;
     calls.push(
-      new Request(new URL(input.toString(), "http://localhost"), init)
+      new Request(new URL(input.toString(), "http://localhost"), requestInit)
     );
-    return Promise.resolve(new Response(null, { status: 201 }));
+    return new Response(null, { status: 201 });
   };
   return {
     box: createLiveRecordingOutbox(store, request),
@@ -247,9 +251,13 @@ it("a successful part does not clear retrying for another failed part", async ()
       },
     },
     async (input, init) => {
+      const requestInit =
+        init?.body instanceof Blob
+          ? { ...init, body: await init.body.arrayBuffer() }
+          : init;
       const request = new Request(
         new URL(input.toString(), "http://localhost"),
-        init
+        requestInit
       );
       requests.push(request);
       await Promise.resolve();

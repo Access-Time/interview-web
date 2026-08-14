@@ -2,9 +2,12 @@ import { Banner } from "@cloudflare/kumo/components/banner";
 import { Button } from "@cloudflare/kumo/components/button";
 import { useEffect, useRef } from "react";
 import type {
+  RecordingDeliveryPhase,
   RecordingFinalizationResult,
   RecordingJourneyOutcome,
+  RecordingPreflightState,
   RecordingSaveState,
+  RecordingStopReason,
 } from "./live-recording";
 
 // biome-ignore lint: preserve the approved public type-alias contract.
@@ -13,16 +16,28 @@ export type CandidateRecordingJourneyProps = {
   blockingErrorTitle: string | null;
   captureBlocked: boolean;
   finalization: RecordingFinalizationResult | null;
+  hasIncompleteRecordingFinalization: boolean;
   hasStopped: boolean;
+  hasUnsentRecordingMedia: boolean;
   isReady: boolean;
   isRecording: boolean;
   journeyOutcome: RecordingJourneyOutcome;
   onInitialize: () => void;
   onRetry: () => void;
+  onRetryPreflight: () => void;
   onResetRecoveredRecording?: () => void;
   onStart: () => void;
   onStop: () => void;
-  pendingAction: "initialize" | "retry" | "start" | "stop" | null;
+  pendingAction:
+    | "initialize"
+    | "retry"
+    | "retry-preflight"
+    | "start"
+    | "stop"
+    | null;
+  recordingDeliveryPhase: RecordingDeliveryPhase;
+  recordingPreflightState: RecordingPreflightState;
+  recordingStopReason: RecordingStopReason;
   recovered: boolean;
   saveState: RecordingSaveState;
   savingNotice: string | null;
@@ -109,18 +124,132 @@ function CameraStage({ stream }: { stream: MediaStream | null }) {
   );
 }
 
-function SaveNotice({ message }: { message: string }) {
-  if (!message) {
-    return null;
+export const RECORDING_DELIVERY_COPY = {
+  candidateStop:
+    "Your camera and microphone are off. Finishing your recording.",
+  capacity:
+    "We stopped recording to protect your saved recording. Finishing it now.",
+  checking:
+    "Checking that this device is ready to record for up to 30 minutes offline.",
+  completionPending: "Your recording is saved. We’re completing it now.",
+  finalizationFailure:
+    "Your recording is still here, but we couldn’t finish it. Check your connection, then try again.",
+  offline:
+    "You’re offline. Your recording is still being saved on this device.",
+  preflightBlocked:
+    "This device isn’t ready to safely store a recording offline. Check your storage or browser, then try again.",
+  ready:
+    "This device is ready to protect up to 30 minutes of recording if you temporarily lose connection.",
+  reconnecting: "Connection restored. Saving your recording.",
+  retrying: "Connection trouble. We’ll keep trying.",
+  saveFailure:
+    "We couldn’t save this recording safely. Your camera and microphone are off. Contact the hiring team for help.",
+  saving: "Your recording is being saved.",
+} as const;
+
+export function getDeliveryPresentation(
+  props: CandidateRecordingJourneyProps
+): {
+  kind: "alert" | "status" | null;
+  message: string | null;
+  retryPreflight: boolean;
+} {
+  if (props.recordingPreflightState === "blocked") {
+    return {
+      kind: "alert",
+      message: RECORDING_DELIVERY_COPY.preflightBlocked,
+      retryPreflight: true,
+    };
   }
-  return (
-    <Banner
-      className="mt-6 rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-      description={message}
-      size="sm"
-      variant="secondary"
-    />
-  );
+  if (props.recordingStopReason === "save-failure") {
+    return {
+      kind: "alert",
+      message: RECORDING_DELIVERY_COPY.saveFailure,
+      retryPreflight: false,
+    };
+  }
+  if (props.finalization?.state === "failed") {
+    return {
+      kind: "alert",
+      message: RECORDING_DELIVERY_COPY.finalizationFailure,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingStopReason === "capacity") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.capacity,
+      retryPreflight: false,
+    };
+  }
+  if (
+    props.recordingStopReason === "candidate" &&
+    props.hasUnsentRecordingMedia
+  ) {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.candidateStop,
+      retryPreflight: false,
+    };
+  }
+  if (
+    props.hasIncompleteRecordingFinalization ||
+    props.finalization?.state === "queued" ||
+    props.finalization?.state === "finalizing"
+  ) {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.completionPending,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingPreflightState === "checking") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.checking,
+      retryPreflight: false,
+    };
+  }
+  if (
+    props.recordingPreflightState === "ready" &&
+    props.recordingDeliveryPhase === "idle" &&
+    !props.isRecording
+  ) {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.ready,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingDeliveryPhase === "saving") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.saving,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingDeliveryPhase === "offline") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.offline,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingDeliveryPhase === "reconnecting") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.reconnecting,
+      retryPreflight: false,
+    };
+  }
+  if (props.recordingDeliveryPhase === "retrying") {
+    return {
+      kind: "status",
+      message: RECORDING_DELIVERY_COPY.retrying,
+      retryPreflight: false,
+    };
+  }
+  return { kind: null, message: null, retryPreflight: false };
 }
 
 function getAsyncSavingMessage(props: CandidateRecordingJourneyProps): string {
@@ -140,7 +269,11 @@ function getAsyncSavingMessage(props: CandidateRecordingJourneyProps): string {
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: explicit finite journey states stay together for review.
 function JourneyPanel(props: CandidateRecordingJourneyProps) {
-  const state = journeyState(props);
+  const delivery = getDeliveryPresentation(props);
+  const state =
+    props.recordingPreflightState === "blocked"
+      ? "permission"
+      : journeyState(props);
   const actionRef = useRef<HTMLButtonElement | null>(null);
   const submissionHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const failureRef = useRef<HTMLHeadingElement | null>(null);
@@ -180,7 +313,44 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
   let announcement = "";
   let content: React.JSX.Element;
 
-  if (state === "permission") {
+  if (delivery.retryPreflight) {
+    announcement = RECORDING_DELIVERY_COPY.preflightBlocked;
+    content = (
+      <>
+        <h2
+          className="font-semibold text-2xl leading-tight"
+          id="journey-state-heading"
+        >
+          This device isn’t ready to record
+        </h2>
+        <div
+          className="mt-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
+          role="alert"
+        >
+          <Banner
+            className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
+            description={RECORDING_DELIVERY_COPY.preflightBlocked}
+            icon={<span aria-hidden="true">!</span>}
+            title="This device isn’t ready to record"
+            variant="secondary"
+          />
+        </div>
+        <Button
+          className={`${actionClassName} mt-6`}
+          disabled={actionsDisabled}
+          onClick={props.onRetryPreflight}
+          ref={actionRef}
+          size="lg"
+          type="button"
+          variant="outline"
+        >
+          {props.pendingAction === "retry-preflight"
+            ? "Checking this device…"
+            : "Try again"}
+        </Button>
+      </>
+    );
+  } else if (state === "permission") {
     announcement = "Set up your camera and microphone.";
     content = (
       <>
@@ -334,10 +504,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         >
           Submission needs attention
         </h2>
-        <div className="mt-6">
+        <div className="mt-6" role="alert">
           <Banner
             className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-            description="Your recording is still here. Check your connection, then try again."
+            description={RECORDING_DELIVERY_COPY.finalizationFailure}
             icon={<span aria-hidden="true">!</span>}
             title="Submission needs attention"
             variant="secondary"
@@ -412,7 +582,11 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           <div className="mt-6">
             <Banner
               className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-              description="Your camera and microphone are off. We couldn’t save this recording safely."
+              description={
+                props.recordingStopReason === "save-failure"
+                  ? RECORDING_DELIVERY_COPY.saveFailure
+                  : "Your camera and microphone are off. We couldn’t save this recording safely."
+              }
               icon={<span aria-hidden="true">!</span>}
               title="Recording needs attention"
               variant="secondary"
@@ -462,15 +636,25 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
       <div aria-atomic="true" aria-live="polite" className="sr-only">
         {announcement}
       </div>
-      <div
-        aria-atomic="true"
-        aria-live="polite"
-        className="sr-only"
-        role="status"
-      >
-        {asyncSavingMessage}
-      </div>
       {content}
+      {delivery.kind === "status" && delivery.message ? (
+        <p
+          aria-live="polite"
+          className="mt-4 text-gray-600 leading-7"
+          role="status"
+        >
+          {delivery.message}
+        </p>
+      ) : (
+        <div
+          aria-atomic="true"
+          aria-live="polite"
+          className="sr-only"
+          role="status"
+        >
+          {asyncSavingMessage}
+        </div>
+      )}
       {props.blockingError &&
       state !== "manual-retry" &&
       state !== "missing-recovery" &&
@@ -489,9 +673,6 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           />
         </div>
       ) : null}
-      <SaveNotice
-        message={state === "manual-retry" ? "" : asyncSavingMessage}
-      />
     </aside>
   );
 }

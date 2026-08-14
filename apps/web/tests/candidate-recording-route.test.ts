@@ -1,7 +1,9 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { RECORDING_DELIVERY_COPY } from "../src/recording/candidate-recording-journey";
 import {
   candidateJourneyHandoff,
   recordingManifestLookup,
+  shouldWarnBeforeUnload,
   usefulError,
 } from "../src/routes/index";
 
@@ -171,6 +173,65 @@ it("maps only typed RECORDING_NOT_FOUND manifest failures to missing", async () 
       sessionId: "recording-1",
     })
   ).resolves.toEqual({ kind: "missing" });
+});
+
+it("prefers capacity and save-failure delivery copy", () => {
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      hasUnsentRecordingMedia: true,
+      recordingStopReason: "capacity",
+    }).deliveryMessage
+  ).toBe(RECORDING_DELIVERY_COPY.capacity);
+
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      recordingStopReason: "save-failure",
+    }).blockingError
+  ).toBe(RECORDING_DELIVERY_COPY.saveFailure);
+});
+
+it("warns before unload during capture, unsent media, or incomplete finalization", () => {
+  const warn = (input: Parameters<typeof shouldWarnBeforeUnload>[0]) => {
+    const event = new Event("beforeunload") as BeforeUnloadEvent;
+    const preventDefault = vi.fn();
+    event.preventDefault = preventDefault;
+    if (shouldWarnBeforeUnload(input)) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    return preventDefault;
+  };
+
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: false,
+      recording: true,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: true,
+      recording: false,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: true,
+      hasUnsentRecordingMedia: false,
+      recording: false,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: false,
+      recording: false,
+    })
+  ).not.toHaveBeenCalled();
 });
 
 it("rethrows manifest transport failures unchanged", async () => {

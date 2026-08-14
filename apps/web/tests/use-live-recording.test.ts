@@ -348,3 +348,30 @@ it("revokes reset after a successful lookup and preserves it after transport fai
   });
   expect(latest?.canResetRecoveredRecording).toBe(true);
 });
+
+it("allows reset for terminal recovery with a retained session", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: { segments: [], sessionId: "session-1" },
+    });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("terminal-restart");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
+  await act(async () => {
+    await latest?.resetRecoveredRecording();
+  });
+  expect(storage.sessions.size).toBe(0);
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+});

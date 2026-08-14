@@ -1076,7 +1076,7 @@ export function useLiveRecording(
         ? async (input: { sessionId: string }) => {
             const result = await getManifest(input);
             if (result === null) {
-              return { kind: "missing" } as const;
+              throw new Error("Recording manifest lookup unavailable");
             }
             if ("kind" in result) {
               return result;

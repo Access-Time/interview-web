@@ -55,7 +55,7 @@ function manifestParts(
 function recoveryHarness(
   parts: RecordingPart[],
   session = recordingSession,
-  storeOptions?: { deleteError?: Error }
+  storeOptions?: { deleteError?: Error; discardError?: Error }
 ) {
   const stored = [...parts];
   const sessions = [session];
@@ -79,6 +79,9 @@ function recoveryHarness(
       return Promise.resolve();
     },
     discardSession: (sessionId: string) => {
+      if (storeOptions?.discardError) {
+        return Promise.reject(storeOptions.discardError);
+      }
       for (let index = stored.length - 1; index >= 0; index -= 1) {
         if (stored[index]?.sessionId === sessionId) {
           stored.splice(index, 1);
@@ -546,6 +549,23 @@ it("marks a typed missing recording without deleting it", async () => {
   expect(harnessed.sessions).toHaveLength(1);
   expect(harnessed.stored).toHaveLength(1);
   harnessed.box.dispose();
+});
+
+it("preserves durable and in-memory state when discard fails", async () => {
+  const harnessed = recoveryHarness(
+    [{ ...part, sequence: 3 }],
+    recordingSession,
+    {
+      discardError: new Error("storage unavailable"),
+    }
+  );
+  await harnessed.box.hydrate();
+  await expect(harnessed.box.discardSession("session")).rejects.toThrow(
+    "storage unavailable"
+  );
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  expect(harnessed.box.pendingCount).toBe(1);
 });
 
 it("lost acknowledgement drops a matching local copy without discarding bytes", async () => {

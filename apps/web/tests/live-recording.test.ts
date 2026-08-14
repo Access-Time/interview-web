@@ -78,6 +78,20 @@ function recoveryHarness(
       }
       return Promise.resolve();
     },
+    discardSession: (sessionId: string) => {
+      for (let index = stored.length - 1; index >= 0; index -= 1) {
+        if (stored[index]?.sessionId === sessionId) {
+          stored.splice(index, 1);
+        }
+      }
+      const sessionIndex = sessions.findIndex(
+        (item) => item.sessionId === sessionId
+      );
+      if (sessionIndex >= 0) {
+        sessions.splice(sessionIndex, 1);
+      }
+      return Promise.resolve();
+    },
     getSession: (sessionId: string) =>
       Promise.resolve(sessions.find((item) => item.sessionId === sessionId)),
     listParts: () => Promise.resolve([...stored]),
@@ -126,6 +140,7 @@ function harness(
       deleted.push(value);
       return Promise.resolve();
     },
+    discardSession: () => Promise.resolve(),
     put: (value: RecordingPart) => {
       events.push("persist");
       stored.push(value);
@@ -176,7 +191,11 @@ it("retryable 503 retains the local part and reports retrying", async () => {
 it("network failures are classified retryable and report retrying", async () => {
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     () => {
       throw new Error("network unavailable");
     },
@@ -221,6 +240,7 @@ it("a successful part does not clear retrying for another failed part", async ()
         deleted.push(value);
         return Promise.resolve();
       },
+      discardSession: () => Promise.resolve(),
       put: (value) => {
         stored.push(value);
         return Promise.resolve();
@@ -258,6 +278,7 @@ it("dispose prevents retry after an in-flight retryable failure", async () => {
   });
   const store = {
     delete: () => Promise.resolve(),
+    discardSession: () => Promise.resolve(),
     put: () => Promise.resolve(),
   };
   const box = createLiveRecordingOutbox(store, () => {
@@ -285,6 +306,7 @@ it("persistence failures reject and never request", async () => {
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       put: () => {
         throw new Error("storage unavailable");
       },
@@ -302,7 +324,11 @@ it("terminal upload failure is retained and does not retry when online", async (
   let requests = 0;
   const errors: unknown[] = [];
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     async () => {
       requests += 1;
       await Promise.resolve();
@@ -332,7 +358,11 @@ it("drain does not resolve while offline work is pending", async () => {
 
 it("drain rejects terminal failures", async () => {
   const box = createLiveRecordingOutbox(
-    { delete: () => Promise.resolve(), put: () => Promise.resolve() },
+    {
+      delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
+      put: () => Promise.resolve(),
+    },
     async () => new Response(null, { status: 409 })
   );
   await box.add(part);
@@ -403,6 +433,7 @@ it("keeps orphan parts without fabricating session metadata", async () => {
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       listParts: () => Promise.resolve(parts),
       listSessions: () => Promise.resolve(sessions),
       put: () => Promise.resolve(),
@@ -424,6 +455,7 @@ it("savePartAndSession reports durable persistence failure", async () => {
   const box = createLiveRecordingOutbox(
     {
       delete: () => Promise.resolve(),
+      discardSession: () => Promise.resolve(),
       put: () => Promise.resolve(),
       putPartAndSession: () => Promise.reject(new Error("storage unavailable")),
     },
@@ -465,9 +497,14 @@ it("reload recovers acknowledged parts without duplicating uploads", async () =>
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
-    )
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+      ]),
+    })
   );
   expect(recovery.recovered).toBe(true);
   expect(recovery.integrity).toBe("ok");
@@ -478,19 +515,45 @@ it("reload recovers acknowledged parts without duplicating uploads", async () =>
   harnessed.box.dispose();
 });
 
+it("retains local recovery when manifest lookup fails", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.hydrate();
+  await expect(
+    harnessed.box.recover(() => {
+      throw new Error("deployment unavailable");
+    })
+  ).rejects.toThrow("deployment unavailable");
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  harnessed.box.dispose();
+});
+
+it("marks a typed missing recording without deleting it", async () => {
+  const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
+  await harnessed.box.hydrate();
+  const recovery = await harnessed.box.recover(async () => ({
+    kind: "missing",
+  }));
+  expect(recovery.missing).toBe(true);
+  expect(harnessed.sessions).toHaveLength(1);
+  expect(harnessed.stored).toHaveLength(1);
+  harnessed.box.dispose();
+});
+
 it("lost acknowledgement drops a matching local copy without discarding bytes", async () => {
   const local = { ...part, sequence: 3 };
   const harnessed = recoveryHarness([local]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { sequence: 2 },
         { sequence: 3 },
-      ])
-    )
+      ]),
+    })
   );
   expect(recovery.integrity).toBe("ok");
   expect(harnessed.calls.length).toBe(0);
@@ -506,14 +569,15 @@ it("reconcile continues when dropping an acknowledged part fails in storage", as
   });
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { sequence: 2 },
         { sequence: 3 },
-      ])
-    )
+      ]),
+    })
   );
   expect(recovery.recovered).toBe(true);
   expect(recovery.integrity).toBe("ok");
@@ -534,9 +598,14 @@ it("offline hydrate retains parts and reconciles after reconnect", async () => {
   expect(harnessed.box.pendingCount).toBe(1);
   await harnessed.box.setOnline(true, { flush: false });
   await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([{ sequence: 0 }, { sequence: 1 }, { sequence: 2 }])
-    )
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
+        { sequence: 0 },
+        { sequence: 1 },
+        { sequence: 2 },
+      ]),
+    })
   );
   expect(harnessed.calls.length).toBe(1);
   expect(harnessed.box.pendingCount).toBe(0);
@@ -547,13 +616,14 @@ it("conflicting checksums retain local media and refuse finalization", async () 
   const harnessed = recoveryHarness([{ ...part, sequence: 2 }]);
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(
-      manifestParts([
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([
         { sequence: 0 },
         { sequence: 1 },
         { checksum: OTHER_CHECKSUM, sequence: 2 },
-      ])
-    )
+      ]),
+    })
   );
   expect(recovery.integrity).toBe("conflict");
   expect(harnessed.deleted.length).toBe(0);
@@ -575,7 +645,10 @@ it("missing ordered parts refuse misleading finalization", async () => {
   });
   await harnessed.box.hydrate();
   const recovery = await harnessed.box.recover(() =>
-    Promise.resolve(manifestParts([{ sequence: 0 }, { sequence: 1 }]))
+    Promise.resolve({
+      kind: "found",
+      manifest: manifestParts([{ sequence: 0 }, { sequence: 1 }]),
+    })
   );
   expect(recovery.integrity).toBe("gap");
   expect(harnessed.calls.length).toBe(0);

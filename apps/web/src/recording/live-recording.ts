@@ -34,6 +34,7 @@ export function normalizeFinalizationStatus(
 }
 
 export interface UseLiveRecordingResult {
+  canResetRecoveredRecording: boolean;
   captureEnded: boolean;
   error: string | null;
   finalization: RecordingFinalizationResult | null;
@@ -41,8 +42,10 @@ export interface UseLiveRecordingResult {
   integrity: RecordingIntegrity;
   isReady: boolean;
   isRecording: boolean;
+  journeyOutcome: RecordingJourneyOutcome;
   pendingPartCount: number;
   recovered: boolean;
+  resetRecoveredRecording: () => Promise<void>;
   retryFinalization: () => Promise<void>;
   saveState: RecordingSaveState;
   start: () => Promise<void>;
@@ -98,6 +101,29 @@ export interface RecordingManifestView {
     parts: Array<{ checksum: string; sequence: number }>;
   }>;
   sessionId: string;
+}
+
+export type RecordingManifestLookup =
+  | { kind: "found"; manifest: RecordingManifestView }
+  | { kind: "missing" };
+
+export type RecordingJourneyOutcome =
+  | "none"
+  | "automatic-retry"
+  | "manual-retry"
+  | "terminal-restart"
+  | "missing-recovery";
+
+function normalizeManifestLookup(
+  result: RecordingManifestLookup | RecordingManifestView | null
+): RecordingManifestLookup {
+  if (result === null) {
+    return { kind: "missing" };
+  }
+  if ("kind" in result) {
+    return result;
+  }
+  return { kind: "found", manifest: result };
 }
 
 const partIdentity = (segmentId: string, sequence: number) =>
@@ -279,6 +305,7 @@ interface PartStore {
 
 export interface RecordingRecoveryStore extends PartStore {
   deleteSession?: (sessionId: string) => Promise<void>;
+  discardSession: (sessionId: string) => Promise<void>;
   getSession?: (sessionId: string) => Promise<RecordingSession | undefined>;
   listParts?: () => Promise<RecordingPart[]>;
   listSessions?: () => Promise<RecordingSession[]>;
@@ -372,6 +399,35 @@ function browserStore(): RecordingRecoveryStore {
       transaction("readwrite", (store) => store.delete(key(part))),
     deleteSession: (sessionId) =>
       transaction("readwrite", (_, store) => store.delete(sessionId)),
+    discardSession: (sessionId) =>
+      open().then(
+        (db) =>
+          new Promise<void>((resolve, reject) => {
+            const tx = db.transaction(["parts", "sessions"], "readwrite");
+            const parts = tx.objectStore("parts");
+            const request = parts.getAll();
+            request.onsuccess = () => {
+              for (const item of request.result as Array<
+                RecordingPart & { id: string }
+              >) {
+                if (item.sessionId === sessionId) {
+                  parts.delete(item.id);
+                }
+              }
+              tx.objectStore("sessions").delete(sessionId);
+            };
+            request.onerror = () => reject(request.error);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () =>
+              reject(
+                tx.error ?? new Error("Recording storage transaction failed")
+              );
+            tx.onabort = () =>
+              reject(
+                tx.error ?? new Error("Recording storage transaction aborted")
+              );
+          })
+      ),
     listParts: () =>
       open().then(
         (db) =>
@@ -434,13 +490,14 @@ export function createLiveRecordingOutbox(
   const send = async (part: RecordingPart) => {
     let response: Response;
     try {
+      const checksum = await recordingBlobChecksum(part.blob);
       response = await request(
         `/api/recordings/${encodeURIComponent(part.sessionId)}/segments/${encodeURIComponent(part.segmentId)}/parts/${part.sequence}`,
         {
           body: part.blob,
           headers: {
             "Content-Type": part.mediaType || "application/octet-stream",
-            "X-Content-SHA256": await recordingBlobChecksum(part.blob),
+            "X-Content-SHA256": checksum,
           },
           method: "PUT",
         }
@@ -548,18 +605,18 @@ export function createLiveRecordingOutbox(
   const recover = async (
     getManifest?: (input: {
       sessionId: string;
-    }) => Promise<RecordingManifestView | null>
+    }) => Promise<RecordingManifestLookup | RecordingManifestView | null>
   ) => {
     const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
     const [stored] = sessions
       .filter((item) => item.status === "recording")
       .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
     if (stored && getManifest && online) {
-      let manifest: RecordingManifestView | null = null;
-      try {
-        manifest = await getManifest({ sessionId: stored.sessionId });
-      } catch {
-        manifest = null;
+      const result = await getManifest({ sessionId: stored.sessionId });
+      const lookup = normalizeManifestLookup(result);
+      if (lookup.kind === "missing") {
+        const session = (await store.getSession?.(stored.sessionId)) ?? stored;
+        return { integrity, missing: true, recovered: true, session };
       }
       const localParts = [...pending.values()].filter(
         (item) => item.sessionId === stored.sessionId
@@ -568,7 +625,7 @@ export function createLiveRecordingOutbox(
         await reconcileRecordingParts({
           localParts,
           localSession: stored,
-          manifest,
+          manifest: lookup.manifest,
         })
       );
     }
@@ -579,6 +636,7 @@ export function createLiveRecordingOutbox(
         : ((await store.getSession?.(stored.sessionId)) ?? stored);
     return {
       integrity,
+      missing: false,
       recovered: Boolean(stored),
       session,
     };
@@ -608,6 +666,18 @@ export function createLiveRecordingOutbox(
     assertCanFinalize,
     async deleteSession(sessionId: string) {
       await store.deleteSession?.(sessionId);
+    },
+    async discardSession(sessionId: string) {
+      await store.discardSession(sessionId);
+      for (const [partKey, item] of pending) {
+        if (item.sessionId === sessionId) {
+          pending.delete(partKey);
+          failed.delete(partKey);
+          failureByKey.delete(partKey);
+          terminal.delete(partKey);
+        }
+      }
+      onChange?.();
     },
     dispose() {
       disposed = true;
@@ -742,7 +812,7 @@ export function useLiveRecording(options: {
   }) => Promise<RecordingFinalizationStatus>;
   getManifest?: (input: {
     sessionId: string;
-  }) => Promise<RecordingManifestView | null>;
+  }) => Promise<RecordingManifestLookup | RecordingManifestView | null>;
 }): UseLiveRecordingResult {
   const outbox = useRef<ReturnType<typeof createLiveRecordingOutbox> | null>(
     null
@@ -760,6 +830,10 @@ export function useLiveRecording(options: {
   const [captureEnded, setCaptureEnded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recovered, setRecovered] = useState(false);
+  const [journeyOutcome, setJourneyOutcome] =
+    useState<RecordingJourneyOutcome>("none");
+  const [canResetRecoveredRecording, setCanResetRecoveredRecording] =
+    useState(false);
   const [finalization, setFinalization] =
     useState<RecordingFinalizationResult | null>(null);
   const finalizationInput = useRef<{
@@ -971,8 +1045,19 @@ export function useLiveRecording(options: {
     submitSealedRef.current = submitSealed;
     recoveryGeneration.current += 1;
     const generation = recoveryGeneration.current;
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: recovery coordinates durable state and retry state.
     const applyRecovery = async () => {
-      const recovery = await box.recover(options.getManifest);
+      const { getManifest } = options;
+      const manifestLookup = getManifest
+        ? async (input: { sessionId: string }) => {
+            const lookup = await getManifest(input);
+            if (!lookup) {
+              throw new Error("Recording manifest lookup unavailable");
+            }
+            return lookup;
+          }
+        : undefined;
+      const recovery = await box.recover(manifestLookup);
       if (generation !== recoveryGeneration.current || isDisposed()) {
         return recovery;
       }
@@ -992,6 +1077,11 @@ export function useLiveRecording(options: {
       const message = integrityMessage(recovery.integrity);
       if (message) {
         setError(message);
+        setJourneyOutcome("terminal-restart");
+        setCanResetRecoveredRecording(Boolean(recovery.session && ids.current));
+      } else if (recovery.missing) {
+        setJourneyOutcome("missing-recovery");
+        setCanResetRecoveredRecording(Boolean(recovery.session && ids.current));
       }
       return recovery;
     };
@@ -1336,7 +1426,28 @@ export function useLiveRecording(options: {
     }
     await submitSealedRef.current?.();
   };
+  const resetRecoveredRecording = async () => {
+    const currentIds = ids.current;
+    if (!canResetRecoveredRecording) {
+      throw new Error("Recovered recording cannot be reset");
+    }
+    if (currentIds === null) {
+      throw new Error("Recovered recording cannot be reset");
+    }
+    await outbox.current?.discardSession(currentIds.sessionId);
+    ids.current = null;
+    session.current = null;
+    setRecovered(false);
+    setCaptureEnded(false);
+    finalizationInput.current = null;
+    finalizationAttempted.current = false;
+    setFinalizationState(null);
+    setError(null);
+    setJourneyOutcome("none");
+    setCanResetRecoveredRecording(false);
+  };
   return {
+    canResetRecoveredRecording,
     captureEnded,
     error,
     finalization,
@@ -1344,8 +1455,10 @@ export function useLiveRecording(options: {
     integrity: outboxView.integrity,
     isReady,
     isRecording,
+    journeyOutcome,
     pendingPartCount: outboxView.pendingPartCount,
     recovered,
+    resetRecoveredRecording,
     retryFinalization,
     saveState: outboxView.saveState,
     start,

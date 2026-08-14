@@ -109,6 +109,10 @@ function installIndexedDb() {
     configurable: true,
     value: { open } as unknown as IDBFactory,
   });
+  return {
+    parts: records.parts,
+    sessions: records.sessions,
+  };
 }
 
 function installBrowserGlobals() {
@@ -118,7 +122,7 @@ function installBrowserGlobals() {
       Object.getOwnPropertyDescriptor(globalThis, property)
     );
   }
-  installIndexedDb();
+  return installIndexedDb();
 }
 
 const events: string[] = [];
@@ -162,6 +166,7 @@ class FakeMediaRecorder extends EventTarget {
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
 let resolveFinalization: (() => void) | null = null;
+let manifestLookup: (() => Promise<{ kind: "missing" }>) | undefined;
 
 function RecordingHost() {
   latest = useLiveRecording({
@@ -174,6 +179,9 @@ function RecordingHost() {
       });
       return { status: "ready" };
     },
+    getManifest: manifestLookup
+      ? async () => manifestLookup?.() ?? { kind: "missing" }
+      : undefined,
   });
   return null;
 }
@@ -193,6 +201,7 @@ afterEach(() => {
   latest = null;
   finalizeCalls = 0;
   resolveFinalization = null;
+  manifestLookup = undefined;
 });
 
 it("normal stop releases tracks after capture and retains submission", async () => {
@@ -243,4 +252,38 @@ it("normal stop releases tracks after capture and retains submission", async () 
     resolveFinalization?.();
     await stopPromise;
   });
+});
+
+it("durably resets a typed missing recovered recording", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [{ partCount: 1, segmentId: "segment" }],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  storage.parts.set("session-1:segment:0", {
+    blob: new Blob(["captured"], { type: "video/webm" }),
+    id: "session-1:segment:0",
+    mediaType: "video/webm",
+    segmentId: "segment",
+    sequence: 0,
+    sessionId: "session-1",
+  });
+  manifestLookup = () => Promise.resolve({ kind: "missing" });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("missing-recovery");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(true);
+  await act(async () => {
+    await latest?.resetRecoveredRecording();
+  });
+  expect(storage.sessions.size).toBe(0);
+  expect(storage.parts.size).toBe(0);
+  expect(latest?.journeyOutcome).toBe("none");
+  expect(latest?.recovered).toBe(false);
+  expect(latest?.canResetRecoveredRecording).toBe(false);
 });

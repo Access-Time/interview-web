@@ -11,6 +11,10 @@ import type { CandidateRecordingJourneyProps } from "../src/recording/candidate-
 import { CandidateRecordingJourney } from "../src/recording/candidate-recording-journey";
 
 const CLOSE_TAB_PATTERN = /may close this tab/i;
+const CAMERA_OFF_PATTERN = /Your camera and microphone are off/i;
+const NEW_RECORDING_PATTERN = /start a new recording/i;
+const RECORDING_GUIDANCE_PATTERN =
+  /Keep this screen open and stay in this browser while you record/i;
 const IMPLEMENTATION_LANGUAGE_PATTERN =
   /\b(session|raw|storage|server|segment|part|queue|acknowledged|finalization|retrieve)\b/i;
 
@@ -22,6 +26,7 @@ const baseProps: CandidateRecordingJourneyProps = {
   hasStopped: false,
   isReady: false,
   isRecording: false,
+  journeyOutcome: "none",
   onInitialize: () => undefined,
   onRetry: () => undefined,
   onStart: () => undefined,
@@ -75,6 +80,44 @@ it("shows one candidate action for each active primary state", () => {
   expect(screen.getAllByRole("button").length).toBe(1);
 });
 
+it("shows foreground guidance without offering an ordinary restart", () => {
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      isReady: true,
+      isRecording: true,
+    })
+  );
+  expect(screen.getByText(RECORDING_GUIDANCE_PATTERN)).toBeTruthy();
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+  expect(
+    screen.queryByRole("button", { name: NEW_RECORDING_PATTERN })
+  ).toBeNull();
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      finalization: { error: null, state: "queued" },
+      hasStopped: true,
+    })
+  );
+  expect(screen.getByText(CAMERA_OFF_PATTERN)).toBeTruthy();
+  expect(
+    screen.queryByRole("button", { name: NEW_RECORDING_PATTERN })
+  ).toBeNull();
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      finalization: { error: null, state: "ready" },
+      hasStopped: true,
+    })
+  );
+  expect(
+    screen.queryByRole("button", { name: NEW_RECORDING_PATTERN })
+  ).toBeNull();
+});
+
 it("continues a recovered recording and retries a failed submission", () => {
   let starts = 0;
   let retries = 0;
@@ -100,6 +143,7 @@ it("continues a recovered recording and retries a failed submission", () => {
       ...baseProps,
       finalization: { error: "failed", state: "failed" },
       hasStopped: true,
+      journeyOutcome: "manual-retry",
       onRetry: () => {
         retries += 1;
       },
@@ -107,7 +151,85 @@ it("continues a recovered recording and retries a failed submission", () => {
   );
   fireEvent.click(screen.getByRole("button", { name: "Try submitting again" }));
   expect(retries).toBe(1);
+  expect(screen.getByRole("status").textContent).toBe(
+    "Your recording is still here. Check your connection, then try again."
+  );
   expect(screen.getAllByRole("button").length).toBe(1);
+});
+
+it("offers reset only for typed restart outcomes", () => {
+  let resets = 0;
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      hasStopped: true,
+      journeyOutcome: "terminal-restart",
+    })
+  );
+  expect(screen.getByText(CAMERA_OFF_PATTERN)).toBeTruthy();
+  expect(screen.getByRole("alert")).toBeTruthy();
+  expect(
+    screen.queryByRole("button", { name: "Start a new recording" })
+  ).toBeNull();
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      hasStopped: true,
+      journeyOutcome: "terminal-restart",
+      onResetRecoveredRecording: () => {
+        resets += 1;
+      },
+    })
+  );
+  fireEvent.click(
+    screen.getByRole("button", { name: "Start a new recording" })
+  );
+  expect(resets).toBe(1);
+
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      journeyOutcome: "missing-recovery",
+      onResetRecoveredRecording: () => {
+        resets += 1;
+      },
+      recovered: true,
+    })
+  );
+  expect(
+    screen.getByText(
+      "We couldn’t find your unfinished recording. It can’t be continued."
+    )
+  ).toBeTruthy();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Set up a new recording" })
+  );
+  expect(resets).toBe(2);
+  expect(screen.getAllByRole("status")).toHaveLength(1);
+});
+
+it("focuses the terminal alert heading after capture ends", async () => {
+  const { rerender } = render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      isReady: true,
+      isRecording: true,
+    })
+  );
+  rerender(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      hasStopped: true,
+      journeyOutcome: "terminal-restart",
+    })
+  );
+
+  const heading = screen.getByRole("heading", {
+    name: "This recording couldn’t be saved safely",
+  });
+  await waitFor(() => expect(document.activeElement).toBe(heading));
+  expect(screen.getByRole("alert").contains(heading)).toBe(true);
 });
 
 const stateScenarios: Array<{
@@ -226,40 +348,35 @@ it("labels the controls by the active state heading", () => {
   expect(controls.getAttribute("aria-labelledby")).toBe(heading.id);
 });
 
-it("keeps saving notices non-alerting and uses the approved copy", () => {
+it("keeps automatic saving notices non-alerting and uses approved copy", () => {
   for (const [saveState, message] of [
-    [
-      "offline",
-      "You’re offline. Keep this tab open; we’ll continue when your connection returns.",
-    ],
-    ["retrying", "Saving is delayed. Keep this tab open while we try again."],
-    [
-      "error",
-      "Saving needs attention. Keep this tab open and check your connection.",
-    ],
+    ["offline", "Saving will resume when you reconnect."],
+    ["retrying", "Keep this screen open; we’ll keep trying."],
+    ["error", "Keep this screen open; we’ll keep trying."],
   ] as const) {
     const { container, unmount } = render(
       React.createElement(CandidateRecordingJourney, {
         ...baseProps,
+        journeyOutcome: "automatic-retry",
         saveState,
       })
     );
-    expect(screen.getByText(message)).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe(message);
     expect(container.querySelector('[role="alert"]')).toBe(null);
     unmount();
   }
 });
 
-it("shows a saving network notice once without a blocking alert", () => {
-  const message =
-    "Saving needs attention. Keep this tab open and check your connection.";
+it("uses one persistent async status without a blocking alert", () => {
+  const message = "Keep this screen open; we’ll keep trying.";
   const { container } = render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
+      journeyOutcome: "automatic-retry",
       savingNotice: message,
     })
   );
-  expect(screen.getAllByText(message).length).toBe(1);
+  expect(screen.getByRole("status").textContent).toBe(message);
   expect(container.querySelector('[role="alert"]')).toBe(null);
 });
 
@@ -270,6 +387,7 @@ it("suppresses a blocking error when submission has failed", () => {
       blockingError: "Camera and microphone access was blocked.",
       finalization: { error: "raw detail", state: "failed" },
       hasStopped: true,
+      journeyOutcome: "manual-retry",
     })
   );
   expect(screen.queryByText("Camera and microphone access was blocked.")).toBe(
@@ -298,6 +416,7 @@ it("announces honestly without invented progress or implementation language", ()
       ...baseProps,
       finalization: { error: "hidden raw detail", state: "failed" },
       hasStopped: true,
+      journeyOutcome: "manual-retry",
     },
     {
       ...baseProps,
@@ -310,10 +429,7 @@ it("announces honestly without invented progress or implementation language", ()
     const { container, unmount } = render(
       React.createElement(CandidateRecordingJourney, props)
     );
-    const liveRegions = container.querySelectorAll(
-      '[aria-live="polite"][aria-atomic="true"]'
-    );
-    expect(liveRegions.length).toBe(1);
+    expect(screen.getAllByRole("status")).toHaveLength(1);
     expect(screen.queryByRole("progressbar")).toBe(null);
     expect((container.textContent ?? "").includes("%")).toBe(false);
     expect(
@@ -371,12 +487,13 @@ it("moves focus through explicit recording state changes", async () => {
       ...baseProps,
       finalization: { error: "hidden raw detail", state: "failed" },
       hasStopped: true,
+      journeyOutcome: "manual-retry",
     })
   );
   await waitFor(() =>
     expect(document.activeElement).toBe(
       screen.getByRole("heading", {
-        name: "Your recording is saved, but we couldn’t finish submitting it.",
+        name: "Submission needs attention",
       })
     )
   );
@@ -432,6 +549,7 @@ it("uses finite pending labels and disables each action", () => {
         ...baseProps,
         finalization: { error: "hidden", state: "failed" },
         hasStopped: true,
+        journeyOutcome: "manual-retry",
         pendingAction: "retry",
       },
     },

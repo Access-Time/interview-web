@@ -3,6 +3,9 @@ import { useCallback, useEffect, useState } from "react";
 import { CandidateRecordingJourney } from "@/recording/candidate-recording-journey";
 import {
   type RecordingFinalizationState,
+  type RecordingJourneyOutcome,
+  type RecordingManifestLookup,
+  type RecordingManifestView,
   type RecordingSaveState,
   type UseLiveRecordingResult,
   useLiveRecording,
@@ -19,37 +22,21 @@ type PendingAction = "initialize" | "retry" | "start" | "stop";
 const PERMISSION_ERROR = /permission|notallowed|denied|security/;
 const DEVICE_ERROR = /notfound|device|camera|microphone|media/;
 const STORAGE_ERROR = /storage|quota|indexeddb|store/;
-const NETWORK_ERROR = /network|fetch|upload|offline|connection/;
 const INTEGRITY_ERROR = /conflicting parts|missing ordered parts/;
-
-const NETWORK_GUIDANCE: Record<RecordingSaveState, string> = {
-  error:
-    "Saving needs attention. Keep this tab open and check your connection.",
-  healthy:
-    "Saving needs attention. Keep this tab open and check your connection.",
-  offline:
-    "You’re offline. Keep this tab open; we’ll continue when your connection returns.",
-  retrying: "Saving is delayed. Keep this tab open while we try again.",
-};
 
 interface CandidateError {
   captureBlocked: boolean;
-  kind: "blocking" | "saving";
   message: string;
   title: string;
 }
 
-export function usefulError(
-  error: unknown,
-  saveState: RecordingSaveState = "healthy"
-): CandidateError {
+export function usefulError(error: unknown): CandidateError {
   const detail = error instanceof Error ? error.message : String(error);
   const normalized = detail.toLowerCase();
 
   if (PERMISSION_ERROR.test(normalized)) {
     return {
       captureBlocked: false,
-      kind: "blocking",
       message:
         "Camera and microphone access was blocked. Allow both in your browser settings, then try again.",
       title: "Camera and microphone access blocked",
@@ -58,7 +45,6 @@ export function usefulError(
   if (DEVICE_ERROR.test(normalized)) {
     return {
       captureBlocked: false,
-      kind: "blocking",
       message:
         "We couldn’t connect to both a camera and microphone. Check that they’re plugged in and not in use by another app.",
       title: "Camera or microphone unavailable",
@@ -67,24 +53,14 @@ export function usefulError(
   if (STORAGE_ERROR.test(normalized)) {
     return {
       captureBlocked: true,
-      kind: "blocking",
       message:
         "This browser can’t save your recording safely right now. Free up space on your device, then try again.",
       title: "Recording can’t be saved",
     };
   }
-  if (NETWORK_ERROR.test(normalized)) {
-    return {
-      captureBlocked: false,
-      kind: "saving",
-      message: NETWORK_GUIDANCE[saveState],
-      title: "Saving needs attention",
-    };
-  }
   if (INTEGRITY_ERROR.test(normalized)) {
     return {
       captureBlocked: true,
-      kind: "blocking",
       message:
         "We found a problem with your recording that needs attention. Keep this tab open and try again.",
       title: "Recording needs attention",
@@ -92,11 +68,34 @@ export function usefulError(
   }
   return {
     captureBlocked: false,
-    kind: "blocking",
     message:
       "Something went wrong with the recording. Keep this page open and try the action again.",
     title: "Recording needs attention",
   };
+}
+
+export async function recordingManifestLookup(
+  getManifest: (input: { sessionId: string }) => Promise<RecordingManifestView>,
+  input: { sessionId: string }
+): Promise<RecordingManifestLookup> {
+  try {
+    return {
+      kind: "found",
+      manifest: await getManifest(input),
+    };
+  } catch (error) {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed oRPC boundary.
+    if (
+      typeof error === "object" &&
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed boundary guard.
+      error !== null &&
+      "code" in error &&
+      error.code === "NOT_FOUND"
+    ) {
+      return { kind: "missing" };
+    }
+    throw error;
+  }
 }
 
 export function candidateJourneyHandoff(input: {
@@ -104,17 +103,25 @@ export function candidateJourneyHandoff(input: {
   captureEnded: boolean;
   controlsHasStopped: boolean;
   finalizationState: RecordingFinalizationState | "idle";
+  journeyOutcome: RecordingJourneyOutcome;
   recordingError: string | null;
   saveState: RecordingSaveState;
 }) {
   const recordingError = input.recordingError
-    ? usefulError(input.recordingError, input.saveState)
+    ? usefulError(input.recordingError)
     : null;
   const visibleError = input.actionError ?? recordingError;
   const blockingError =
-    input.finalizationState === "failed" || visibleError?.kind !== "blocking"
-      ? null
-      : visibleError.message;
+    input.journeyOutcome === "none" && input.finalizationState !== "failed"
+      ? (visibleError?.message ?? null)
+      : null;
+  let savingNotice: string | null = null;
+  if (input.journeyOutcome === "automatic-retry") {
+    savingNotice =
+      input.saveState === "offline"
+        ? "Saving will resume when you reconnect."
+        : "Keep this screen open; we’ll keep trying.";
+  }
 
   return {
     blockingError,
@@ -127,7 +134,8 @@ export function candidateJourneyHandoff(input: {
       input.captureEnded ||
       input.controlsHasStopped ||
       input.finalizationState !== "idle",
-    savingNotice: visibleError?.kind === "saving" ? visibleError.message : null,
+    journeyOutcome: input.journeyOutcome,
+    savingNotice,
   };
 }
 
@@ -137,7 +145,7 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
   );
   const [actionError, setActionError] = useState<CandidateError | null>(null);
   const [hasStopped, setHasStopped] = useState(false);
-  const { initialize, retryFinalization, saveState, start, stop } = recording;
+  const { initialize, retryFinalization, start, stop } = recording;
 
   const perform = useCallback(
     async (action: PendingAction, task: () => Promise<void>) => {
@@ -146,12 +154,12 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
       try {
         await task();
       } catch (cause) {
-        setActionError(usefulError(cause, saveState));
+        setActionError(usefulError(cause));
       } finally {
         setPendingAction(null);
       }
     },
-    [saveState]
+    []
   );
 
   const handleInitialize = useCallback(() => {
@@ -191,13 +199,8 @@ function HomeComponent() {
     createSession: (input) => client.recording.create(input),
     finalizeSession: (input) => client.recording.finalize(input),
     getFinalizationStatus: (input) => client.recording.getStatus(input),
-    getManifest: async (input) => {
-      try {
-        return await client.recording.getManifest(input);
-      } catch {
-        return null;
-      }
-    },
+    getManifest: (input) =>
+      recordingManifestLookup(client.recording.getManifest, input),
   });
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
@@ -206,6 +209,7 @@ function HomeComponent() {
     captureEnded: recording.captureEnded,
     controlsHasStopped: controls.hasStopped,
     finalizationState,
+    journeyOutcome: recording.journeyOutcome,
     recordingError: recording.error,
     saveState: recording.saveState,
   });
@@ -231,7 +235,15 @@ function HomeComponent() {
       hasStopped={handoff.hasStopped}
       isReady={recording.isReady}
       isRecording={recording.isRecording}
+      journeyOutcome={handoff.journeyOutcome}
       onInitialize={controls.handleInitialize}
+      onResetRecoveredRecording={
+        recording.canResetRecoveredRecording
+          ? () => {
+              recording.resetRecoveredRecording().catch(() => undefined);
+            }
+          : undefined
+      }
       onRetry={controls.handleRetryFinalization}
       onStart={controls.handleStart}
       onStop={controls.handleStop}

@@ -1,39 +1,12 @@
 import { expect, it } from "vitest";
-import { candidateJourneyHandoff, usefulError } from "../src/routes/index";
+import {
+  candidateJourneyHandoff,
+  recordingManifestLookup,
+  usefulError,
+} from "../src/routes/index";
 
 const FORBIDDEN_COPY =
   /\b(session|raw|storage|server|segment|part|queue|acknowledged|finalization|retrieve)\b/i;
-
-it("classifies connection failures as saving guidance", () => {
-  const scenarios = [
-    {
-      error: "fetch failed",
-      message:
-        "Saving needs attention. Keep this tab open and check your connection.",
-      saveState: "healthy" as const,
-    },
-    {
-      error: "network offline",
-      message:
-        "You’re offline. Keep this tab open; we’ll continue when your connection returns.",
-      saveState: "offline" as const,
-    },
-    {
-      error: "upload connection failed",
-      message: "Saving is delayed. Keep this tab open while we try again.",
-      saveState: "retrying" as const,
-    },
-  ];
-
-  for (const scenario of scenarios) {
-    expect(usefulError(scenario.error, scenario.saveState)).toEqual({
-      captureBlocked: false,
-      kind: "saving",
-      message: scenario.message,
-      title: "Saving needs attention",
-    });
-  }
-});
 
 it("keeps non-network failures blocking and candidate-safe", () => {
   const scenarios = [
@@ -46,7 +19,6 @@ it("keeps non-network failures blocking and candidate-safe", () => {
 
   for (const [error, title] of scenarios) {
     const classification = usefulError(error);
-    expect(classification.kind).toBe("blocking");
     expect(classification.title).toBe(title);
     expect(FORBIDDEN_COPY.test(classification.message)).toBe(false);
     expect(FORBIDDEN_COPY.test(classification.title)).toBe(false);
@@ -62,11 +34,14 @@ it("hands saving failures to the notice only", () => {
     captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "idle",
+    journeyOutcome: "automatic-retry",
     recordingError: "fetch failed",
     saveState: "healthy",
   });
 
-  expect(handoff.savingNotice).toBe(usefulError("fetch failed").message);
+  expect(handoff.savingNotice).toBe(
+    "Keep this screen open; we’ll keep trying."
+  );
   expect(handoff.blockingError).toBe(null);
   expect(handoff.blockingErrorTitle).toBe(null);
   expect(handoff.finalizationState).toBe("idle");
@@ -80,6 +55,7 @@ it("hands off blocking failures and suppresses them after failed submission", ()
     captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "idle",
+    journeyOutcome: "none",
     recordingError: null,
     saveState: "healthy",
   });
@@ -92,6 +68,7 @@ it("hands off blocking failures and suppresses them after failed submission", ()
     captureEnded: false,
     controlsHasStopped: false,
     finalizationState: "failed",
+    journeyOutcome: "manual-retry",
     recordingError: null,
     saveState: "healthy",
   });
@@ -99,6 +76,7 @@ it("hands off blocking failures and suppresses them after failed submission", ()
   expect(failed.blockingErrorTitle).toBe(null);
   expect(failed.hasStopped).toBe(true);
   expect(failed.finalizationState).toBe("failed");
+  expect(failed.journeyOutcome).toBe("manual-retry");
 });
 
 it("preserves stopped semantics for pending and terminal states", () => {
@@ -113,6 +91,7 @@ it("preserves stopped semantics for pending and terminal states", () => {
       captureEnded: false,
       controlsHasStopped: false,
       finalizationState,
+      journeyOutcome: "none",
       recordingError: null,
       saveState: "healthy",
     });
@@ -125,6 +104,7 @@ it("preserves stopped semantics for pending and terminal states", () => {
     captureEnded: false,
     controlsHasStopped: true,
     finalizationState: "idle",
+    journeyOutcome: "none",
     recordingError: null,
     saveState: "healthy",
   });
@@ -137,6 +117,7 @@ it("capture-ended signal produces stopped handoff immediately", () => {
     captureEnded: true,
     controlsHasStopped: false,
     finalizationState: "idle",
+    journeyOutcome: "none",
     recordingError: null,
     saveState: "healthy",
   });
@@ -157,9 +138,44 @@ it("blocks capture handoff only for unsafe recording failures", () => {
       captureEnded: false,
       controlsHasStopped: false,
       finalizationState: "idle",
+      journeyOutcome: "none",
       recordingError: error,
       saveState: "healthy",
     });
     expect(handoff.captureBlocked).toBe(captureBlocked);
   }
+});
+
+it("does not describe a fatal 400 upload as retryable network saving", () => {
+  const handoff = candidateJourneyHandoff({
+    actionError: null,
+    captureEnded: true,
+    controlsHasStopped: false,
+    finalizationState: "idle",
+    journeyOutcome: "terminal-restart",
+    recordingError: "Recording part upload failed (400)",
+    saveState: "error",
+  });
+
+  expect(handoff.hasStopped).toBe(true);
+  expect(handoff.journeyOutcome).toBe("terminal-restart");
+  expect(handoff.savingNotice).toBeNull();
+});
+
+it("maps only typed NOT_FOUND manifest failures to missing", async () => {
+  const notFound = Object.assign(new Error("missing"), { code: "NOT_FOUND" });
+  await expect(
+    recordingManifestLookup(() => Promise.reject(notFound), {
+      sessionId: "recording-1",
+    })
+  ).resolves.toEqual({ kind: "missing" });
+});
+
+it("rethrows manifest transport failures unchanged", async () => {
+  const failure = new Error("deployment unavailable");
+  await expect(
+    recordingManifestLookup(() => Promise.reject(failure), {
+      sessionId: "recording-1",
+    })
+  ).rejects.toBe(failure);
 });

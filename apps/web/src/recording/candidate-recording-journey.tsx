@@ -3,6 +3,7 @@ import { Button } from "@cloudflare/kumo/components/button";
 import { useEffect, useRef } from "react";
 import type {
   RecordingFinalizationResult,
+  RecordingJourneyOutcome,
   RecordingSaveState,
 } from "./live-recording";
 
@@ -15,8 +16,10 @@ export type CandidateRecordingJourneyProps = {
   hasStopped: boolean;
   isReady: boolean;
   isRecording: boolean;
+  journeyOutcome: RecordingJourneyOutcome;
   onInitialize: () => void;
   onRetry: () => void;
+  onResetRecoveredRecording?: () => void;
   onStart: () => void;
   onStop: () => void;
   pendingAction: "initialize" | "retry" | "start" | "stop" | null;
@@ -32,17 +35,26 @@ type JourneyState =
   | "recovered"
   | "recording"
   | "submitting"
-  | "failed"
+  | "manual-retry"
+  | "terminal-restart"
+  | "missing-recovery"
   | "success";
 
 function journeyState(props: CandidateRecordingJourneyProps): JourneyState {
   if (props.finalization?.state === "ready") {
     return "success";
   }
-  if (props.finalization?.state === "failed") {
-    return "failed";
+  if (props.journeyOutcome === "missing-recovery") {
+    return "missing-recovery";
+  }
+  if (props.journeyOutcome === "terminal-restart") {
+    return "terminal-restart";
+  }
+  if (props.journeyOutcome === "manual-retry") {
+    return "manual-retry";
   }
   if (
+    props.journeyOutcome === "automatic-retry" ||
     props.hasStopped ||
     props.finalization?.state === "queued" ||
     props.finalization?.state === "finalizing"
@@ -97,35 +109,33 @@ function CameraStage({ stream }: { stream: MediaStream | null }) {
   );
 }
 
-const saveMessages: Record<Exclude<RecordingSaveState, "healthy">, string> = {
-  error:
-    "Saving needs attention. Keep this tab open and check your connection.",
-  offline:
-    "You’re offline. Keep this tab open; we’ll continue when your connection returns.",
-  retrying: "Saving is delayed. Keep this tab open while we try again.",
-};
-
-function SaveNotice({
-  saveState,
-  savingNotice,
-}: {
-  saveState: RecordingSaveState;
-  savingNotice: string | null;
-}) {
-  if (saveState === "healthy" && !savingNotice) {
+function SaveNotice({ message }: { message: string }) {
+  if (!message) {
     return null;
   }
   return (
     <Banner
       className="mt-6 rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-      description={
-        savingNotice ??
-        (saveState === "healthy" ? undefined : saveMessages[saveState])
-      }
+      description={message}
       size="sm"
       variant="secondary"
     />
   );
+}
+
+function getAsyncSavingMessage(props: CandidateRecordingJourneyProps): string {
+  if (props.journeyOutcome === "manual-retry") {
+    return "Your recording is still here. Check your connection, then try again.";
+  }
+  if (props.journeyOutcome !== "automatic-retry") {
+    return "";
+  }
+  if (props.savingNotice) {
+    return props.savingNotice;
+  }
+  return props.saveState === "offline"
+    ? "Saving will resume when you reconnect."
+    : "Keep this screen open; we’ll keep trying.";
 }
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: explicit finite journey states stay together for review.
@@ -135,6 +145,8 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
   const submissionHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const failureRef = useRef<HTMLHeadingElement | null>(null);
   const previous = useRef({ isReady: props.isReady, state });
+  const asyncSavingMessage =
+    state === "success" ? "" : getAsyncSavingMessage(props);
 
   useEffect(() => {
     const last = previous.current;
@@ -151,7 +163,12 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
       actionRef.current?.focus();
     } else if (last.state === "recording" && state === "submitting") {
       submissionHeadingRef.current?.focus();
-    } else if (last.state === "submitting" && state === "failed") {
+    } else if (
+      (state === "manual-retry" ||
+        state === "missing-recovery" ||
+        state === "terminal-restart") &&
+      last.state !== state
+    ) {
       failureRef.current?.focus();
     }
     previous.current = { isReady: props.isReady, state };
@@ -265,7 +282,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           <span>Recording</span>
         </h2>
         <p className="mt-4 text-gray-600 leading-7">
-          Take your time and speak naturally.
+          Keep this screen open and stay in this browser while you record.
         </p>
         <Button
           className={`${actionClassName} mt-8`}
@@ -299,12 +316,14 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
             ? "Checking and completing your submission"
             : "Waiting to submit"}
         </p>
-        <p className="mt-2 text-gray-600 leading-7">Keep this tab open.</p>
+        <p className="mt-2 text-gray-600 leading-7">
+          Your camera and microphone are off. Keep this screen open until
+          submission is complete.
+        </p>
       </>
     );
-  } else if (state === "failed") {
-    announcement =
-      "Your recording is saved, but we couldn’t finish submitting it.";
+  } else if (state === "manual-retry") {
+    announcement = "Submission needs attention.";
     content = (
       <>
         <h2
@@ -313,12 +332,12 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           ref={failureRef}
           tabIndex={-1}
         >
-          Your recording is saved, but we couldn’t finish submitting it.
+          Submission needs attention
         </h2>
         <div className="mt-6">
           <Banner
             className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-            description="Keep this tab open, then try again."
+            description="Your recording is still here. Check your connection, then try again."
             icon={<span aria-hidden="true">!</span>}
             title="Submission needs attention"
             variant="secondary"
@@ -337,6 +356,82 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
             ? "Trying to submit…"
             : "Try submitting again"}
         </Button>
+      </>
+    );
+  } else if (state === "missing-recovery") {
+    announcement = "This recording can’t be continued.";
+    content = (
+      <>
+        <div role="alert">
+          <h2
+            className="font-semibold text-2xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
+            id="journey-state-heading"
+            ref={failureRef}
+            tabIndex={-1}
+          >
+            This recording can’t be continued
+          </h2>
+          <div className="mt-6">
+            <Banner
+              className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
+              description="We couldn’t find your unfinished recording. It can’t be continued."
+              icon={<span aria-hidden="true">!</span>}
+              title="Recording unavailable"
+              variant="secondary"
+            />
+          </div>
+        </div>
+        {props.onResetRecoveredRecording ? (
+          <Button
+            className={`${actionClassName} mt-6`}
+            disabled={actionsDisabled}
+            onClick={props.onResetRecoveredRecording}
+            ref={actionRef}
+            size="lg"
+            type="button"
+            variant="outline"
+          >
+            Set up a new recording
+          </Button>
+        ) : null}
+      </>
+    );
+  } else if (state === "terminal-restart") {
+    announcement = "This recording couldn’t be saved safely.";
+    content = (
+      <>
+        <div role="alert">
+          <h2
+            className="font-semibold text-2xl leading-tight focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
+            id="journey-state-heading"
+            ref={failureRef}
+            tabIndex={-1}
+          >
+            This recording couldn’t be saved safely
+          </h2>
+          <div className="mt-6">
+            <Banner
+              className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
+              description="Your camera and microphone are off. We couldn’t save this recording safely."
+              icon={<span aria-hidden="true">!</span>}
+              title="Recording needs attention"
+              variant="secondary"
+            />
+          </div>
+        </div>
+        {props.onResetRecoveredRecording ? (
+          <Button
+            className={`${actionClassName} mt-6`}
+            disabled={actionsDisabled}
+            onClick={props.onResetRecoveredRecording}
+            ref={actionRef}
+            size="lg"
+            type="button"
+            variant="outline"
+          >
+            Start a new recording
+          </Button>
+        ) : null}
       </>
     );
   } else {
@@ -367,8 +462,19 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
       <div aria-atomic="true" aria-live="polite" className="sr-only">
         {announcement}
       </div>
+      <div
+        aria-atomic="true"
+        aria-live="polite"
+        className="sr-only"
+        role="status"
+      >
+        {asyncSavingMessage}
+      </div>
       {content}
-      {props.blockingError && state !== "failed" ? (
+      {props.blockingError &&
+      state !== "manual-retry" &&
+      state !== "missing-recovery" &&
+      state !== "terminal-restart" ? (
         <div
           className="mt-6 focus-visible:outline focus-visible:outline-2 focus-visible:outline-black focus-visible:outline-offset-2 forced-colors:outline"
           role="alert"
@@ -384,8 +490,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         </div>
       ) : null}
       <SaveNotice
-        saveState={props.saveState}
-        savingNotice={props.savingNotice}
+        message={state === "manual-retry" ? "" : asyncSavingMessage}
       />
     </aside>
   );

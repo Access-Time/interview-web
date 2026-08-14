@@ -778,7 +778,6 @@ it("does not upload later parts after a terminal predecessor", async () => {
   expect(harnessed.box.snapshot.pendingPartCount).toBe(2);
   harnessed.box.dispose();
 });
-
 it("keeps an ambiguous rejected fetch first in drain order", async () => {
   const harnessed = controlledHarness();
   harnessed.respond

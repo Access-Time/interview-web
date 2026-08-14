@@ -55,7 +55,7 @@ backed by Cloudflare D1 (SQLite) and a private R2 bucket. Standard scripts live 
 - Dev server: `pnpm dev` → serves http://localhost:3001 (Alchemy wires local D1 + R2 bindings).
   Run it in a long-lived tmux/login shell; it is persistent and must not be treated as a
   one-shot command.
-- Tests: `pnpm test` — `node --test` with mocked storage/db (no live services needed).
+- Tests: `pnpm test` — Vitest suites with mocked storage/db (no live services needed); Playwright is available for browser coverage.
 - Build: `pnpm build`. Type-check: `pnpm check-types`.
 - Lint/format: `pnpm check` / `pnpm fix` (Ultracite/Biome). Note: the repo currently has
   a pre-existing lint finding in `packages/env/env.d.ts`; this is not an environment issue.

@@ -89,14 +89,7 @@ export const recordingRouter = {
         const bindings = requireBindings(context);
         const result = await bindings.finalizeRecording(input);
         if (result.status === "queued") {
-          try {
-            await bindings.enqueueFinalization(input.sessionId);
-          } catch (error) {
-            console.error("Failed to enqueue recording finalization", {
-              error,
-              sessionId: input.sessionId,
-            });
-          }
+          await bindings.enqueueFinalization(input.sessionId);
         }
         return result;
       } catch (error) {

@@ -30,16 +30,6 @@ const finalizationQueue = await Queue("finalization", {
   name: "recording-finalizations",
 });
 
-export const web = await TanStackStart("web", {
-  bindings: {
-    CORS_ORIGIN: alchemy.env.CORS_ORIGIN ?? "*",
-    DB: db,
-    FINALIZATION_QUEUE: finalizationQueue,
-    RECORDINGS: recordings,
-  },
-  cwd: "../../apps/web",
-});
-
 const finalizerContainer = await Container("recording-finalizer-container", {
   build: {
     context: "../../packages/finalizer",
@@ -70,7 +60,19 @@ export const finalizer = await Worker("recording-finalizer", {
       settings: { batchSize: 1, maxConcurrency: 1, maxRetries: 5 },
     },
   ],
+  previewSubdomains: false,
   sourceMap: false,
+  url: false,
+});
+
+export const web = await TanStackStart("web", {
+  bindings: {
+    CORS_ORIGIN: alchemy.env.CORS_ORIGIN ?? "*",
+    DB: db,
+    FINALIZER: finalizer,
+    RECORDINGS: recordings,
+  },
+  cwd: "../../apps/web",
 });
 
 console.log(`Web    -> ${web.url}`);

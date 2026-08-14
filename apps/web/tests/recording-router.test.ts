@@ -12,7 +12,10 @@ import type {
 import { createORPCClient } from "@orpc/client";
 import { RPCLink } from "@orpc/client/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { dispatchFinalization } from "@/routes/api/rpc/$";
+
+vi.mock("@interview-web/env/server", () => ({ env: {} }));
 
 const input = {
   recorderMimeType: "video/webm;codecs=opus",
@@ -206,7 +209,7 @@ it("recording.finalize does not enqueue non-queued results", async () => {
   }
 });
 
-it("recording.finalize returns queued when enqueue fails after persistence", async () => {
+it("recording.finalize rejects when enqueue fails after persistence", async () => {
   let persisted = false;
   const { client, enqueueCalls } = setup(
     undefined,
@@ -218,14 +221,40 @@ it("recording.finalize returns queued when enqueue fails after persistence", asy
     undefined,
     () => Promise.reject(new Error("queue unavailable"))
   );
-  expect(
-    await client.recording.finalize({
+  await expect(
+    client.recording.finalize({
       segments: [{ partCount: 1, segmentId: input.segmentId }],
       sessionId: input.sessionId,
     })
-  ).toEqual({ status: "queued" });
+  ).rejects.toThrow();
   expect(persisted).toBe(true);
   expect(enqueueCalls).toEqual([{ sessionId: input.sessionId }]);
+});
+
+it("dispatchFinalization sends the session through the private binding", async () => {
+  const fetch = vi.fn<(request: Request) => Promise<Response>>();
+  fetch.mockResolvedValue(new Response(null, { status: 202 }));
+
+  await dispatchFinalization({ fetch }, "session-1");
+
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const request = fetch.mock.calls[0]?.[0];
+  if (!(request instanceof Request)) {
+    throw new Error("Finalizer dispatch did not receive a Request");
+  }
+  expect(request.method).toBe("POST");
+  expect(new URL(request.url).pathname).toBe("/internal/finalizations");
+  expect(request.headers.get("content-type")).toBe("application/json");
+  expect(await request.json()).toEqual({ sessionId: "session-1" });
+});
+
+it("dispatchFinalization rejects a failed private binding response", async () => {
+  const fetch = vi.fn<(request: Request) => Promise<Response>>();
+  fetch.mockResolvedValue(new Response(null, { status: 503 }));
+
+  await expect(dispatchFinalization({ fetch }, "session-1")).rejects.toThrow(
+    "Finalization dispatch failed"
+  );
 });
 
 for (const [name, errorName, status, code] of [

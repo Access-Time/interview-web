@@ -833,7 +833,6 @@ it("clears incomplete finalization when remote status becomes ready", async () =
   await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
   expect(latest?.hasIncompleteRecordingFinalization).toBe(false);
 });
-
 it("safety-stops before the next normal part would breach the admitted policy", async () => {
   const policy = getRecordingStoragePolicy(128_000, 1_000_000);
   if (!policy) {

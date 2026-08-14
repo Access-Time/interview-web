@@ -114,6 +114,29 @@ export type RecordingJourneyOutcome =
   | "terminal-restart"
   | "missing-recovery";
 
+export type RecordingPreflightState = "idle" | "checking" | "ready" | "blocked";
+export type RecordingDeliveryPhase =
+  | "idle"
+  | "saving"
+  | "offline"
+  | "reconnecting"
+  | "retrying";
+export type RecordingStopReason =
+  | "candidate"
+  | "capacity"
+  | "save-failure"
+  | null;
+
+export interface RecordingStoragePolicy {
+  predictedPartBytes: number;
+  recoveryTargetBytes: number;
+  safetyMarginBytes: number;
+}
+
+export type RecordingPreflightResult =
+  | { policy: RecordingStoragePolicy; state: "ready" }
+  | { state: "blocked" };
+
 const partIdentity = (segmentId: string, sequence: number) =>
   `${segmentId}:${sequence}`;
 
@@ -297,6 +320,7 @@ export interface RecordingRecoveryStore extends PartStore {
   getSession?: (sessionId: string) => Promise<RecordingSession | undefined>;
   listParts?: () => Promise<RecordingPart[]>;
   listSessions?: () => Promise<RecordingSession[]>;
+  probe: () => Promise<void>;
   putPartAndSession?: (
     part: RecordingPart,
     session: RecordingSession
@@ -342,7 +366,92 @@ const MIME_TYPES = [
   "video/mp4",
   "video/webm",
 ];
+const RECORDING_TIMESLICE_MS = 5000;
+const RECOVERY_TARGET_SECONDS = 30 * 60;
+const RECOVERY_SAFETY_MARGIN = 0.25;
+const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
 const RETRY_DELAY = 1000;
+
+export const getRecordingStoragePolicy = (
+  audioBitsPerSecond: number,
+  videoBitsPerSecond: number
+): RecordingStoragePolicy | null => {
+  if (
+    !(
+      Number.isFinite(audioBitsPerSecond) &&
+      audioBitsPerSecond > 0 &&
+      Number.isFinite(videoBitsPerSecond) &&
+      videoBitsPerSecond > 0
+    )
+  ) {
+    return null;
+  }
+  const bitrateBitsPerSecond = audioBitsPerSecond + videoBitsPerSecond;
+
+  const recoveryTargetBytes = Math.ceil(
+    (bitrateBitsPerSecond / 8) * RECOVERY_TARGET_SECONDS
+  );
+  const safetyMarginBytes = Math.ceil(
+    recoveryTargetBytes * RECOVERY_SAFETY_MARGIN
+  );
+
+  return {
+    predictedPartBytes: Math.ceil(
+      (bitrateBitsPerSecond / 8) * (RECORDING_TIMESLICE_MS / 1000)
+    ),
+    recoveryTargetBytes,
+    safetyMarginBytes,
+  };
+};
+
+interface RecordingStoragePreflightDependencies {
+  probe: () => Promise<void>;
+  storage: {
+    estimate: () => Promise<{ quota?: number; usage?: number }>;
+    persist: () => Promise<boolean>;
+    persisted: () => Promise<boolean>;
+  } | null;
+}
+
+export const runRecordingPreflight = async (
+  dependencies: RecordingStoragePreflightDependencies,
+  policy: RecordingStoragePolicy | null
+): Promise<RecordingPreflightResult> => {
+  if (!(policy && dependencies.storage)) {
+    return { state: "blocked" };
+  }
+
+  try {
+    const alreadyPersistent = await dependencies.storage.persisted();
+    if (!(alreadyPersistent || (await dependencies.storage.persist()))) {
+      return { state: "blocked" };
+    }
+
+    const { quota, usage } = await dependencies.storage.estimate();
+    if (!(Number.isFinite(quota) && Number.isFinite(usage))) {
+      return { state: "blocked" };
+    }
+
+    await dependencies.probe();
+    return quota - usage > policy.recoveryTargetBytes + policy.safetyMarginBytes
+      ? { policy, state: "ready" }
+      : { state: "blocked" };
+  } catch {
+    return { state: "blocked" };
+  }
+};
+
+export const wouldBreachRecordingCapacity = (
+  pendingBytes: number,
+  freeBytes: number,
+  policy: RecordingStoragePolicy
+): boolean => {
+  const reservedNextBytes = policy.predictedPartBytes * 2;
+  return (
+    pendingBytes + reservedNextBytes > policy.recoveryTargetBytes ||
+    freeBytes <= reservedNextBytes + policy.safetyMarginBytes
+  );
+};
 const ignorePromise = (promise: Promise<unknown>) => {
   promise.catch(() => undefined);
 };
@@ -449,6 +558,11 @@ function browserStore(): RecordingRecoveryStore {
             request.onerror = () => reject(request.error);
           })
       ),
+    probe: () =>
+      transaction("readwrite", (store) => {
+        store.put({ id: PREFLIGHT_PROBE_KEY });
+        store.delete(PREFLIGHT_PROBE_KEY);
+      }),
     put: (part) =>
       transaction("readwrite", (store) =>
         store.put({ ...part, id: key(part) })

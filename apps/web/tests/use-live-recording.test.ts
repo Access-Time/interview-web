@@ -752,7 +752,7 @@ it("does not start when the IndexedDB probe rejects", async () => {
 
 it("persists the terminal part, drains, then finalizes after a candidate stop", async () => {
   const calls: string[] = [];
-  let resolveTerminalUpload = (_value: Response) => undefined;
+  let resolveTerminalUpload: (value: Response) => void = () => undefined;
   const terminalUpload = {
     promise: new Promise<Response>((resolve) => {
       resolveTerminalUpload = resolve;
@@ -888,7 +888,8 @@ it("treats an IndexedDB write failure as a save failure, not a capacity stop", a
 
 it("reconciles before reconnect drain", async () => {
   const calls: string[] = [];
-  let resolveManifest = (_value: RecordingManifestLookup) => undefined;
+  let resolveManifest: (value: RecordingManifestLookup) => void = () =>
+    undefined;
   const manifestReady = {
     promise: new Promise<RecordingManifestLookup>((resolve) => {
       resolveManifest = resolve;

@@ -29,7 +29,6 @@
     "@interview-web/api": "workspace:*",
     "@interview-web/db": "workspace:*",
     "@cloudflare/kumo": "2.10.0",
-    "@phosphor-icons/react": "2.1.10",
     "@orpc/client": "catalog:",
     "@orpc/openapi": "catalog:",
     "@orpc/server": "catalog:",

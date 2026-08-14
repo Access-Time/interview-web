@@ -313,6 +313,8 @@ it("releases media and stays terminal after a fatal upload", async () => {
     await latest?.start();
   });
   FakeMediaRecorder.last?.emitData("captured");
+  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
+  await waitFor(() => expect(latest?.saveState).toBe("error"));
   let stopPromise: Promise<void> | undefined;
   await act(async () => {
     stopPromise = latest?.stop();
@@ -322,12 +324,20 @@ it("releases media and stays terminal after a fatal upload", async () => {
   expect(latest?.isReady).toBe(false);
   expect(latest?.stream).toBe(null);
   expect(
-    events.filter((event) => event.includes("track-stopped"))
-  ).toHaveLength(2);
-  await waitFor(() => expect(uploadCalls).toBeGreaterThan(0));
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
   await stopPromise;
   expect(latest?.captureEnded).toBe(true);
   expect(latest?.journeyOutcome).toBe("terminal-restart");
+  expect(
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
 });
 
 it("handles duplicate recorder errors with one physical cleanup", async () => {
@@ -361,8 +371,11 @@ it("handles duplicate recorder errors with one physical cleanup", async () => {
   expect(latest?.isReady).toBe(false);
   expect(latest?.stream).toBe(null);
   expect(
-    events.filter((event) => event.includes("track-stopped"))
-  ).toHaveLength(2);
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
   expect(events.filter((event) => event === "capture-ended")).toHaveLength(0);
   await waitFor(() => expect(finalizeCalls).toBe(1));
   await act(async () => {
@@ -371,8 +384,11 @@ it("handles duplicate recorder errors with one physical cleanup", async () => {
   });
   expect(latest?.captureEnded).toBe(true);
   expect(
-    events.filter((event) => event.includes("track-stopped"))
-  ).toHaveLength(2);
+    events.filter((event) => event === "audio-track-stopped")
+  ).toHaveLength(1);
+  expect(
+    events.filter((event) => event === "video-track-stopped")
+  ).toHaveLength(1);
 });
 
 it("durably resets a typed missing recovered recording", async () => {

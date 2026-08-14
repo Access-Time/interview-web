@@ -375,3 +375,46 @@ it("allows reset for terminal recovery with a retained session", async () => {
   expect(storage.sessions.size).toBe(0);
   expect(latest?.canResetRecoveredRecording).toBe(false);
 });
+
+it("does not offer reset for terminal recovery without a complete session", async () => {
+  const storage = installBrowserGlobals();
+  const session = {
+    recorderMimeType: "video/webm",
+    requestedMimeType: "video/webm",
+    segments: [],
+    sessionId: "session-1",
+    status: "recording" as const,
+  };
+  storage.sessions.set(session.sessionId, session);
+  storage.parts.set("session-1:segment:0", {
+    blob: new Blob(["captured"], { type: "video/webm" }),
+    id: "session-1:segment:0",
+    mediaType: "video/webm",
+    segmentId: "segment",
+    sequence: 0,
+    sessionId: "session-1",
+  });
+  manifestLookup = () =>
+    Promise.resolve({
+      kind: "found",
+      manifest: {
+        segments: [
+          {
+            id: "segment",
+            parts: [{ checksum: "conflicting", sequence: 0 }],
+          },
+        ],
+        sessionId: "session-1",
+      },
+    });
+  render(React.createElement(RecordingHost));
+  await waitFor(() => {
+    expect(latest?.journeyOutcome).toBe("terminal-restart");
+  });
+  expect(latest?.canResetRecoveredRecording).toBe(false);
+  await expect(latest?.resetRecoveredRecording()).rejects.toThrow(
+    "cannot be reset"
+  );
+  expect(storage.sessions.size).toBe(1);
+  expect(storage.parts.size).toBe(1);
+});

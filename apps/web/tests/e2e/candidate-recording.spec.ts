@@ -14,6 +14,7 @@ const RECORDING_GUIDANCE =
 const NEW_RECORDING_PATTERN = /start a new recording/i;
 const RETRYABLE_UPLOAD_PATTERN = /upload|saving is delayed|keep trying/i;
 const START_BUTTON_PATTERN = /start/i;
+const START_OR_CONTINUE_PATTERN = /Start recording|Continue recording/;
 const STOP_BUTTON_PATTERN = /stop/i;
 const TRY_AGAIN_PATTERN = /try again/i;
 
@@ -398,17 +399,21 @@ test("waits for delayed recovery before creating a session", async ({
   page,
 }) => {
   const { fixture } = await installRecordingFixture(page);
+  let appendCalls = 0;
+  const { appendRecordingSegment } = fixture;
+  fixture.appendRecordingSegment = (input) => {
+    appendCalls += 1;
+    return appendRecordingSegment(input);
+  };
   const manifest = fixture.deferManifest("missing-recording");
   await page.goto("/");
   await seedMissingRecovery(page);
   await page.reload();
+  await waitForRecordingApp(page);
   await expect.poll(() => fixture.createCallCount()).toBe(0);
-  const enable = page.getByRole("button", {
-    name: "Enable camera and microphone",
-  });
-  await expect(enable).toBeVisible();
-  await enable.click();
-  await expect.poll(() => fixture.createCallCount()).toBe(0);
+  await expect(
+    page.getByRole("button", { name: START_OR_CONTINUE_PATTERN })
+  ).toHaveCount(0);
   expect(await fixture.getRecordingStatus("missing-recording")).toBeNull();
   manifest.resolve({
     createdAt: Date.now(),
@@ -432,6 +437,16 @@ test("waits for delayed recovery before creating a session", async ({
   await expect(
     page.getByRole("button", { name: "Enable camera and microphone" })
   ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Enable camera and microphone" })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Continue recording" })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continue recording" }).click();
+  await expect.poll(() => appendCalls).toBe(1);
+  expect(fixture.createCallCount() + appendCalls).toBe(1);
+  await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
 });
 
 test("deduplicates rapid Start clicks while creation is pending", async ({

@@ -6,17 +6,12 @@ import {
   wouldBreachRecordingCapacity,
 } from "./recording-admission";
 import type {
-  AppendSegmentMutate,
-  CreateRecordingMutate,
-  FinalizeRecordingMutate,
-} from "./recording-mutate";
+  RecordingCommands,
+  RecordingFinalizationState,
+  RecordingManifestLookup,
+} from "./recording-commands";
 
 export type RecordingSaveState = "healthy" | "offline" | "error";
-export type RecordingFinalizationState =
-  | "queued"
-  | "finalizing"
-  | "ready"
-  | "failed";
 export interface RecordingFinalizationStatus {
   status: RecordingFinalizationState;
 }
@@ -102,17 +97,11 @@ export function recordingRemoteAction(
     : "append";
 }
 
-export interface RecordingManifestView {
-  segments: Array<{
-    id: string;
-    parts: Array<{ checksum: string; sequence: number }>;
-  }>;
-  sessionId: string;
-}
-
-export type RecordingManifestLookup =
-  | { kind: "found"; manifest: RecordingManifestView }
-  | { kind: "missing" };
+export type {
+  RecordingFinalizationState,
+  RecordingManifestLookup,
+  RecordingManifestView,
+} from "./recording-commands";
 
 export type RecordingJourneyOutcome =
   | "none"
@@ -569,30 +558,10 @@ export function createLiveRecordingOutbox(
   };
 }
 
-export interface UseLiveRecordingOptions {
-  appendSegment: AppendSegmentMutate;
-  createSession: CreateRecordingMutate;
-  finalizeSession: FinalizeRecordingMutate;
-  getManifest?: (input: {
-    sessionId: string;
-  }) => Promise<RecordingManifestLookup>;
-  manifestLookup?: RecordingManifestLookup;
-  onRequestManifest?: (sessionId: string | null) => void;
-  onRequestStatus?: (sessionId: string | null) => void;
-  status?: RecordingFinalizationState | null;
-}
-
-type LegacyLiveRecordingOptions = Omit<
-  UseLiveRecordingOptions,
-  "getManifest"
-> & {
-  getManifest?: (input: {
-    sessionId: string;
-  }) => Promise<RecordingManifestView | null>;
-};
+export interface UseLiveRecordingOptions extends RecordingCommands {}
 
 export function useLiveRecording(
-  options: UseLiveRecordingOptions | LegacyLiveRecordingOptions
+  options: UseLiveRecordingOptions
 ): UseLiveRecordingResult {
   const outbox = useRef<ReturnType<typeof createLiveRecordingOutbox> | null>(
     null
@@ -728,7 +697,36 @@ export function useLiveRecording(
   };
 
   const requestStatus = (sessionId: string | null) => {
-    options.onRequestStatus?.(sessionId);
+    pollGeneration.current += 1;
+    if (pollTimer.current !== undefined) {
+      clearTimeout(pollTimer.current);
+    }
+    pollTimer.current = undefined;
+    if (!sessionId) {
+      return;
+    }
+    const generation = pollGeneration.current;
+    const poll = async (): Promise<void> => {
+      try {
+        const state = await options.getStatus({ sessionId });
+        if (generation !== pollGeneration.current || state === null) {
+          return;
+        }
+        setFinalizationState({ error: null, state });
+        if (isPendingFinalizationState(state)) {
+          pollTimer.current = setTimeout(poll, 1000);
+        } else if (state === "ready") {
+          await completeReadyFinalization(
+            finalizationInput.current ?? { segments: [], sessionId }
+          );
+        }
+      } catch {
+        if (generation === pollGeneration.current) {
+          pollTimer.current = setTimeout(poll, 1000);
+        }
+      }
+    };
+    ignorePromise(poll());
   };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: lifecycle effect intentionally runs once; mutable refs carry runtime callbacks.
@@ -845,19 +843,10 @@ export function useLiveRecording(
         .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
         .at(0);
       if (stored && navigator.onLine) {
-        if (options.getManifest) {
-          const result = await options.getManifest({
-            sessionId: stored.sessionId,
-          });
-          if (result === null) {
-            throw new Error("Recording manifest lookup unavailable");
-          }
-          await applyRecovery(
-            "kind" in result ? result : { kind: "found", manifest: result }
-          );
-          return;
-        }
-        options.onRequestManifest?.(stored.sessionId);
+        const result = await options.getManifest({
+          sessionId: stored.sessionId,
+        });
+        await applyRecovery(result);
         return;
       }
       await applyRecovery();
@@ -902,7 +891,7 @@ export function useLiveRecording(
       recoveryGeneration.current += 1;
       pollGeneration.current += 1;
       // biome-ignore lint/suspicious/noUnnecessaryConditions: timer refs are populated at runtime.
-      if (pollTimer.current) {
+      if (pollTimer.current !== undefined) {
         clearTimeout(pollTimer.current);
       }
       pollTimer.current = undefined;
@@ -918,29 +907,6 @@ export function useLiveRecording(
       streamRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    if (options.getManifest || !options.manifestLookup) {
-      return;
-    }
-    ignorePromise(
-      Promise.resolve(applyRecoveryRef.current?.(options.manifestLookup))
-    );
-  }, [options.getManifest, options.manifestLookup]);
-
-  const isRemoteReady = options.status === "ready";
-  // biome-ignore lint/correctness/useExhaustiveDependencies: IndexedDB cleanup runs when remote status becomes ready; refs hold the latest session plan.
-  useEffect(() => {
-    if (!isRemoteReady) {
-      return;
-    }
-    const input = finalizationInput.current;
-    if (input === null) {
-      return;
-    }
-    ignorePromise(completeReadyFinalization(input));
-    requestStatus(null);
-  }, [isRemoteReady]);
 
   const createRecorder = (media: MediaStream) => {
     const requested =
@@ -1180,20 +1146,16 @@ export function useLiveRecording(
         setError(null);
       }
     };
-    const failStart = (startError: { message: string }) => {
-      setError(startError.message);
+    const failStart = (startError: unknown) => {
+      setError(
+        startError instanceof Error ? startError.message : String(startError)
+      );
     };
     if (recordingRemoteAction(previous, resumeTail) === "append") {
-      options.appendSegment(remoteMetadata, {
-        onError: failStart,
-        onSuccess: beginCapture,
-      });
+      options.appendSegment(remoteMetadata).then(beginCapture).catch(failStart);
       return;
     }
-    options.createSession(remoteMetadata, {
-      onError: failStart,
-      onSuccess: beginCapture,
-    });
+    options.createSession(remoteMetadata).then(beginCapture).catch(failStart);
   };
   const evaluateCapacityStop = async (policy: RecordingStoragePolicy) => {
     try {
@@ -1378,65 +1340,51 @@ export function useLiveRecording(
     revokeRecoveryReset();
     requestStatus(null);
     setFinalizationState({ error: null, state: "finalizing" });
-    options.finalizeSession(input, {
-      onError: (finalizeError) => {
-        finalizationInFlight.current = false;
-        const retryable =
-          outbox.current?.saveState === "offline" ||
-          isRetryableRecordingFailure(finalizeError);
-        if (retryable) {
-          finalizationAttempted.current = false;
-          setFinalizationState({ error: null, state: "queued" });
-          return;
-        }
-        setFinalizationState({
-          error: finalizeError.message,
-          state: "failed",
-        });
-        setIncompleteFinalization(true);
-        setJourneyOutcome("manual-retry");
-        setError(finalizeError.message);
-      },
-      onSuccess: (result) => {
-        finalizationInFlight.current = false;
-        const state = normalizeFinalizationStatus(result);
-        if (state === null) {
+    ignorePromise(
+      options.finalizeSession(input).then(
+        (result) => {
+          finalizationInFlight.current = false;
+          const state = normalizeFinalizationStatus(result);
+          if (state === null) {
+            setFinalizationState({
+              error: "Invalid finalization status",
+              state: "failed",
+            });
+            setIncompleteFinalization(true);
+            setJourneyOutcome("manual-retry");
+            return;
+          }
+          setFinalizationState({ error: null, state });
+          if (state === "ready") {
+            ignorePromise(completeReadyFinalization(input));
+          } else if (isPendingFinalizationState(state)) {
+            requestStatus(input.sessionId);
+          }
+        },
+        (finalizeError: unknown) => {
+          finalizationInFlight.current = false;
+          const retryable =
+            outbox.current?.saveState === "offline" ||
+            isRetryableRecordingFailure(finalizeError);
+          if (retryable) {
+            finalizationAttempted.current = false;
+            setFinalizationState({ error: null, state: "queued" });
+            return;
+          }
+          const message =
+            finalizeError instanceof Error
+              ? finalizeError.message
+              : String(finalizeError);
           setFinalizationState({
-            error: "Invalid finalization status",
+            error: message,
             state: "failed",
           });
           setIncompleteFinalization(true);
           setJourneyOutcome("manual-retry");
-          return;
+          setError(message);
         }
-        setFinalizationState({ error: null, state });
-        if (state === "ready") {
-          setIncompleteFinalization(false);
-          ignorePromise(
-            (async () => {
-              await outbox.current?.deleteSession(input.sessionId);
-              sealedPlans.current = sealedPlans.current.filter(
-                (plan) => plan.sessionId !== input.sessionId
-              );
-              finalizationInput.current = null;
-              if (
-                !sealedPlans.current.length &&
-                session.current?.status === "recording"
-              ) {
-                setFinalizationState(null);
-              }
-              await submitSealedRef.current?.();
-            })()
-          );
-          return;
-        }
-        if (isPendingFinalizationState(state)) {
-          requestStatus(input.sessionId);
-          return;
-        }
-        requestStatus(null);
-      },
-    });
+      )
+    );
   };
   const retryFinalization = async () => {
     if (finalization?.state !== "failed" || !finalizationInput.current) {
@@ -1469,10 +1417,7 @@ export function useLiveRecording(
     canResetRecoveredRecording,
     captureEnded,
     error,
-    finalization:
-      options.status === undefined || options.status === null
-        ? finalization
-        : { error: null, state: options.status },
+    finalization,
     hasIncompleteRecordingFinalization,
     hasUnsentRecordingMedia,
     initialize,

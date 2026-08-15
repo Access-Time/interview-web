@@ -8,16 +8,12 @@ import {
 import {
   type RecordingFinalizationState,
   type RecordingJourneyOutcome,
-  type RecordingManifestLookup,
-  type RecordingManifestView,
   type RecordingPreflightState,
   type RecordingStopReason,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "@/recording/live-recording";
 import { useRecordingApi } from "@/recording/recording-api";
-import type { ApiErrors } from "@/utils/orpc";
-import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export const Route = createFileRoute("/")({
   component: HomeComponent,
@@ -84,21 +80,6 @@ export function usefulError(error: unknown): CandidateError {
       "Something went wrong with the recording. Keep this page open and try the action again.",
     title: "Recording needs attention",
   };
-}
-
-export function recordingManifestLookup(
-  getManifest: (input: { sessionId: string }) => Promise<RecordingManifestView>,
-  input: { sessionId: string }
-): Promise<RecordingManifestLookup> {
-  return getManifest(input).then(
-    (manifest) => ({ kind: "found", manifest }),
-    (error: ApiErrors["recording"]["getManifest"]) => {
-      if (isRecordingNotFoundError(error)) {
-        return { kind: "missing" };
-      }
-      throw error;
-    }
-  );
 }
 
 function mapDeliveryHandoff(input: {
@@ -266,20 +247,7 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
 }
 
 function HomeComponent() {
-  const [manifestSessionId, setManifestSessionId] = useState<string | null>(
-    null
-  );
-  const [statusSessionId, setStatusSessionId] = useState<string | null>(null);
-  const api = useRecordingApi({ manifestSessionId, statusSessionId });
-  const recording = useLiveRecording({
-    appendSegment: api.appendSegment,
-    createSession: api.createSession,
-    finalizeSession: api.finalizeSession,
-    manifestLookup: api.manifestLookup,
-    onRequestManifest: setManifestSessionId,
-    onRequestStatus: setStatusSessionId,
-    status: api.status,
-  });
+  const recording = useLiveRecording(useRecordingApi());
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
   const handoff = candidateJourneyHandoff({

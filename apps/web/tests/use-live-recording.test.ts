@@ -5,6 +5,7 @@ import {
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "../src/recording/live-recording";
+import type { RecordingCommands } from "../src/recording/recording-commands";
 
 interface Records {
   parts: Map<string, unknown>;
@@ -13,6 +14,41 @@ interface Records {
 let latest: UseLiveRecordingResult | null = null;
 let finalizeFailure = false;
 let finalizeCalls = 0;
+
+const commands = (): RecordingCommands => ({
+  appendSegment: vi.fn().mockResolvedValue(undefined),
+  createSession: vi.fn().mockResolvedValue(undefined),
+  finalizeSession: vi.fn().mockResolvedValue({ status: "ready" }),
+  getManifest: vi.fn().mockResolvedValue({ kind: "missing" }),
+  getStatus: vi.fn().mockResolvedValue(null),
+});
+
+it("exposes awaitable recording commands", async () => {
+  const host = commands();
+  await expect(
+    host.appendSegment({
+      recorderMimeType: null,
+      requestedMimeType: null,
+      segmentId: "segment",
+      sessionId: "session",
+    })
+  ).resolves.toBeUndefined();
+  await expect(
+    host.createSession({
+      recorderMimeType: null,
+      requestedMimeType: null,
+      segmentId: "segment",
+      sessionId: "session",
+    })
+  ).resolves.toBeUndefined();
+  await expect(
+    host.finalizeSession({ segments: [], sessionId: "session" })
+  ).resolves.toEqual({ status: "ready" });
+  await expect(host.getManifest({ sessionId: "session" })).resolves.toEqual({
+    kind: "missing",
+  });
+  await expect(host.getStatus({ sessionId: "session" })).resolves.toBeNull();
+});
 
 function installIndexedDb(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
   const records: Records = { parts: new Map(), sessions: new Map() };
@@ -136,20 +172,16 @@ function mount(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
     configurable: true,
     value: vi.fn(async () => new Response(null, { status: 204 })),
   });
-  const finalizeSession = vi.fn((_input, callbacks) => {
+  const recordingCommands = commands();
+  recordingCommands.finalizeSession = vi.fn(() => {
     finalizeCalls += 1;
     if (finalizeFailure) {
-      callbacks.onError(new Error("finalization unavailable"));
-      return;
+      throw new Error("finalization unavailable");
     }
-    callbacks.onSuccess({ status: "ready" });
+    return Promise.resolve({ status: "ready" });
   });
   function Host() {
-    latest = useLiveRecording({
-      appendSegment: (_input, callbacks) => callbacks.onSuccess(undefined),
-      createSession: (_input, callbacks) => callbacks.onSuccess(undefined),
-      finalizeSession,
-    });
+    latest = useLiveRecording(recordingCommands);
     return null;
   }
   render(React.createElement(Host));
@@ -172,11 +204,7 @@ it("reports a preflight access error without delivery state", async () => {
     },
   });
   function Host() {
-    latest = useLiveRecording({
-      appendSegment: vi.fn(),
-      createSession: vi.fn(),
-      finalizeSession: vi.fn(),
-    });
+    latest = useLiveRecording(commands());
     return null;
   }
   render(React.createElement(Host));

@@ -763,6 +763,22 @@ it("retains local bytes after a non-retryable 409", async () => {
   harnessed.box.dispose();
 });
 
+it("does not upload later parts after a terminal predecessor", async () => {
+  const harnessed = controlledHarness();
+  harnessed.respond
+    .mockResolvedValueOnce(new Response(null, { status: 409 }))
+    .mockResolvedValue(new Response(null, { status: 201 }));
+  await harnessed.box.add(sequencedPart(0, { blob: new Blob(["first"]) }));
+  await expect(harnessed.box.drain()).rejects.toThrow(UPLOAD_ERROR);
+  await harnessed.box.add(sequencedPart(1, { blob: new Blob(["second"]) }));
+  await expect(harnessed.box.drain()).rejects.toThrow(UPLOAD_ERROR);
+  expect(harnessed.calls).toHaveLength(1);
+  expect(harnessed.calls[0]?.url).toContain("/parts/0");
+  expect(harnessed.deleted).toHaveLength(0);
+  expect(harnessed.box.snapshot.pendingPartCount).toBe(2);
+  harnessed.box.dispose();
+});
+
 it("keeps an ambiguous rejected fetch first in drain order", async () => {
   const harnessed = controlledHarness();
   harnessed.respond

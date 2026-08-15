@@ -673,10 +673,9 @@ export function createLiveRecordingOutbox(
     emit();
   };
   const getNextOrderedPart = () => {
-    const candidates = [...pending.values()].filter((item) => {
-      const partKey = getPartKey(item);
-      return partKey !== inFlightPartKey && !terminal.has(partKey);
-    });
+    const candidates = [...pending.values()].filter(
+      (item) => getPartKey(item) !== inFlightPartKey
+    );
     if (candidates.length === 0) {
       return;
     }
@@ -696,7 +695,11 @@ export function createLiveRecordingOutbox(
       }
       return left.sequence - right.sequence;
     });
-    return candidates[0];
+    const [nextPart] = candidates;
+    if (!nextPart || terminal.has(getPartKey(nextPart))) {
+      return;
+    }
+    return nextPart;
   };
   const recordFailure = (
     partKey: string,

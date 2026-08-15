@@ -65,7 +65,10 @@ function journeyState(props: CandidateRecordingJourneyProps): JourneyState {
   if (props.journeyOutcome === "terminal-restart") {
     return "terminal-restart";
   }
-  if (props.journeyOutcome === "manual-retry") {
+  if (
+    props.journeyOutcome === "manual-retry" ||
+    props.finalization?.state === "failed"
+  ) {
     return "manual-retry";
   }
   if (

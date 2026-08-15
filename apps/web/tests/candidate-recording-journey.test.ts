@@ -22,6 +22,7 @@ const IMPLEMENTATION_LANGUAGE_PATTERN =
   /\b(session|raw|storage|server|segment|part|queue|acknowledged|finalization|retrieve)\b/i;
 const START_BUTTON_PATTERN = /start/i;
 const TRY_AGAIN_PATTERN = /try again/i;
+const RETRY_SUBMIT_PATTERN = /try submitting again/i;
 const IMPLEMENTATION_TERM_PATTERN = /\b(part|queue|IndexedDB|quota)\b/i;
 
 const baseProps: CandidateRecordingJourneyProps = {
@@ -746,6 +747,19 @@ it("alerts on finalization failure", () => {
   });
   expect(
     screen.getByText(RECORDING_DELIVERY_COPY.finalizationFailure)
+  ).toBeTruthy();
+});
+
+it("treats a failed finalization as a retryable alert even without a journey outcome", () => {
+  renderJourney({
+    finalization: { error: "hidden", state: "failed" },
+    hasStopped: true,
+  });
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.finalizationFailure
+  );
+  expect(
+    screen.getByRole("button", { name: RETRY_SUBMIT_PATTERN })
   ).toBeTruthy();
 });
 

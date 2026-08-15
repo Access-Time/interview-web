@@ -17,6 +17,8 @@ const RETRYABLE_UPLOAD_PATTERN = /upload|saving is delayed|keep trying/i;
 const START_BUTTON_PATTERN = /start/i;
 const STOP_BUTTON_PATTERN = /stop/i;
 const TRY_AGAIN_PATTERN = /try again/i;
+const RESUME_SAVING_PATTERN =
+  /Connection restored\. Saving your recording\.|Your recording is being saved\./;
 
 async function installCandidateMedia(page: Page) {
   await page.addInitScript(() => {
@@ -254,9 +256,12 @@ test("queued finalization reaches completion when it becomes ready", async ({
     "Your recording is saved. We’re completing it now."
   );
   fixture.markAllReady();
-  await expect(page.getByRole("status")).toHaveText(
-    "Your recording is saved. We’re completing it now."
-  );
+  await expect(
+    page.getByRole("heading", { name: "Submission complete." })
+  ).toBeVisible();
+  await expect(
+    page.getByText("Your recording is saved. We’re completing it now.")
+  ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: NEW_RECORDING_PATTERN })
   ).toHaveCount(0);
@@ -316,9 +321,7 @@ test("keeps recording offline and resumes saving after reconnect", async ({
     page.getByRole("button", { name: STOP_BUTTON_PATTERN })
   ).toBeVisible();
   await reconnectRecordingFixture(page, upload);
-  await expect(page.getByRole("status")).toHaveText(
-    "Connection restored. Saving your recording."
-  );
+  await expect(page.getByRole("status")).toHaveText(RESUME_SAVING_PATTERN);
 });
 
 test("shows finishing copy while durable parts drain after Stop", async ({
@@ -347,9 +350,12 @@ test("shows completion pending until finalization is ready", async ({
     "Your recording is saved. We’re completing it now."
   );
   fixture.markAllReady();
-  await expect(page.getByRole("status")).toHaveText(
-    "Your recording is saved. We’re completing it now."
-  );
+  await expect(
+    page.getByRole("heading", { name: "Submission complete." })
+  ).toBeVisible();
+  await expect(
+    page.getByText("Your recording is saved. We’re completing it now.")
+  ).toHaveCount(0);
 });
 
 test("a local save failure turns hardware off without a misleading retry", async ({
@@ -388,10 +394,17 @@ test("capacity safety-stop stays a status and still completes", async ({
     "We stopped recording to protect your saved recording. Finishing it now."
   );
   await expect(page.getByRole("alert")).toHaveCount(0);
-  fixture.markAllReady();
-  await expect(page.getByRole("status")).toHaveText(
-    "We stopped recording to protect your saved recording. Finishing it now."
-  );
+  await expect(async () => {
+    fixture.markAllReady();
+    await expect(
+      page.getByRole("heading", { name: "Submission complete." })
+    ).toBeVisible({ timeout: 500 });
+  }).toPass({ timeout: 8000 });
+  await expect(
+    page.getByText(
+      "We stopped recording to protect your saved recording. Finishing it now."
+    )
+  ).toHaveCount(0);
 });
 
 test("keeps a single status region on desktop and mobile", async ({ page }) => {

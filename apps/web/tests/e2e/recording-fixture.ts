@@ -159,6 +159,7 @@ export async function installRecordingApi(
   uploadStatus = 204,
   upload?: { mode: UploadMode }
 ) {
+  heldUploads.length = 0;
   const handler = new RPCHandler({
     recording: createCandidateRecordingRouter(fixture),
   });
@@ -211,6 +212,7 @@ export async function installRecordingApi(
       }
     }
     if (mode === "offline") {
+      heldUploads.push(route);
       return;
     }
     if (mode === "retryable") {
@@ -243,6 +245,8 @@ export interface RecordingFixtureOptions {
 type UploadMode = NonNullable<
   NonNullable<RecordingFixtureOptions["upload"]>["mode"]
 >;
+
+const heldUploads: Array<{ abort: (errorCode?: string) => Promise<void> }> = [];
 
 const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
 
@@ -351,6 +355,13 @@ export async function installRecordingFixture(
   if (options.finalization === "failed") {
     fixture.bindings.finalizeRecording = () =>
       Promise.reject(new Error("finalization unavailable"));
+  } else if (options.finalization === "ready") {
+    const finalize = fixture.bindings.finalizeRecording;
+    fixture.bindings.finalizeRecording = async (input) => {
+      await finalize(input);
+      fixture.markAllReady();
+      return { status: "ready" };
+    };
   }
   const upload = createUploadController(options.upload?.mode ?? "success");
   let uploadStatus = 204;
@@ -368,6 +379,9 @@ export async function reconnectRecordingFixture(
   upload?: { setMode: (mode: UploadMode) => void }
 ) {
   upload?.setMode("success");
+  await Promise.all(
+    heldUploads.splice(0).map((route) => route.abort("internetdisconnected"))
+  );
   await page.evaluate(() => {
     window.dispatchEvent(new Event("online"));
   });

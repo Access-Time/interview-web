@@ -218,23 +218,41 @@ it("recording.finalize does not enqueue non-queued results", async () => {
   }
 });
 
-it("recording.finalize rejects when enqueue fails after persistence", async () => {
+it("recording.finalize acknowledges queued persistence when enqueue fails", async () => {
   let persisted = false;
   const client = createClient();
+  const error = new Error("queue unavailable");
+  const consoleError = vi
+    .spyOn(console, "error")
+    .mockImplementation(() => undefined);
   vi.mocked(finalizeRecording).mockImplementation(() => {
     persisted = true;
     return Promise.resolve({ status: "queued" as const });
   });
-  finalizerFetch.mockResolvedValue(new Response(null, { status: 503 }));
+  finalizerFetch.mockRejectedValue(error);
 
-  await expect(
-    client.recording.finalize({
-      segments: [{ partCount: 1, segmentId: input.segmentId }],
+  try {
+    await expect(
+      client.recording.finalize({
+        segments: [{ partCount: 1, segmentId: input.segmentId }],
+        sessionId: input.sessionId,
+      })
+    ).resolves.toEqual({ status: "queued" });
+    expect(persisted).toBe(true);
+    expect(finalizerFetch).toHaveBeenCalledTimes(1);
+    expect(new URL(finalizerFetch.mock.calls[0]?.[0].url).pathname).toBe(
+      "/internal/finalizations"
+    );
+    expect(await finalizerFetch.mock.calls[0]?.[0].json()).toEqual({
       sessionId: input.sessionId,
-    })
-  ).rejects.toThrow();
-  expect(persisted).toBe(true);
-  expect(finalizerFetch).toHaveBeenCalledTimes(1);
+    });
+    expect(consoleError).toHaveBeenCalledWith(
+      "Recording finalization dispatch failed",
+      { error, sessionId: input.sessionId }
+    );
+  } finally {
+    consoleError.mockRestore();
+  }
 });
 
 it("dispatchFinalization sends the session through the private binding", async () => {

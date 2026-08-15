@@ -17,12 +17,14 @@ vi.mock("@interview-web/db", () => ({
 }));
 
 import { getContainer } from "@cloudflare/containers";
-import {
+import { listRecordingsForFinalization } from "@interview-web/db";
+import worker, {
   dispatchFinalizationRequest,
   type FinalizerEnv,
   getFinalizerContainer,
   isExactFinalizerOutput,
   outputMediaType,
+  reconciliationBatch,
   validateFinalizePlan,
   validateManifest,
 } from "../src/worker.ts";
@@ -90,6 +92,27 @@ describe("dispatchFinalizationRequest", () => {
 
     expect(response.status).toBe(503);
   });
+});
+
+it("scheduled reconciliation enqueues every mapped session in order", async () => {
+  const sessions = ["session-1", "session-2", "session-3"];
+  const send = vi.fn().mockResolvedValue(undefined);
+  const env = {
+    DB: {},
+    FINALIZATION_QUEUE: { send },
+  } as unknown as FinalizerEnv;
+  vi.mocked(listRecordingsForFinalization).mockResolvedValue(sessions);
+
+  expect(await reconciliationBatch({} as never)).toEqual(
+    sessions.map((sessionId) => ({ sessionId }))
+  );
+
+  await worker.scheduled({} as ScheduledEvent, env);
+
+  expect(send).toHaveBeenCalledTimes(sessions.length);
+  expect(send.mock.calls.map(([message]) => message)).toEqual(
+    sessions.map((sessionId) => ({ sessionId }))
+  );
 });
 
 it("reuses one finalizer container instead of naming one per attempt", () => {

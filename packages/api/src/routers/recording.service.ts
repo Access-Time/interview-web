@@ -93,12 +93,9 @@ export const finalizeSession = async (
 ): Promise<
   ServiceResult<RecordingFinalizeResult, FinalizeRecordingServiceError>
 > => {
+  let result: RecordingFinalizeResult;
   try {
-    const result = await finalizeRecording(context.db, input);
-    if (result.status === "queued") {
-      await dispatchFinalization(context.finalizer, input.sessionId);
-    }
-    return ok(result);
+    result = await finalizeRecording(context.db, input);
   } catch (error) {
     if (
       error instanceof RecordingNotFoundError ||
@@ -121,6 +118,17 @@ export const finalizeSession = async (
     }
     throw error;
   }
+  if (result.status === "queued") {
+    try {
+      await dispatchFinalization(context.finalizer, input.sessionId);
+    } catch (error) {
+      console.error("Recording finalization dispatch failed", {
+        error,
+        sessionId: input.sessionId,
+      });
+    }
+  }
+  return ok(result);
 };
 
 export const getManifest = async (

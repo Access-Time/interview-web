@@ -990,6 +990,8 @@ export function useLiveRecording(
       policy
     );
     if (lifecycle.current === true) {
+      preparedRecorderRef.current = null;
+      recordingPolicyRef.current = null;
       return;
     }
     if (result.state === "blocked") {
@@ -1056,6 +1058,11 @@ export function useLiveRecording(
       throw new Error("Recording is not initialized");
     }
     await prepareRecording();
+    if (lifecycle.current === true) {
+      preparedRecorderRef.current = null;
+      recordingPolicyRef.current = null;
+      return;
+    }
     // biome-ignore lint/suspicious/noUnnecessaryConditions: preflight mutates these refs asynchronously.
     if (!(preparedRecorderRef.current && recordingPolicyRef.current)) {
       return;

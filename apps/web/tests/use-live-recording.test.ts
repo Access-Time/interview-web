@@ -27,6 +27,7 @@ let storageEstimateOverride:
 let cleanupPromise: Promise<void> | null = null;
 let mediaOverride: (() => Promise<MediaStream>) | null = null;
 let lastCommands: RecordingCommands | null = null;
+let unmountHook: (() => void) | null = null;
 let finalizeCalls = 0;
 let statusCalls = 0;
 
@@ -252,7 +253,8 @@ function mount(
     latest = useLiveRecording(recordingCommands);
     return null;
   }
-  render(React.createElement(Host));
+  const rendered = render(React.createElement(Host));
+  unmountHook = rendered.unmount;
   return records;
 }
 
@@ -271,6 +273,7 @@ afterEach(() => {
   cleanupPromise = null;
   mediaOverride = null;
   lastCommands = null;
+  unmountHook = null;
 });
 
 it("reports a preflight access error without delivery state", async () => {
@@ -424,6 +427,34 @@ it("blocks a fresh preflight without remote creation or recorder start", async (
   await act(async () => latest?.initialize());
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("blocked"));
   await act(async () => latest?.start());
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
+  expect(FakeMediaRecorder.starts).toBe(0);
+});
+
+it("fails closed when unmount interrupts a fresh Start preflight", async () => {
+  const pendingEstimate = deferred<{ quota?: number; usage?: number }>();
+  let estimateCalls = 0;
+  storageEstimateOverride = () => {
+    estimateCalls += 1;
+    return estimateCalls === 1
+      ? Promise.resolve({ quota: 1_000_000_000, usage: 10 })
+      : pendingEstimate.promise;
+  };
+  const records = mount();
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  let start: Promise<void> | undefined;
+  act(() => {
+    start = latest?.start();
+  });
+  await waitFor(() => expect(estimateCalls).toBe(2));
+  await act(async () => {
+    unmountHook?.();
+    pendingEstimate.resolve({ quota: 1, usage: 1 });
+    await start;
+  });
+  expect(records.sessions.size).toBe(0);
   expect(lastCommands?.createSession).not.toHaveBeenCalled();
   expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
   expect(FakeMediaRecorder.starts).toBe(0);

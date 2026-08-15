@@ -2,11 +2,11 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { afterEach, expect, it, vi } from "vitest";
 import {
-  getRecordingStoragePolicy,
   type RecordingManifestLookup,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "../src/recording/live-recording.ts";
+import { getRecordingStoragePolicy } from "../src/recording/recording-admission.ts";
 
 const originalDescriptors = new Map<string, PropertyDescriptor | undefined>();
 const NodeEvent = Event;

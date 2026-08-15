@@ -11,13 +11,6 @@ import type {
   FinalizeRecordingMutate,
 } from "./recording-mutate";
 
-// biome-ignore lint/performance/noBarrelFile: preserve the existing public test import surface during extraction.
-export {
-  getRecordingStoragePolicy,
-  runRecordingPreflight,
-  wouldBreachRecordingCapacity,
-} from "./recording-admission";
-
 import { useRecordingStore } from "./recording-store";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";

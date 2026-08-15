@@ -18,6 +18,25 @@ const isFinitePositive = (value: unknown): value is number =>
 const isFiniteNonNegative = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value) && value >= 0;
 
+const policyThresholds = (policy: RecordingStoragePolicy | null) => {
+  if (
+    !(
+      policy &&
+      isFinitePositive(policy.predictedPartBytes) &&
+      isFinitePositive(policy.recoveryTargetBytes) &&
+      isFiniteNonNegative(policy.safetyMarginBytes)
+    )
+  ) {
+    return null;
+  }
+  const threshold = policy.recoveryTargetBytes + policy.safetyMarginBytes;
+  const reserved = policy.predictedPartBytes * 2 + policy.safetyMarginBytes;
+  if (!(isFinitePositive(threshold) && isFinitePositive(reserved))) {
+    return null;
+  }
+  return { reserved, threshold };
+};
+
 export const getRecordingStoragePolicy = (
   audioBitsPerSecond: number,
   videoBitsPerSecond: number
@@ -52,6 +71,15 @@ export const getRecordingStoragePolicy = (
   ) {
     return null;
   }
+  if (
+    !policyThresholds({
+      predictedPartBytes,
+      recoveryTargetBytes,
+      safetyMarginBytes,
+    })
+  ) {
+    return null;
+  }
   return { predictedPartBytes, recoveryTargetBytes, safetyMarginBytes };
 };
 
@@ -68,7 +96,8 @@ export const runRecordingPreflight = async (
   dependencies: RecordingStoragePreflightDependencies,
   policy: RecordingStoragePolicy | null
 ): Promise<RecordingPreflightResult> => {
-  if (!(policy && dependencies.storage)) {
+  const thresholds = policyThresholds(policy);
+  if (!(thresholds && policy && dependencies.storage)) {
     return { state: "blocked" };
   }
   try {
@@ -85,7 +114,7 @@ export const runRecordingPreflight = async (
     }
     const freeBytes = quota - usage;
     await dependencies.probe();
-    return freeBytes > policy.recoveryTargetBytes + policy.safetyMarginBytes
+    return freeBytes > thresholds.threshold
       ? { policy, state: "ready" }
       : { state: "blocked" };
   } catch {
@@ -107,20 +136,13 @@ export const wouldBreachRecordingCapacity = (
   ) {
     return true;
   }
-  const { predictedPartBytes, recoveryTargetBytes, safetyMarginBytes } = policy;
-  if (
-    !(
-      isFinitePositive(predictedPartBytes) &&
-      isFinitePositive(recoveryTargetBytes) &&
-      isFiniteNonNegative(safetyMarginBytes)
-    )
-  ) {
+  const thresholds = policyThresholds(policy);
+  if (!(policy && thresholds)) {
     return true;
   }
-  const reserved = predictedPartBytes * 2 + safetyMarginBytes;
   return (
-    !isFinitePositive(reserved) ||
-    persistedBytes + reserved > recoveryTargetBytes ||
-    freeBytes <= reserved
+    !isFiniteNonNegative(persistedBytes + thresholds.reserved) ||
+    persistedBytes + thresholds.reserved > policy.recoveryTargetBytes ||
+    freeBytes <= thresholds.reserved
   );
 };

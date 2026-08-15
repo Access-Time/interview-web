@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 import {
   createLiveRecordingOutbox,
+  getRecordingStoragePolicy,
   integrityMessage,
   isRetryableRecordingFailure,
   type RecordingManifestView,
@@ -9,6 +10,8 @@ import {
   reconcileRecordingParts,
   recordingIntentMetadata,
   recordingRemoteAction,
+  runRecordingPreflight,
+  wouldBreachRecordingCapacity,
 } from "../src/recording/live-recording.ts";
 
 const part: RecordingPart = {
@@ -99,6 +102,7 @@ function recoveryHarness(
       Promise.resolve(sessions.find((item) => item.sessionId === sessionId)),
     listParts: () => Promise.resolve([...stored]),
     listSessions: () => Promise.resolve([...sessions]),
+    probe: () => Promise.resolve(),
     put: (value: RecordingPart) => {
       stored.push(value);
       return Promise.resolve();
@@ -148,6 +152,7 @@ function harness(
       return Promise.resolve();
     },
     discardSession: () => Promise.resolve(),
+    probe: () => Promise.resolve(),
     put: (value: RecordingPart) => {
       events.push("persist");
       stored.push(value);
@@ -173,6 +178,169 @@ function harness(
     stored,
   };
 }
+
+function admittedPolicy() {
+  const policy = getRecordingStoragePolicy(128_000, 1_000_000);
+  if (!policy) {
+    throw new Error("expected a usable recording storage policy");
+  }
+  return policy;
+}
+
+function preflightDependencies(overrides?: {
+  estimate?: { usage?: number; quota?: number };
+  persist?: boolean;
+  persisted?: boolean;
+  probe?: () => Promise<void>;
+  storage?: null;
+}) {
+  return {
+    probe: overrides?.probe ?? (() => Promise.resolve()),
+    storage:
+      overrides?.storage === null
+        ? null
+        : {
+            estimate: () =>
+              Promise.resolve(
+                overrides?.estimate ?? { quota: 1_000_000_000, usage: 10 }
+              ),
+            persist: () => Promise.resolve(overrides?.persist ?? true),
+            persisted: () => Promise.resolve(overrides?.persisted ?? true),
+          },
+  };
+}
+
+it("calculates a 30-minute target, margin, and five-second part prediction", () => {
+  expect(getRecordingStoragePolicy(128_000, 1_000_000)).toEqual({
+    predictedPartBytes: 705_000,
+    recoveryTargetBytes: 253_800_000,
+    safetyMarginBytes: 63_450_000,
+  });
+});
+
+it.each([
+  [0, 1_000_000],
+  [Number.NaN, 1_000_000],
+  [128_000, Number.POSITIVE_INFINITY],
+])("rejects an unusable recorder bitrate", (audio, video) => {
+  expect(getRecordingStoragePolicy(audio, video)).toBeNull();
+});
+
+it("blocks preflight when persistence is denied", async () => {
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({ persist: false, persisted: false }),
+      getRecordingStoragePolicy(128_000, 1_000_000)
+    )
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it("blocks preflight when storage is absent", async () => {
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({ storage: null }),
+      getRecordingStoragePolicy(128_000, 1_000_000)
+    )
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it.each([
+  { quota: Number.NaN, usage: 10 },
+  { quota: 1_000_000_000, usage: Number.POSITIVE_INFINITY },
+  { quota: undefined, usage: 10 },
+  { quota: 1_000_000_000, usage: undefined },
+])("blocks preflight when the estimate is not finite", async (estimate) => {
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({ estimate }),
+      getRecordingStoragePolicy(128_000, 1_000_000)
+    )
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it("blocks preflight when the IndexedDB probe rejects", async () => {
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({
+        probe: () => Promise.reject(new Error("probe failed")),
+      }),
+      getRecordingStoragePolicy(128_000, 1_000_000)
+    )
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it("blocks preflight when free bytes equal the required target plus margin", async () => {
+  const policy = admittedPolicy();
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({
+        estimate: {
+          quota: policy.recoveryTargetBytes + policy.safetyMarginBytes,
+          usage: 0,
+        },
+      }),
+      policy
+    )
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it("is ready only when free bytes are strictly greater and the probe completes", async () => {
+  const policy = admittedPolicy();
+  await expect(
+    runRecordingPreflight(
+      preflightDependencies({
+        estimate: {
+          quota: policy.recoveryTargetBytes + policy.safetyMarginBytes + 1,
+          usage: 0,
+        },
+      }),
+      policy
+    )
+  ).resolves.toEqual({ policy, state: "ready" });
+});
+
+it("blocks preflight when the policy is unusable", async () => {
+  await expect(
+    runRecordingPreflight(preflightDependencies(), null)
+  ).resolves.toEqual({ state: "blocked" });
+});
+
+it("stops before a pending-media target breach", () => {
+  const policy = admittedPolicy();
+  expect(
+    wouldBreachRecordingCapacity(
+      policy.recoveryTargetBytes - policy.predictedPartBytes * 2 + 1,
+      Number.POSITIVE_INFINITY,
+      policy
+    )
+  ).toBe(true);
+  expect(
+    wouldBreachRecordingCapacity(
+      policy.recoveryTargetBytes - policy.predictedPartBytes * 2,
+      Number.POSITIVE_INFINITY,
+      policy
+    )
+  ).toBe(false);
+});
+
+it("stops before remaining free space cannot hold the reserved parts", () => {
+  const policy = admittedPolicy();
+  const reservedNextBytes = policy.predictedPartBytes * 2;
+  expect(
+    wouldBreachRecordingCapacity(
+      0,
+      reservedNextBytes + policy.safetyMarginBytes,
+      policy
+    )
+  ).toBe(true);
+  expect(
+    wouldBreachRecordingCapacity(
+      0,
+      reservedNextBytes + policy.safetyMarginBytes + 1,
+      policy
+    )
+  ).toBe(false);
+});
 
 it("persists before PUT and deletes only after a 2xx response", async () => {
   const harnessed = harness();
@@ -201,6 +369,7 @@ it("network failures are classified retryable and report retrying", async () => 
     {
       delete: () => Promise.resolve(),
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: () => Promise.resolve(),
     },
     () => {
@@ -248,6 +417,7 @@ it("a successful part does not clear retrying for another failed part", async ()
         return Promise.resolve();
       },
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: (value) => {
         stored.push(value);
         return Promise.resolve();
@@ -290,6 +460,7 @@ it("dispose prevents retry after an in-flight retryable failure", async () => {
   const store = {
     delete: () => Promise.resolve(),
     discardSession: () => Promise.resolve(),
+    probe: () => Promise.resolve(),
     put: () => Promise.resolve(),
   };
   const box = createLiveRecordingOutbox(store, () => {
@@ -318,6 +489,7 @@ it("persistence failures reject and never request", async () => {
     {
       delete: () => Promise.resolve(),
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: () => {
         throw new Error("storage unavailable");
       },
@@ -338,6 +510,7 @@ it("terminal upload failure is retained and does not retry when online", async (
     {
       delete: () => Promise.resolve(),
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: () => Promise.resolve(),
     },
     async () => {
@@ -372,6 +545,7 @@ it("drain rejects terminal failures", async () => {
     {
       delete: () => Promise.resolve(),
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: () => Promise.resolve(),
     },
     async () => new Response(null, { status: 409 })
@@ -447,6 +621,7 @@ it("keeps orphan parts without fabricating session metadata", async () => {
       discardSession: () => Promise.resolve(),
       listParts: () => Promise.resolve(parts),
       listSessions: () => Promise.resolve(sessions),
+      probe: () => Promise.resolve(),
       put: () => Promise.resolve(),
       putSession: (value) => {
         sessions.push(value);
@@ -467,6 +642,7 @@ it("savePartAndSession reports durable persistence failure", async () => {
     {
       delete: () => Promise.resolve(),
       discardSession: () => Promise.resolve(),
+      probe: () => Promise.resolve(),
       put: () => Promise.resolve(),
       putPartAndSession: () => Promise.reject(new Error("storage unavailable")),
     },

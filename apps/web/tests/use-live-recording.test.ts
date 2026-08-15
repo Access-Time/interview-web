@@ -752,13 +752,13 @@ it("does not start when the IndexedDB probe rejects", async () => {
 
 it("persists the terminal part, drains, then finalizes after a candidate stop", async () => {
   const calls: string[] = [];
+  let resolveTerminalUpload: (value: Response) => void = () => undefined;
   const terminalUpload = {
-    promise: Promise.resolve(new Response(null, { status: 204 })),
-    resolve: (_value: Response) => undefined,
+    promise: new Promise<Response>((resolve) => {
+      resolveTerminalUpload = resolve;
+    }),
+    resolve: (value: Response) => resolveTerminalUpload(value),
   };
-  terminalUpload.promise = new Promise((resolve) => {
-    terminalUpload.resolve = resolve;
-  });
   mountAdmittedHost({
     fetch: async (input) => {
       const url = input.toString();
@@ -888,19 +888,14 @@ it("treats an IndexedDB write failure as a save failure, not a capacity stop", a
 
 it("reconciles before reconnect drain", async () => {
   const calls: string[] = [];
+  let resolveManifest: (value: RecordingManifestLookup) => void = () =>
+    undefined;
   const manifestReady = {
-    promise: Promise.resolve({
-      kind: "found" as const,
-      manifest: {
-        segments: [{ id: "segment", parts: [] }],
-        sessionId: "held",
-      },
+    promise: new Promise<RecordingManifestLookup>((resolve) => {
+      resolveManifest = resolve;
     }),
-    resolve: (_value: RecordingManifestLookup) => undefined,
+    resolve: (value: RecordingManifestLookup) => resolveManifest(value),
   };
-  manifestReady.promise = new Promise((resolve) => {
-    manifestReady.resolve = resolve;
-  });
   manifestLookup = () => manifestReady.promise;
   mountAdmittedHost({
     fetch: async (input) => {

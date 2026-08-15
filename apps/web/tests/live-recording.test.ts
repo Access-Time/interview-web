@@ -507,16 +507,14 @@ it("reconcile drops matching acknowledgements and keeps missing parts", async ()
 it("reload recovers acknowledged parts without duplicating uploads", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([
-        { sequence: 0 },
-        { sequence: 1 },
-        { sequence: 2 },
-      ]),
-    })
-  );
+  const recovery = await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { sequence: 2 },
+    ]),
+  });
   expect(recovery.recovered).toBe(true);
   expect(recovery.integrity).toBe("ok");
   expect(harnessed.calls.length).toBe(1);
@@ -526,25 +524,22 @@ it("reload recovers acknowledged parts without duplicating uploads", async () =>
   harnessed.box.dispose();
 });
 
-it("retains local recovery when manifest lookup fails", async () => {
+it("retains the local session when recover runs without a remote lookup", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.hydrate();
-  await expect(
-    harnessed.box.recover(() => {
-      throw new Error("deployment unavailable");
-    })
-  ).rejects.toThrow("deployment unavailable");
+  const recovery = await harnessed.box.recover();
+  expect(recovery.recovered).toBe(true);
+  expect(recovery.missing).toBe(false);
   expect(harnessed.sessions).toHaveLength(1);
-  expect(harnessed.stored).toHaveLength(1);
   harnessed.box.dispose();
 });
 
 it("marks a typed missing recording without deleting it", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(async () => ({
+  const recovery = await harnessed.box.recover({
     kind: "missing",
-  }));
+  });
   expect(recovery.missing).toBe(true);
   expect(harnessed.sessions).toHaveLength(1);
   expect(harnessed.stored).toHaveLength(1);
@@ -572,17 +567,15 @@ it("lost acknowledgement drops a matching local copy without discarding bytes", 
   const local = { ...part, sequence: 3 };
   const harnessed = recoveryHarness([local]);
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([
-        { sequence: 0 },
-        { sequence: 1 },
-        { sequence: 2 },
-        { sequence: 3 },
-      ]),
-    })
-  );
+  const recovery = await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { sequence: 2 },
+      { sequence: 3 },
+    ]),
+  });
   expect(recovery.integrity).toBe("ok");
   expect(harnessed.calls.length).toBe(0);
   expect(harnessed.deleted.length).toBe(1);
@@ -596,17 +589,15 @@ it("reconcile continues when dropping an acknowledged part fails in storage", as
     deleteError: new Error("IndexedDB delete failed"),
   });
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([
-        { sequence: 0 },
-        { sequence: 1 },
-        { sequence: 2 },
-        { sequence: 3 },
-      ]),
-    })
-  );
+  const recovery = await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { sequence: 2 },
+      { sequence: 3 },
+    ]),
+  });
   expect(recovery.recovered).toBe(true);
   expect(recovery.integrity).toBe("ok");
   expect(harnessed.box.pendingCount).toBe(0);
@@ -618,23 +609,19 @@ it("offline hydrate retains parts and reconciles after reconnect", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 3 }]);
   await harnessed.box.setOnline(false);
   await harnessed.box.hydrate();
-  const offline = await harnessed.box.recover(() => {
-    throw new Error("manifest should not be fetched offline");
-  });
+  const offline = await harnessed.box.recover();
   expect(offline.recovered).toBe(true);
   expect(harnessed.calls.length).toBe(0);
   expect(harnessed.box.pendingCount).toBe(1);
   await harnessed.box.setOnline(true, { flush: false });
-  await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([
-        { sequence: 0 },
-        { sequence: 1 },
-        { sequence: 2 },
-      ]),
-    })
-  );
+  await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { sequence: 2 },
+    ]),
+  });
   expect(harnessed.calls.length).toBe(1);
   expect(harnessed.box.pendingCount).toBe(0);
   harnessed.box.dispose();
@@ -643,16 +630,14 @@ it("offline hydrate retains parts and reconciles after reconnect", async () => {
 it("conflicting checksums retain local media and refuse finalization", async () => {
   const harnessed = recoveryHarness([{ ...part, sequence: 2 }]);
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([
-        { sequence: 0 },
-        { sequence: 1 },
-        { checksum: OTHER_CHECKSUM, sequence: 2 },
-      ]),
-    })
-  );
+  const recovery = await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([
+      { sequence: 0 },
+      { sequence: 1 },
+      { checksum: OTHER_CHECKSUM, sequence: 2 },
+    ]),
+  });
   expect(recovery.integrity).toBe("conflict");
   expect(harnessed.deleted.length).toBe(0);
   expect(harnessed.stored.length).toBe(1);
@@ -672,12 +657,10 @@ it("missing ordered parts refuse misleading finalization", async () => {
     segments: [{ partCount: 3, segmentId: "segment" }],
   });
   await harnessed.box.hydrate();
-  const recovery = await harnessed.box.recover(() =>
-    Promise.resolve({
-      kind: "found",
-      manifest: manifestParts([{ sequence: 0 }, { sequence: 1 }]),
-    })
-  );
+  const recovery = await harnessed.box.recover({
+    kind: "found",
+    manifest: manifestParts([{ sequence: 0 }, { sequence: 1 }]),
+  });
   expect(recovery.integrity).toBe("gap");
   expect(harnessed.calls.length).toBe(0);
   await harnessed.box.drain();

@@ -1,5 +1,6 @@
+import { useMutation } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { CandidateRecordingJourney } from "@/recording/candidate-recording-journey";
 import {
   type RecordingFinalizationState,
@@ -10,7 +11,9 @@ import {
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "@/recording/live-recording";
-import { client } from "@/utils/orpc";
+import { useRecordingApi } from "@/recording/recording-api";
+import type { ApiErrors } from "@/utils/orpc";
+import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export const Route = createFileRoute("/")({
   component: HomeComponent,
@@ -74,28 +77,19 @@ export function usefulError(error: unknown): CandidateError {
   };
 }
 
-export async function recordingManifestLookup(
+export function recordingManifestLookup(
   getManifest: (input: { sessionId: string }) => Promise<RecordingManifestView>,
   input: { sessionId: string }
 ): Promise<RecordingManifestLookup> {
-  try {
-    return {
-      kind: "found",
-      manifest: await getManifest(input),
-    };
-  } catch (error) {
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed oRPC boundary.
-    if (
-      typeof error === "object" &&
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: keep the explicit typed boundary guard.
-      error !== null &&
-      "code" in error &&
-      error.code === "NOT_FOUND"
-    ) {
-      return { kind: "missing" };
+  return getManifest(input).then(
+    (manifest) => ({ kind: "found", manifest }),
+    (error: ApiErrors["recording"]["getManifest"]) => {
+      if (isRecordingNotFoundError(error)) {
+        return { kind: "missing" };
+      }
+      throw error;
     }
-    throw error;
-  }
+  );
 }
 
 export function candidateJourneyHandoff(input: {
@@ -140,67 +134,71 @@ export function candidateJourneyHandoff(input: {
 }
 
 function useRecordingControls(recording: UseLiveRecordingResult) {
-  const [pendingAction, setPendingAction] = useState<PendingAction | null>(
-    null
-  );
   const [actionError, setActionError] = useState<CandidateError | null>(null);
   const [hasStopped, setHasStopped] = useState(false);
-  const { initialize, retryFinalization, start, stop } = recording;
 
-  const perform = useCallback(
-    async (action: PendingAction, task: () => Promise<void>) => {
-      setPendingAction(action);
-      setActionError(null);
-      try {
-        await task();
-      } catch (cause) {
-        setActionError(usefulError(cause));
-      } finally {
-        setPendingAction(null);
-      }
-    },
-    []
-  );
+  const initialize = useMutation({
+    mutationFn: recording.initialize,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+  });
+  const start = useMutation({
+    mutationFn: recording.start,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+  });
+  const stop = useMutation({
+    mutationFn: recording.stop,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+    onSuccess: () => setHasStopped(true),
+  });
+  const retry = useMutation({
+    mutationFn: recording.retryFinalization,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+  });
+  const resetRecovered = useMutation({
+    mutationFn: recording.resetRecoveredRecording,
+  });
 
-  const handleInitialize = useCallback(() => {
-    perform("initialize", initialize).catch(() => undefined);
-  }, [initialize, perform]);
-
-  const handleStart = useCallback(() => {
-    perform("start", start).catch(() => undefined);
-  }, [perform, start]);
-
-  const handleStop = useCallback(() => {
-    const stopAndMark = async () => {
-      await stop();
-      setHasStopped(true);
-    };
-    perform("stop", stopAndMark).catch(() => undefined);
-  }, [perform, stop]);
-
-  const handleRetryFinalization = useCallback(() => {
-    perform("retry", retryFinalization).catch(() => undefined);
-  }, [perform, retryFinalization]);
+  let pendingAction: PendingAction | null = null;
+  if (initialize.isPending) {
+    pendingAction = "initialize";
+  } else if (start.isPending) {
+    pendingAction = "start";
+  } else if (stop.isPending) {
+    pendingAction = "stop";
+  } else if (retry.isPending) {
+    pendingAction = "retry";
+  }
 
   return {
     actionError,
-    handleInitialize,
-    handleRetryFinalization,
-    handleStart,
-    handleStop,
+    handleInitialize: initialize.mutate,
+    handleRetryFinalization: retry.mutate,
+    handleStart: start.mutate,
+    handleStop: stop.mutate,
     hasStopped,
     pendingAction,
+    resetRecovered: resetRecovered.mutate,
   };
 }
 
 function HomeComponent() {
+  const [manifestSessionId, setManifestSessionId] = useState<string | null>(
+    null
+  );
+  const [statusSessionId, setStatusSessionId] = useState<string | null>(null);
+  const api = useRecordingApi({ manifestSessionId, statusSessionId });
   const recording = useLiveRecording({
-    appendSegment: (input) => client.recording.appendSegment(input),
-    createSession: (input) => client.recording.create(input),
-    finalizeSession: (input) => client.recording.finalize(input),
-    getFinalizationStatus: (input) => client.recording.getStatus(input),
-    getManifest: (input) =>
-      recordingManifestLookup(client.recording.getManifest, input),
+    appendSegment: api.appendSegment,
+    createSession: api.createSession,
+    finalizeSession: api.finalizeSession,
+    manifestLookup: api.manifestLookup,
+    onRequestManifest: setManifestSessionId,
+    onRequestStatus: setStatusSessionId,
+    status: api.status,
   });
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
@@ -239,9 +237,7 @@ function HomeComponent() {
       onInitialize={controls.handleInitialize}
       onResetRecoveredRecording={
         recording.canResetRecoveredRecording
-          ? () => {
-              recording.resetRecoveredRecording().catch(() => undefined);
-            }
+          ? controls.resetRecovered
           : undefined
       }
       onRetry={controls.handleRetryFinalization}

@@ -1,16 +1,5 @@
 import { createContext } from "@interview-web/api/context";
 import { appRouter } from "@interview-web/api/routers/index";
-import {
-  appendRecordingSegment,
-  createDb,
-  createRecordingSession,
-  finalizeRecording,
-  getRecordingManifest,
-  getRecordingPlaybackSummary,
-  getRecordingStatus,
-  listRecordingPlaybackSummaries,
-} from "@interview-web/db";
-import { env } from "@interview-web/env/server";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { OpenAPIReferencePlugin } from "@orpc/openapi/plugins";
 import { onError } from "@orpc/server";
@@ -39,46 +28,8 @@ const apiHandler = new OpenAPIHandler(appRouter, {
   ],
 });
 
-export interface FinalizerDispatcher {
-  fetch: (request: Request) => Promise<Response>;
-}
-
-export async function dispatchFinalization(
-  finalizer: FinalizerDispatcher,
-  sessionId: string
-): Promise<void> {
-  const response = await finalizer.fetch(
-    new Request("https://finalizer/internal/finalizations", {
-      body: JSON.stringify({ sessionId }),
-      headers: { "content-type": "application/json" },
-      method: "POST",
-    })
-  );
-  if (!response.ok) {
-    throw new Error("Finalization dispatch failed");
-  }
-}
-
 async function handle({ request }: { request: Request }) {
-  const context = await createContext({
-    bindings: {
-      appendRecordingSegment: (input) =>
-        appendRecordingSegment(createDb(), input),
-      createRecordingSession: (input) =>
-        createRecordingSession(createDb(), input),
-      enqueueFinalization: (sessionId) =>
-        dispatchFinalization(env.FINALIZER, sessionId),
-      finalizeRecording: (input) => finalizeRecording(createDb(), input),
-      getRecordingManifest: (sessionId) =>
-        getRecordingManifest(createDb(), sessionId),
-      getRecordingPlaybackSummary: (sessionId) =>
-        getRecordingPlaybackSummary(createDb(), sessionId),
-      getRecordingStatus: (sessionId) =>
-        getRecordingStatus(createDb(), sessionId),
-      listRecordingPlaybackSummaries: (input) =>
-        listRecordingPlaybackSummaries(createDb(), input),
-    },
-  });
+  const context = await createContext({ req: request });
   const rpcResult = await rpcHandler.handle(request, {
     context,
     prefix: "/api/rpc",

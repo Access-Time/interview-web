@@ -162,8 +162,10 @@ it("does not describe a fatal 400 upload as retryable network saving", () => {
   expect(handoff.savingNotice).toBeNull();
 });
 
-it("maps only typed NOT_FOUND manifest failures to missing", async () => {
-  const notFound = Object.assign(new Error("missing"), { code: "NOT_FOUND" });
+it("maps only typed RECORDING_NOT_FOUND manifest failures to missing", async () => {
+  const notFound = Object.assign(new Error("missing"), {
+    code: "RECORDING_NOT_FOUND",
+  });
   await expect(
     recordingManifestLookup(() => Promise.reject(notFound), {
       sessionId: "recording-1",

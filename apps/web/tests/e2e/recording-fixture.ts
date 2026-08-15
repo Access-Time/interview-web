@@ -1,15 +1,14 @@
-import {
-  createContext,
-  type RecordingBindings,
-} from "@interview-web/api/context";
-import { appRouter } from "@interview-web/api/routers/index";
 import type {
   AppendRecordingSegmentInput,
+  RecordingFinalizeInput,
+  RecordingFinalizeResult,
   RecordingManifest,
   RecordingStatus,
 } from "@interview-web/db";
+import { ORPCError, os } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Page } from "@playwright/test";
+import z from "zod";
 
 declare global {
   interface Window {
@@ -17,8 +16,42 @@ declare global {
   }
 }
 
+const procedure = os;
+const recordingId = z.string().min(1).max(128);
+const sessionInput = z.object({
+  recorderMimeType: z.string().nullable().optional(),
+  requestedMimeType: z.string().nullable().optional(),
+  segmentId: recordingId,
+  sessionId: recordingId,
+});
+const finalizeInput = z.object({
+  segments: z
+    .array(
+      z.object({
+        partCount: z.number().int().positive(),
+        segmentId: recordingId,
+      })
+    )
+    .min(1),
+  sessionId: recordingId,
+});
+
 export interface CandidateBindingFixture {
-  bindings: RecordingBindings;
+  appendRecordingSegment: (
+    input: AppendRecordingSegmentInput
+  ) => Promise<unknown>;
+  bindings: {
+    finalizeRecording: (
+      input: RecordingFinalizeInput
+    ) => Promise<RecordingFinalizeResult>;
+  };
+  createRecordingSession: (
+    input: AppendRecordingSegmentInput
+  ) => Promise<unknown>;
+  getRecordingManifest: (
+    sessionId: string
+  ) => Promise<RecordingManifest | null>;
+  getRecordingStatus: (sessionId: string) => Promise<RecordingStatus | null>;
   markAllReady: () => void;
 }
 
@@ -28,60 +61,56 @@ export function createCandidateBindings(): CandidateBindingFixture {
   const appendedSegments = new Map<string, AppendRecordingSegmentInput[]>();
 
   return {
-    bindings: {
-      appendRecordingSegment: (input) => {
-        const segments = appendedSegments.get(input.sessionId) ?? [];
-        segments.push(input);
-        appendedSegments.set(input.sessionId, segments);
-        const manifest = manifests.get(input.sessionId);
-        if (
-          manifest &&
-          !manifest.segments.some((segment) => segment.id === input.segmentId)
-        ) {
-          manifest.segments.push({
-            createdAt: Date.now(),
-            id: input.segmentId,
-            index: segments.length,
-            parts: [],
-            recorderMimeType: input.recorderMimeType ?? null,
-            requestedMimeType: input.requestedMimeType ?? null,
-          });
-        }
-        return Promise.resolve({
-          index: segments.length,
-          recorderMimeType: input.recorderMimeType ?? null,
-          requestedMimeType: input.requestedMimeType ?? null,
-          segmentId: input.segmentId,
-          sessionId: input.sessionId,
-        });
-      },
-      createRecordingSession: (input) => {
-        manifests.set(input.sessionId, {
+    appendRecordingSegment: (input) => {
+      const segments = appendedSegments.get(input.sessionId) ?? [];
+      segments.push(input);
+      appendedSegments.set(input.sessionId, segments);
+      const manifest = manifests.get(input.sessionId);
+      if (
+        manifest &&
+        !manifest.segments.some((segment) => segment.id === input.segmentId)
+      ) {
+        manifest.segments.push({
           createdAt: Date.now(),
-          segments: [],
-          sessionId: input.sessionId,
-        });
-        appendedSegments.set(input.sessionId, []);
-        return Promise.resolve({
+          id: input.segmentId,
+          index: segments.length,
+          parts: [],
           recorderMimeType: input.recorderMimeType ?? null,
           requestedMimeType: input.requestedMimeType ?? null,
-          segmentId: input.segmentId,
-          sessionId: input.sessionId,
         });
-      },
-      enqueueFinalization: () => Promise.resolve(),
+      }
+      return Promise.resolve({
+        index: segments.length,
+        recorderMimeType: input.recorderMimeType ?? null,
+        requestedMimeType: input.requestedMimeType ?? null,
+        segmentId: input.segmentId,
+        sessionId: input.sessionId,
+      });
+    },
+    bindings: {
       finalizeRecording: (input) => {
         statuses.set(input.sessionId, { status: "queued" });
         return Promise.resolve({ status: "queued" });
       },
-      getRecordingManifest: (sessionId) =>
-        Promise.resolve(manifests.get(sessionId) ?? null),
-      getRecordingPlaybackSummary: () => Promise.resolve(null),
-      getRecordingStatus: (sessionId) =>
-        Promise.resolve(statuses.get(sessionId) ?? null),
-      listRecordingPlaybackSummaries: () =>
-        Promise.resolve({ items: [], nextCursor: null }),
     },
+    createRecordingSession: (input) => {
+      manifests.set(input.sessionId, {
+        createdAt: Date.now(),
+        segments: [],
+        sessionId: input.sessionId,
+      });
+      appendedSegments.set(input.sessionId, []);
+      return Promise.resolve({
+        recorderMimeType: input.recorderMimeType ?? null,
+        requestedMimeType: input.requestedMimeType ?? null,
+        segmentId: input.segmentId,
+        sessionId: input.sessionId,
+      });
+    },
+    getRecordingManifest: (sessionId) =>
+      Promise.resolve(manifests.get(sessionId) ?? null),
+    getRecordingStatus: (sessionId) =>
+      Promise.resolve(statuses.get(sessionId) ?? null),
     markAllReady: () => {
       for (const sessionId of statuses.keys()) {
         statuses.set(sessionId, { status: "ready" });
@@ -90,12 +119,46 @@ export function createCandidateBindings(): CandidateBindingFixture {
   };
 }
 
+function createCandidateRecordingRouter(fixture: CandidateBindingFixture) {
+  return {
+    appendSegment: procedure
+      .input(sessionInput)
+      .handler(({ input }) => fixture.appendRecordingSegment(input)),
+    create: procedure
+      .input(sessionInput)
+      .handler(({ input }) => fixture.createRecordingSession(input)),
+    finalize: procedure
+      .input(finalizeInput)
+      .handler(({ input }) => fixture.bindings.finalizeRecording(input)),
+    getManifest: procedure
+      .input(z.object({ sessionId: recordingId }))
+      .handler(async ({ input }) => {
+        const manifest = await fixture.getRecordingManifest(input.sessionId);
+        if (!manifest) {
+          throw new ORPCError("RECORDING_NOT_FOUND");
+        }
+        return manifest;
+      }),
+    getStatus: procedure
+      .input(z.object({ sessionId: recordingId }))
+      .handler(async ({ input }) => {
+        const status = await fixture.getRecordingStatus(input.sessionId);
+        if (!status) {
+          throw new ORPCError("RECORDING_NOT_FOUND");
+        }
+        return status;
+      }),
+  };
+}
+
 export async function installRecordingApi(
   page: Page,
   fixture: CandidateBindingFixture,
   uploadStatus = 204
 ) {
-  const handler = new RPCHandler(appRouter);
+  const handler = new RPCHandler({
+    recording: createCandidateRecordingRouter(fixture),
+  });
 
   await page.route("**/api/rpc**", async (route) => {
     const browserRequest = route.request();
@@ -110,7 +173,7 @@ export async function installRecordingApi(
       method: browserRequest.method(),
     });
     const result = await handler.handle(request, {
-      context: createContext({ bindings: fixture.bindings }),
+      context: {},
       prefix: "/api/rpc",
     });
     const response =
@@ -132,13 +195,13 @@ export async function installMediaRecorder(page: Page) {
     window.__recordingTestState = { stoppedTracks: 0 };
 
     class TestTrack {
-      private stopped = false;
+      private stops = 0;
       readonly kind = "video";
       readonly id = crypto.randomUUID();
 
       stop() {
-        if (!this.stopped) {
-          this.stopped = true;
+        this.stops += 1;
+        if (this.stops === 1) {
           window.__recordingTestState.stoppedTracks += 1;
         }
       }

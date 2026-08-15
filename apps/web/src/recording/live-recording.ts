@@ -1,10 +1,10 @@
-import {
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import { useEffect, useRef } from "react";
+import type {
+  AppendSegmentMutate,
+  CreateRecordingMutate,
+  FinalizeRecordingMutate,
+} from "./recording-mutate";
+import { useRecordingStore } from "./recording-store";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";
 export type RecordingIntegrity = "ok" | "gap" | "conflict";
@@ -597,17 +597,12 @@ export function createLiveRecordingOutbox(
       onChange?.();
     }
   };
-  const recover = async (
-    getManifest?: (input: {
-      sessionId: string;
-    }) => Promise<RecordingManifestLookup>
-  ) => {
+  const recover = async (lookup?: RecordingManifestLookup) => {
     const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
     const [stored] = sessions
       .filter((item) => item.status === "recording")
       .sort((a, b) => a.sessionId.localeCompare(b.sessionId));
-    if (stored && getManifest && online) {
-      const lookup = await getManifest({ sessionId: stored.sessionId });
+    if (stored && lookup && online) {
       if (lookup.kind === "missing") {
         const session = (await store.getSession?.(stored.sessionId)) ?? stored;
         return { integrity, missing: true, recovered: true, session };
@@ -780,53 +775,17 @@ export function createLiveRecordingOutbox(
   };
 }
 
-interface OutboxSnapshot {
-  integrity: RecordingIntegrity;
-  pendingPartCount: number;
-  saveState: RecordingSaveState;
-}
-
-const IDLE_OUTBOX_SNAPSHOT: OutboxSnapshot = {
-  integrity: "ok",
-  pendingPartCount: 0,
-  saveState: "healthy",
-};
-
-function snapshotOutbox(
-  box: ReturnType<typeof createLiveRecordingOutbox> | null
-): OutboxSnapshot {
-  return box
-    ? {
-        integrity: box.integrity,
-        pendingPartCount: box.pendingCount,
-        saveState: box.saveState,
-      }
-    : IDLE_OUTBOX_SNAPSHOT;
-}
-
 export interface UseLiveRecordingOptions {
-  appendSegment: (input: {
-    sessionId: string;
-    segmentId: string;
-    requestedMimeType: string | null;
-    recorderMimeType: string | null;
-  }) => Promise<unknown>;
-  createSession: (input: {
-    sessionId: string;
-    segmentId: string;
-    requestedMimeType: string | null;
-    recorderMimeType: string | null;
-  }) => Promise<unknown>;
-  finalizeSession: (input: {
-    sessionId: string;
-    segments: Array<{ segmentId: string; partCount: number }>;
-  }) => Promise<unknown>;
-  getFinalizationStatus?: (input: {
-    sessionId: string;
-  }) => Promise<RecordingFinalizationStatus>;
+  appendSegment: AppendSegmentMutate;
+  createSession: CreateRecordingMutate;
+  finalizeSession: FinalizeRecordingMutate;
   getManifest?: (input: {
     sessionId: string;
   }) => Promise<RecordingManifestLookup>;
+  manifestLookup?: RecordingManifestLookup;
+  onRequestManifest?: (sessionId: string | null) => void;
+  onRequestStatus?: (sessionId: string | null) => void;
+  status?: RecordingFinalizationState | null;
 }
 
 type LegacyLiveRecordingOptions = Omit<
@@ -856,24 +815,37 @@ export function useLiveRecording(
     resolve: () => void;
   } | null>(null);
   const lifecycle = useRef<boolean | undefined>(undefined);
-  const [stream, setStream] = useState<MediaStream | null>(null);
-  const [isReady, setReady] = useState(false);
-  const [isRecording, setRecording] = useState(false);
-  const [captureEnded, setCaptureEnded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [recovered, setRecovered] = useState(false);
-  const [journeyOutcome, setJourneyOutcome] =
-    useState<RecordingJourneyOutcome>("none");
-  const [canResetRecoveredRecording, setCanResetRecoveredRecording] =
-    useState(false);
-  const [finalization, setFinalization] =
-    useState<RecordingFinalizationResult | null>(null);
+  const stream = useRecordingStore((state) => state.stream);
+  const isReady = useRecordingStore((state) => state.isReady);
+  const isRecording = useRecordingStore((state) => state.isRecording);
+  const captureEnded = useRecordingStore((state) => state.captureEnded);
+  const error = useRecordingStore((state) => state.error);
+  const recovered = useRecordingStore((state) => state.recovered);
+  const journeyOutcome = useRecordingStore((state) => state.journeyOutcome);
+  const canResetRecoveredRecording = useRecordingStore(
+    (state) => state.canResetRecoveredRecording
+  );
+  const finalization = useRecordingStore((state) => state.finalization);
+  const integrity = useRecordingStore((state) => state.integrity);
+  const pendingPartCount = useRecordingStore((state) => state.pendingPartCount);
+  const saveState = useRecordingStore((state) => state.saveState);
+
+  const { setJourney } = useRecordingStore.getState();
+  const setStream = (next: MediaStream | null) => setJourney({ stream: next });
+  const setReady = (next: boolean) => setJourney({ isReady: next });
+  const setRecording = (next: boolean) => setJourney({ isRecording: next });
+  const setCaptureEnded = (next: boolean) => setJourney({ captureEnded: next });
+  const setError = (next: string | null) => setJourney({ error: next });
+  const setRecovered = (next: boolean) => setJourney({ recovered: next });
+  const setJourneyOutcome = (next: RecordingJourneyOutcome) =>
+    setJourney({ journeyOutcome: next });
+  const setCanResetRecoveredRecording = (next: boolean) =>
+    setJourney({ canResetRecoveredRecording: next });
   const finalizationInput = useRef<{
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
   } | null>(null);
   const finalizationAttempted = useRef(false);
-  const finalizationRef = useRef<RecordingFinalizationResult | null>(null);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined
   );
@@ -882,7 +854,7 @@ export function useLiveRecording(
   const recoveryPromise = useRef<Promise<void> | null>(null);
   const captureEndingRef = useRef<Promise<void> | null>(null);
   const captureCauseRef = useRef<unknown>(undefined);
-  const finalizationInFlight = useRef<Promise<void> | null>(null);
+  const finalizationInFlight = useRef(false);
   const sealedPumpLock = useRef(false);
   const sealedPlans = useRef<
     Array<{
@@ -891,33 +863,16 @@ export function useLiveRecording(
     }>
   >([]);
   const submitSealedRef = useRef<(() => Promise<void>) | null>(null);
-  const outboxSnapshot = useRef(IDLE_OUTBOX_SNAPSHOT);
-  const outboxListeners = useRef(new Set<() => void>());
-  const subscribeOutbox = useCallback((onStoreChange: () => void) => {
-    outboxListeners.current.add(onStoreChange);
-    return () => {
-      outboxListeners.current.delete(onStoreChange);
-    };
-  }, []);
-  const getOutboxSnapshot = useCallback(() => outboxSnapshot.current, []);
-  const outboxView = useSyncExternalStore(
-    subscribeOutbox,
-    getOutboxSnapshot,
-    () => IDLE_OUTBOX_SNAPSHOT
-  );
+  const applyRecoveryRef = useRef<
+    ((lookup?: RecordingManifestLookup) => Promise<unknown>) | null
+  >(null);
 
   const cancelFinalizationPolling = () => {
-    pollGeneration.current += 1;
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: timer refs are populated at runtime.
-    if (pollTimer.current) {
-      clearTimeout(pollTimer.current);
-    }
-    pollTimer.current = undefined;
+    requestStatus(null);
   };
 
   const setFinalizationState = (value: RecordingFinalizationResult | null) => {
-    finalizationRef.current = value;
-    setFinalization(value);
+    setJourney({ finalization: value });
   };
   const revokeRecoveryReset = () => {
     setJourneyOutcome("none");
@@ -944,60 +899,13 @@ export function useLiveRecording(
     ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
   };
 
-  const pollFinalization = async (generation: number) => {
-    const input = finalizationInput.current;
-    const getStatus = options.getFinalizationStatus;
-    const isDisposed = () => lifecycle.current === true;
-    if (
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: refs and optional callbacks are runtime state.
-      !(input && getStatus) ||
-      generation !== pollGeneration.current ||
-      isDisposed()
-    ) {
-      return;
-    }
-    try {
-      const status = normalizeFinalizationStatus(await getStatus(input));
-      if (status === null) {
-        throw new Error("Invalid finalization status");
-      }
-      if (generation !== pollGeneration.current || isDisposed()) {
-        return;
-      }
-      setFinalizationState({ error: null, state: status });
-      if (status === "ready") {
-        await completeReadyFinalization(input);
-      }
-      if (status === "queued" || status === "finalizing") {
-        pollTimer.current = setTimeout(() => {
-          pollTimer.current = undefined;
-          ignorePromise(pollFinalization(generation));
-        }, RETRY_DELAY);
-      }
-    } catch {
-      if (generation !== pollGeneration.current || isDisposed()) {
-        return;
-      }
-      pollTimer.current = setTimeout(() => {
-        pollTimer.current = undefined;
-        ignorePromise(pollFinalization(generation));
-      }, RETRY_DELAY);
-    }
-  };
-
-  const beginFinalizationPolling = () => {
-    cancelFinalizationPolling();
-    const generation = pollGeneration.current;
-    if (options.getFinalizationStatus) {
-      pollTimer.current = setTimeout(() => {
-        pollTimer.current = undefined;
-        ignorePromise(pollFinalization(generation));
-      }, RETRY_DELAY);
-    }
+  const requestStatus = (sessionId: string | null) => {
+    options.onRequestStatus?.(sessionId);
   };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: lifecycle effect intentionally runs once; mutable refs carry runtime callbacks.
   useEffect(() => {
+    useRecordingStore.getState().reset();
     lifecycle.current = false;
     const isDisposed = () => lifecycle.current === true;
     const box = createLiveRecordingOutbox(undefined, undefined, (cause) => {
@@ -1014,18 +922,11 @@ export function useLiveRecording(
     });
     outbox.current = box;
     const emitOutbox = () => {
-      const next = snapshotOutbox(box);
-      const { current } = outboxSnapshot;
-      if (
-        current.integrity !== next.integrity ||
-        current.pendingPartCount !== next.pendingPartCount ||
-        current.saveState !== next.saveState
-      ) {
-        outboxSnapshot.current = next;
-      }
-      for (const listener of outboxListeners.current) {
-        listener();
-      }
+      useRecordingStore.getState().syncOutbox({
+        integrity: box.integrity,
+        pendingPartCount: box.pendingCount,
+        saveState: box.saveState,
+      });
     };
     const unsubscribe = box.subscribe(() => {
       emitOutbox();
@@ -1057,16 +958,11 @@ export function useLiveRecording(
             // biome-ignore lint/performance/noAwaitInLoops: each plan must complete before the next is submitted.
             await box.drain();
             finalizationAttempted.current = true;
-            const attempt = finalize(plan);
-            finalizationInFlight.current = attempt;
-            await attempt;
-            finalizationInFlight.current = null;
-            if (finalizationRef.current?.state !== "ready") {
-              return;
-            }
-            finalizationAttempted.current = false;
+            finalizationInFlight.current = true;
+            finalize(plan);
+            return;
           } catch (cause) {
-            finalizationInFlight.current = null;
+            finalizationInFlight.current = false;
             if (
               box.saveState !== "offline" &&
               !isRetryableRecordingFailure(cause)
@@ -1084,21 +980,8 @@ export function useLiveRecording(
     recoveryGeneration.current += 1;
     const generation = recoveryGeneration.current;
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: recovery coordinates durable state and retry state.
-    const applyRecovery = async () => {
-      const { getManifest } = options;
-      const manifestLookup = getManifest
-        ? async (input: { sessionId: string }) => {
-            const result = await getManifest(input);
-            if (result === null) {
-              throw new Error("Recording manifest lookup unavailable");
-            }
-            if ("kind" in result) {
-              return result;
-            }
-            return { kind: "found", manifest: result } as const;
-          }
-        : undefined;
-      const recovery = await box.recover(manifestLookup);
+    const applyRecovery = async (lookup?: RecordingManifestLookup) => {
+      const recovery = await box.recover(lookup);
       if (generation !== recoveryGeneration.current || isDisposed()) {
         return recovery;
       }
@@ -1128,6 +1011,7 @@ export function useLiveRecording(
       }
       return recovery;
     };
+    applyRecoveryRef.current = applyRecovery;
     const enqueueRecovery = (task: () => Promise<void>) => {
       const next = (recoveryPromise.current ?? Promise.resolve())
         .catch(() => undefined)
@@ -1140,11 +1024,35 @@ export function useLiveRecording(
       recoveryPromise.current = next;
       return next;
     };
+    const recoverFromStore = async () => {
+      const sessions = await box.getSessions();
+      const stored = sessions
+        .filter((item) => item.status === "recording")
+        .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
+        .at(0);
+      if (stored && navigator.onLine) {
+        if (options.getManifest) {
+          const result = await options.getManifest({
+            sessionId: stored.sessionId,
+          });
+          if (result === null) {
+            throw new Error("Recording manifest lookup unavailable");
+          }
+          await applyRecovery(
+            "kind" in result ? result : { kind: "found", manifest: result }
+          );
+          return;
+        }
+        options.onRequestManifest?.(stored.sessionId);
+        return;
+      }
+      await applyRecovery();
+    };
     const online = () => {
       ignorePromise(
         enqueueRecovery(async () => {
           await box.setOnline(true, { flush: false });
-          await applyRecovery();
+          await recoverFromStore();
           await submitSealed();
         })
       );
@@ -1159,7 +1067,7 @@ export function useLiveRecording(
         if (generation !== recoveryGeneration.current || isDisposed()) {
           return;
         }
-        await applyRecovery();
+        await recoverFromStore();
         if (generation !== recoveryGeneration.current || isDisposed()) {
           return;
         }
@@ -1195,8 +1103,32 @@ export function useLiveRecording(
         track.stop();
       }
       streamRef.current = null;
+      useRecordingStore.getState().reset();
     };
   }, []);
+
+  useEffect(() => {
+    if (options.getManifest || !options.manifestLookup) {
+      return;
+    }
+    ignorePromise(
+      Promise.resolve(applyRecoveryRef.current?.(options.manifestLookup))
+    );
+  }, [options.getManifest, options.manifestLookup]);
+
+  const isRemoteReady = options.status === "ready";
+  // biome-ignore lint/correctness/useExhaustiveDependencies: IndexedDB cleanup runs when remote status becomes ready; refs hold the latest session plan.
+  useEffect(() => {
+    if (!isRemoteReady) {
+      return;
+    }
+    const input = finalizationInput.current;
+    if (input === null) {
+      return;
+    }
+    ignorePromise(completeReadyFinalization(input));
+    requestStatus(null);
+  }, [isRemoteReady]);
 
   const initialize = async () => {
     try {
@@ -1287,83 +1219,94 @@ export function useLiveRecording(
     session.current = nextSession;
     await outbox.current?.saveSession(nextSession);
     const remoteMetadata = { ...metadata, ...intent };
+    const beginCapture = () => {
+      if (lifecycle.current === true) {
+        return;
+      }
+      instance.ondataavailable = (event) => {
+        if (terminalDataRef.current?.awaiting) {
+          terminalDataRef.current.resolve();
+        }
+        if (!(event.data.size && ids.current && outbox.current)) {
+          return;
+        }
+        const part = {
+          ...ids.current,
+          blob: event.data,
+          mediaType:
+            event.data.type || instance.mimeType || "application/octet-stream",
+          sequence: sequence.current,
+        };
+        sequence.current += 1;
+        const currentSession = session.current;
+        // biome-ignore lint/suspicious/noUnnecessaryConditions: session is established before MediaRecorder starts.
+        if (!currentSession) {
+          return;
+        }
+        const updatedSession = {
+          recorderMimeType: currentSession.recorderMimeType,
+          requestedMimeType: currentSession.requestedMimeType,
+          segments: currentSession.segments.map((segment) =>
+            segment.segmentId === part.segmentId
+              ? { ...segment, partCount: part.sequence + 1 }
+              : segment
+          ),
+          sessionId: currentSession.sessionId,
+          status: currentSession.status,
+        };
+        session.current = updatedSession;
+        const work = outbox.current.savePartAndSession(part, updatedSession);
+        processing.current.push(work);
+        work.then(
+          () => {
+            processing.current = processing.current.filter(
+              (item) => item !== work
+            );
+          },
+          () => {
+            processing.current = processing.current.filter(
+              (item) => item !== work
+            );
+          }
+        );
+      };
+      instance.onerror = (event) => {
+        if (lifecycle.current !== true) {
+          captureCauseRef.current = event;
+          setError("Recording failed while capturing media");
+          ignorePromise(endCapture(event));
+        }
+      };
+      instance.onstop = () => {
+        if (lifecycle.current !== true) {
+          setRecording(false);
+        }
+      };
+      instance.start(5000);
+      captureEndingRef.current = null;
+      captureCauseRef.current = undefined;
+      setCaptureEnded(false);
+      if (lifecycle.current === false || lifecycle.current === undefined) {
+        setRecording(true);
+        if (outbox.current?.integrity === "ok") {
+          setError(null);
+        }
+      }
+    };
+    const failStart = (startError: { message: string }) => {
+      setError(startError.message);
+    };
     if (recordingRemoteAction(previous, resumeTail) === "append") {
-      await options.appendSegment(remoteMetadata);
-    } else {
-      await options.createSession(remoteMetadata);
-    }
-    if (lifecycle.current === true) {
+      options.appendSegment(remoteMetadata, {
+        onError: failStart,
+        onSuccess: beginCapture,
+      });
       return;
     }
-    instance.ondataavailable = (event) => {
-      if (terminalDataRef.current?.awaiting) {
-        terminalDataRef.current.resolve();
-      }
-      if (!(event.data.size && ids.current && outbox.current)) {
-        return;
-      }
-      const part = {
-        ...ids.current,
-        blob: event.data,
-        mediaType:
-          event.data.type || instance.mimeType || "application/octet-stream",
-        sequence: sequence.current,
-      };
-      sequence.current += 1;
-      const currentSession = session.current;
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: session is established before MediaRecorder starts.
-      if (!currentSession) {
-        return;
-      }
-      const updatedSession = {
-        recorderMimeType: currentSession.recorderMimeType,
-        requestedMimeType: currentSession.requestedMimeType,
-        segments: currentSession.segments.map((segment) =>
-          segment.segmentId === part.segmentId
-            ? { ...segment, partCount: part.sequence + 1 }
-            : segment
-        ),
-        sessionId: currentSession.sessionId,
-        status: currentSession.status,
-      };
-      session.current = updatedSession;
-      const work = outbox.current.savePartAndSession(part, updatedSession);
-      processing.current.push(work);
-      work.then(
-        () => {
-          processing.current = processing.current.filter(
-            (item) => item !== work
-          );
-        },
-        () => {
-          processing.current = processing.current.filter(
-            (item) => item !== work
-          );
-        }
-      );
-    };
-    instance.onerror = (event) => {
-      if (lifecycle.current !== true) {
-        captureCauseRef.current = event;
-        setError("Recording failed while capturing media");
-        ignorePromise(endCapture(event));
-      }
-    };
-    instance.onstop = () => {
-      if (lifecycle.current !== true) {
-        setRecording(false);
-      }
-    };
-    instance.start(5000);
-    captureEndingRef.current = null;
-    captureCauseRef.current = undefined;
-    setCaptureEnded(false);
-    if (lifecycle.current === false || lifecycle.current === undefined) {
-      setRecording(true);
-      if (outbox.current?.integrity === "ok") {
-        setError(null);
-      }
-    }
+    options.createSession(remoteMetadata, {
+      onError: failStart,
+      onSuccess: beginCapture,
+    });
   };
   const endCapture = (cause?: unknown): Promise<void> => {
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: capture shutdown serializes media, persistence, and finalization failures.
@@ -1443,7 +1386,8 @@ export function useLiveRecording(
         setFinalizationState({ error: null, state: "queued" });
         await submitSealedRef.current?.();
 
-        const finalizationState = finalizationRef.current?.state;
+        const finalizationState =
+          useRecordingStore.getState().finalization?.state;
         if (finalizationState === "failed") {
           setJourneyOutcome("manual-retry");
         } else if (
@@ -1462,7 +1406,7 @@ export function useLiveRecording(
         if (cause === undefined && failure instanceof Error) {
           setError(failure.message);
         }
-        if (finalizationRef.current?.state === "failed") {
+        if (useRecordingStore.getState().finalization?.state === "failed") {
           setJourneyOutcome("manual-retry");
         } else if (isFatalRecordingFailure(failureCause)) {
           setJourneyOutcome("terminal-restart");
@@ -1493,57 +1437,72 @@ export function useLiveRecording(
     }
     return endCapture();
   };
-  const finalize = async (input: {
+  const finalize = (input: {
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
   }) => {
     revokeRecoveryReset();
     outbox.current?.assertCanFinalize();
-    cancelFinalizationPolling();
+    requestStatus(null);
     setFinalizationState({ error: null, state: "finalizing" });
-    try {
-      const result = await options.finalizeSession(input);
-      const state = normalizeFinalizationStatus(result);
-      if (state === null) {
-        throw new Error("Invalid finalization status");
-      }
-      setFinalizationState({ error: null, state });
-      if (state === "ready") {
-        await outbox.current?.deleteSession(input.sessionId);
-        sealedPlans.current = sealedPlans.current.filter(
-          (plan) => plan.sessionId !== input.sessionId
-        );
-        finalizationInput.current = null;
-        if (
-          !sealedPlans.current.length &&
-          session.current?.status === "recording"
-        ) {
-          setFinalizationState(null);
+    options.finalizeSession(input, {
+      onError: (finalizeError) => {
+        finalizationInFlight.current = false;
+        const retryable =
+          outbox.current?.saveState === "offline" ||
+          isRetryableRecordingFailure(finalizeError);
+        if (retryable) {
+          finalizationAttempted.current = false;
+          setFinalizationState({ error: null, state: "queued" });
+          return;
         }
-        ignorePromise(submitSealedRef.current?.() ?? Promise.resolve());
-      }
-      if (isPendingFinalizationState(state)) {
-        beginFinalizationPolling();
-      }
-    } catch (cause) {
-      const retryable =
-        outbox.current?.saveState === "offline" ||
-        isRetryableRecordingFailure(cause);
-      if (retryable) {
-        finalizationAttempted.current = false;
-        setFinalizationState({ error: null, state: "queued" });
-        throw cause;
-      }
-      setFinalizationState({
-        error: cause instanceof Error ? cause.message : String(cause),
-        state: "failed",
-      });
-      throw cause;
-    }
+        setFinalizationState({
+          error: finalizeError.message,
+          state: "failed",
+        });
+        setError(finalizeError.message);
+      },
+      onSuccess: (result) => {
+        finalizationInFlight.current = false;
+        const state = normalizeFinalizationStatus(result);
+        if (state === null) {
+          setFinalizationState({
+            error: "Invalid finalization status",
+            state: "failed",
+          });
+          return;
+        }
+        setFinalizationState({ error: null, state });
+        if (state === "ready") {
+          ignorePromise(
+            (async () => {
+              await outbox.current?.deleteSession(input.sessionId);
+              sealedPlans.current = sealedPlans.current.filter(
+                (plan) => plan.sessionId !== input.sessionId
+              );
+              finalizationInput.current = null;
+              if (
+                !sealedPlans.current.length &&
+                session.current?.status === "recording"
+              ) {
+                setFinalizationState(null);
+              }
+              await submitSealedRef.current?.();
+            })()
+          );
+          return;
+        }
+        if (isPendingFinalizationState(state)) {
+          requestStatus(input.sessionId);
+          return;
+        }
+        requestStatus(null);
+      },
+    });
   };
   const retryFinalization = async () => {
     if (
-      finalizationRef.current?.state !== "failed" ||
+      useRecordingStore.getState().finalization?.state !== "failed" ||
       !finalizationInput.current
     ) {
       return;
@@ -1574,17 +1533,20 @@ export function useLiveRecording(
     canResetRecoveredRecording,
     captureEnded,
     error,
-    finalization,
+    finalization:
+      options.status === undefined || options.status === null
+        ? finalization
+        : { error: null, state: options.status },
     initialize,
-    integrity: outboxView.integrity,
+    integrity,
     isReady,
     isRecording,
     journeyOutcome,
-    pendingPartCount: outboxView.pendingPartCount,
+    pendingPartCount,
     recovered,
     resetRecoveredRecording,
     retryFinalization,
-    saveState: outboxView.saveState,
+    saveState,
     start,
     stop,
     stream,

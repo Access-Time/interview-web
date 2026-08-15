@@ -70,9 +70,12 @@ it("builds an encoded same-origin submission URL", () => {
 
 it("maps a missing summary lookup to a typed missing result", async () => {
   await expect(
-    playbackSummaryLookup(async () => Promise.reject({ code: "NOT_FOUND" }), {
-      sessionId: "missing",
-    })
+    playbackSummaryLookup(
+      async () => Promise.reject({ code: "RECORDING_NOT_FOUND" }),
+      {
+        sessionId: "missing",
+      }
+    )
   ).resolves.toEqual({ kind: "missing" });
 });
 

@@ -1,9 +1,23 @@
 import { useEffect, useRef } from "react";
+import {
+  getRecordingStoragePolicy,
+  type RecordingStoragePolicy,
+  runRecordingPreflight,
+  wouldBreachRecordingCapacity,
+} from "./recording-admission";
 import type {
   AppendSegmentMutate,
   CreateRecordingMutate,
   FinalizeRecordingMutate,
 } from "./recording-mutate";
+
+// biome-ignore lint/performance/noBarrelFile: preserve the existing public test import surface during extraction.
+export {
+  getRecordingStoragePolicy,
+  runRecordingPreflight,
+  wouldBreachRecordingCapacity,
+} from "./recording-admission";
+
 import { useRecordingStore } from "./recording-store";
 
 export type RecordingSaveState = "healthy" | "retrying" | "offline" | "error";
@@ -132,16 +146,6 @@ export type RecordingStopReason =
   | "capacity"
   | "save-failure"
   | null;
-
-export interface RecordingStoragePolicy {
-  predictedPartBytes: number;
-  recoveryTargetBytes: number;
-  safetyMarginBytes: number;
-}
-
-export type RecordingPreflightResult =
-  | { policy: RecordingStoragePolicy; state: "ready" }
-  | { state: "blocked" };
 
 const partIdentity = (segmentId: string, sequence: number) =>
   `${segmentId}:${sequence}`;
@@ -326,7 +330,6 @@ export interface RecordingRecoveryStore extends PartStore {
   getSession?: (sessionId: string) => Promise<RecordingSession | undefined>;
   listParts?: () => Promise<RecordingPart[]>;
   listSessions?: () => Promise<RecordingSession[]>;
-  probe: () => Promise<void>;
   putPartAndSession?: (
     part: RecordingPart,
     session: RecordingSession
@@ -372,9 +375,6 @@ const MIME_TYPES = [
   "video/mp4",
   "video/webm",
 ];
-const RECORDING_TIMESLICE_MS = 5000;
-const RECOVERY_TARGET_SECONDS = 30 * 60;
-const RECOVERY_SAFETY_MARGIN = 0.25;
 const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
 const INITIAL_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30_000;
@@ -388,92 +388,14 @@ export interface RecordingOutboxSnapshot {
   saveState: RecordingSaveState;
 }
 
-export const getRecordingStoragePolicy = (
-  audioBitsPerSecond: number,
-  videoBitsPerSecond: number
-): RecordingStoragePolicy | null => {
-  if (
-    !(
-      Number.isFinite(audioBitsPerSecond) &&
-      audioBitsPerSecond > 0 &&
-      Number.isFinite(videoBitsPerSecond) &&
-      videoBitsPerSecond > 0
-    )
-  ) {
-    return null;
-  }
-  const bitrateBitsPerSecond = audioBitsPerSecond + videoBitsPerSecond;
-
-  const recoveryTargetBytes = Math.ceil(
-    (bitrateBitsPerSecond / 8) * RECOVERY_TARGET_SECONDS
-  );
-  const safetyMarginBytes = Math.ceil(
-    recoveryTargetBytes * RECOVERY_SAFETY_MARGIN
-  );
-
-  return {
-    predictedPartBytes: Math.ceil(
-      (bitrateBitsPerSecond / 8) * (RECORDING_TIMESLICE_MS / 1000)
-    ),
-    recoveryTargetBytes,
-    safetyMarginBytes,
-  };
-};
-
-interface RecordingStoragePreflightDependencies {
-  probe: () => Promise<void>;
-  storage: {
-    estimate: () => Promise<{ quota?: number; usage?: number }>;
-    persist: () => Promise<boolean>;
-    persisted: () => Promise<boolean>;
-  } | null;
-}
-
-export const runRecordingPreflight = async (
-  dependencies: RecordingStoragePreflightDependencies,
-  policy: RecordingStoragePolicy | null
-): Promise<RecordingPreflightResult> => {
-  if (!(policy && dependencies.storage)) {
-    return { state: "blocked" };
-  }
-
-  try {
-    const alreadyPersistent = await dependencies.storage.persisted();
-    if (!(alreadyPersistent || (await dependencies.storage.persist()))) {
-      return { state: "blocked" };
-    }
-
-    const { quota, usage } = await dependencies.storage.estimate();
-    if (!(Number.isFinite(quota) && Number.isFinite(usage))) {
-      return { state: "blocked" };
-    }
-    const freeBytes = Number(quota) - Number(usage);
-
-    await dependencies.probe();
-    return freeBytes > policy.recoveryTargetBytes + policy.safetyMarginBytes
-      ? { policy, state: "ready" }
-      : { state: "blocked" };
-  } catch {
-    return { state: "blocked" };
-  }
-};
-
-export const wouldBreachRecordingCapacity = (
-  pendingBytes: number,
-  freeBytes: number,
-  policy: RecordingStoragePolicy
-): boolean => {
-  const reservedNextBytes = policy.predictedPartBytes * 2;
-  return (
-    pendingBytes + reservedNextBytes > policy.recoveryTargetBytes ||
-    freeBytes <= reservedNextBytes + policy.safetyMarginBytes
-  );
-};
 const ignorePromise = (promise: Promise<unknown>) => {
   promise.catch(() => undefined);
 };
 
-function browserStore(): RecordingRecoveryStore {
+function browserStore(): {
+  recoveryStore: RecordingRecoveryStore;
+  probe: () => Promise<void>;
+} {
   let database: Promise<IDBDatabase> | undefined;
   const open = () => {
     database ??= new Promise((resolve, reject) => {
@@ -515,7 +437,7 @@ function browserStore(): RecordingRecoveryStore {
             );
         })
     );
-  return {
+  const recoveryStore: RecordingRecoveryStore = {
     delete: (part) =>
       transaction("readwrite", (store) => store.delete(key(part))),
     deleteSession: (sessionId) =>
@@ -575,11 +497,6 @@ function browserStore(): RecordingRecoveryStore {
             request.onerror = () => reject(request.error);
           })
       ),
-    probe: () =>
-      transaction("readwrite", (store) => {
-        store.put({ id: PREFLIGHT_PROBE_KEY });
-        store.delete(PREFLIGHT_PROBE_KEY);
-      }),
     put: (part) =>
       transaction("readwrite", (store) =>
         store.put({ ...part, id: key(part) })
@@ -592,10 +509,16 @@ function browserStore(): RecordingRecoveryStore {
     putSession: (session) =>
       transaction("readwrite", (_, store) => store.put(session)),
   };
+  const probe = () =>
+    transaction("readwrite", (store) => {
+      store.put({ id: PREFLIGHT_PROBE_KEY });
+      store.delete(PREFLIGHT_PROBE_KEY);
+    });
+  return { probe, recoveryStore };
 }
 
 export function createLiveRecordingOutbox(
-  store: RecordingRecoveryStore = browserStore(),
+  store: RecordingRecoveryStore = browserStore().recoveryStore,
   request: typeof fetch = fetch,
   onError?: (error: unknown) => void
 ) {
@@ -1117,6 +1040,7 @@ export function useLiveRecording(
   const preparedRecorderRef = useRef<MediaRecorder | null>(null);
   const recordingPolicyRef = useRef<RecordingStoragePolicy | null>(null);
   const recoveryStoreRef = useRef<RecordingRecoveryStore | null>(null);
+  const probeRef = useRef<(() => Promise<void>) | null>(null);
   const sequence = useRef(0);
   const processing = useRef(new Set<Promise<void>>());
   const ids = useRef<{ sessionId: string; segmentId: string } | null>(null);
@@ -1246,20 +1170,25 @@ export function useLiveRecording(
     useRecordingStore.getState().reset();
     lifecycle.current = false;
     const isDisposed = () => lifecycle.current === true;
-    const recoveryStore = browserStore();
-    recoveryStoreRef.current = recoveryStore;
-    const box = createLiveRecordingOutbox(recoveryStore, undefined, (cause) => {
-      if (isDisposed()) {
-        return;
+    const browserStorage = browserStore();
+    recoveryStoreRef.current = browserStorage.recoveryStore;
+    probeRef.current = browserStorage.probe;
+    const box = createLiveRecordingOutbox(
+      browserStorage.recoveryStore,
+      undefined,
+      (cause) => {
+        if (isDisposed()) {
+          return;
+        }
+        if (isRetryableRecordingFailure(cause)) {
+          return;
+        }
+        captureCauseRef.current = cause;
+        setError(cause instanceof Error ? cause.message : String(cause));
+        setJourneyOutcome("terminal-restart");
+        ignorePromise(endCapture(cause));
       }
-      if (isRetryableRecordingFailure(cause)) {
-        return;
-      }
-      captureCauseRef.current = cause;
-      setError(cause instanceof Error ? cause.message : String(cause));
-      setJourneyOutcome("terminal-restart");
-      ignorePromise(endCapture(cause));
-    });
+    );
     outbox.current = box;
     const emitOutbox = () => {
       const {
@@ -1492,8 +1421,9 @@ export function useLiveRecording(
   const prepareRecording = async () => {
     const media = streamRef.current;
     const recoveryStore = recoveryStoreRef.current;
+    const probe = probeRef.current;
     // biome-ignore lint/suspicious/noUnnecessaryConditions: refs are populated after initialize.
-    if (!(media && recoveryStore)) {
+    if (!(media && recoveryStore && probe)) {
       setRecordingPreflightState("blocked");
       return;
     }
@@ -1505,7 +1435,7 @@ export function useLiveRecording(
     );
     const result = await runRecordingPreflight(
       {
-        probe: () => recoveryStore.probe(),
+        probe,
         storage: navigator.storage ?? null,
       },
       policy

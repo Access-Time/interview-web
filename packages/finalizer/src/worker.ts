@@ -60,6 +60,18 @@ export class RecordingFinalizerContainer extends Container {
   sleepAfter = "10m";
   pingEndpoint = "container/health";
   enableInternet = false;
+
+  override async onActivityExpired() {
+    // Remove the instance instead of leaving a stopped container in Docker.
+    await this.destroy();
+  }
+}
+
+export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
+  // One instance: jobs stay isolated under /jobs/:id, and Alchemy caps this
+  // class at maxInstances: 1. A name per attempt starts a new Durable Object
+  // and a new local Docker container that workerd leaves stopped.
+  return getContainer(env.FINALIZER);
 }
 
 function hex(bytes: ArrayBuffer) {
@@ -393,10 +405,7 @@ export async function handleQueueMessage(
 ) {
   try {
     await processFinalization({
-      containerForAttempt: (attempt) =>
-        deterministicJobName(message.body.sessionId, attempt).then((name) =>
-          getContainer(env.FINALIZER, name)
-        ),
+      containerForAttempt: () => getFinalizerContainer(env),
       db: createDb(env.DB),
       recordings: env.RECORDINGS,
       sessionId: message.body.sessionId,

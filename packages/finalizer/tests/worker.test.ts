@@ -16,9 +16,11 @@ vi.mock("@interview-web/db", () => ({
   renewRecordingFinalizationLease: vi.fn(),
 }));
 
+import { getContainer } from "@cloudflare/containers";
 import {
   dispatchFinalizationRequest,
   type FinalizerEnv,
+  getFinalizerContainer,
   isExactFinalizerOutput,
   outputMediaType,
   validateFinalizePlan,
@@ -88,6 +90,17 @@ describe("dispatchFinalizationRequest", () => {
 
     expect(response.status).toBe(503);
   });
+});
+
+it("reuses one finalizer container instead of naming one per attempt", () => {
+  const namespace = {
+    idFromName: vi.fn(),
+  } as unknown as FinalizerEnv["FINALIZER"];
+  const stub = { fetch: vi.fn() };
+  vi.mocked(getContainer).mockReturnValue(stub as never);
+
+  expect(getFinalizerContainer({ FINALIZER: namespace })).toBe(stub);
+  expect(getContainer).toHaveBeenCalledExactlyOnceWith(namespace);
 });
 
 it("manifest validation accepts contiguous bounded parts", () => {

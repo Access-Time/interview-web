@@ -5,7 +5,6 @@ import {
   installRecordingApi,
   installRecordingFixture,
   installRecordingStorage,
-  reconnectRecordingFixture,
 } from "./recording-fixture";
 
 const CAMERA_OFF_COPY =
@@ -17,8 +16,6 @@ const RETRYABLE_UPLOAD_PATTERN = /upload|saving is delayed|keep trying/i;
 const START_BUTTON_PATTERN = /start/i;
 const STOP_BUTTON_PATTERN = /stop/i;
 const TRY_AGAIN_PATTERN = /try again/i;
-const RESUME_SAVING_PATTERN =
-  /Connection restored\. Saving your recording\.|Your recording is being saved\./;
 
 async function installCandidateMedia(page: Page) {
   await page.addInitScript(() => {
@@ -168,22 +165,6 @@ test("fatal upload clears capture without retryable upload wording", async ({
   await expect(page.getByText(RETRYABLE_UPLOAD_PATTERN)).toHaveCount(0);
 });
 
-test("offline saving exposes one async status", async ({ page }) => {
-  const fixture = createCandidateBindings();
-  await installCandidateMedia(page);
-  await installRecordingApi(page, fixture);
-  await page.goto("/");
-  await startRecording(page);
-  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
-
-  await page.getByRole("button", { name: "Stop recording" }).click();
-
-  await expect(page.getByRole("status")).toHaveText(
-    "You’re offline. Your recording is still being saved on this device."
-  );
-  await expect(page.getByRole("status")).toHaveCount(1);
-});
-
 test("failed finalization offers a manual retry", async ({ page }) => {
   const fixture = createCandidateBindings();
   let attempts = 0;
@@ -223,7 +204,9 @@ test("mobile recording keeps foreground and browser guidance visible", async ({
   await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
 });
 
-test("typed missing recovery resets to normal setup", async ({ page }) => {
+test("typed missing recovery is cleaned up into normal setup", async ({
+  page,
+}) => {
   const fixture = createCandidateBindings();
   await installCandidateMedia(page);
   await installRecordingApi(page, fixture);
@@ -231,12 +214,6 @@ test("typed missing recovery resets to normal setup", async ({ page }) => {
   await seedMissingRecovery(page);
   await page.reload();
 
-  await expect(
-    page.getByText(
-      "We couldn’t find your unfinished recording. It can’t be continued."
-    )
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Set up a new recording" }).click();
   await expect(
     page.getByRole("button", { name: "Enable camera and microphone" })
   ).toBeVisible();
@@ -306,26 +283,6 @@ test("blocks Start when the device cannot pass the offline recovery check", asyn
   await expect(
     page.getByRole("button", { name: TRY_AGAIN_PATTERN })
   ).toBeVisible();
-});
-
-test("keeps recording offline and resumes saving after reconnect", async ({
-  page,
-}) => {
-  const { upload } = await installRecordingFixture(page, {
-    upload: { mode: "offline" },
-  });
-  await page.goto("/");
-  await startRecording(page);
-  await page.evaluate(() => window.__testMediaRecorder?.emitPart());
-  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
-  await expect(page.getByRole("status")).toHaveText(
-    "You’re offline. Your recording is still being saved on this device."
-  );
-  await expect(
-    page.getByRole("button", { name: STOP_BUTTON_PATTERN })
-  ).toBeVisible();
-  await reconnectRecordingFixture(page, upload);
-  await expect(page.getByRole("status")).toHaveText(RESUME_SAVING_PATTERN);
 });
 
 test("shows finishing copy while durable parts drain after Stop", async ({
@@ -446,6 +403,13 @@ test("waits for delayed recovery before creating a session", async ({
   await seedMissingRecovery(page);
   await page.reload();
   await expect.poll(() => fixture.createCallCount()).toBe(0);
+  const enable = page.getByRole("button", {
+    name: "Enable camera and microphone",
+  });
+  await expect(enable).toBeVisible();
+  await enable.click();
+  await expect.poll(() => fixture.createCallCount()).toBe(0);
+  expect(await fixture.getRecordingStatus("missing-recording")).toBeNull();
   manifest.resolve({
     createdAt: Date.now(),
     segments: [

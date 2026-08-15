@@ -5,7 +5,10 @@ import {
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "../src/recording/live-recording";
-import type { RecordingCommands } from "../src/recording/recording-commands";
+import type {
+  RecordingCommands,
+  RecordingFinalizationState,
+} from "../src/recording/recording-commands";
 
 interface Records {
   parts: Map<string, unknown>;
@@ -14,6 +17,7 @@ interface Records {
 let latest: UseLiveRecordingResult | null = null;
 let finalizeFailure = false;
 let finalizeCalls = 0;
+let statusCalls = 0;
 
 const commands = (): RecordingCommands => ({
   appendSegment: vi.fn().mockResolvedValue(undefined),
@@ -142,7 +146,11 @@ class FakeMediaRecorder extends EventTarget {
   }
 }
 
-function mount(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
+function mount(
+  writeFailsAfterPart = Number.POSITIVE_INFINITY,
+  statusResults: Array<RecordingFinalizationState | null> = [],
+  finalizeStatus: RecordingFinalizationState = "ready"
+) {
   const records = installIndexedDb(writeFailsAfterPart);
   Object.defineProperty(navigator, "onLine", {
     configurable: true,
@@ -173,12 +181,16 @@ function mount(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
     value: vi.fn(async () => new Response(null, { status: 204 })),
   });
   const recordingCommands = commands();
+  recordingCommands.getStatus = vi.fn(() => {
+    statusCalls += 1;
+    return Promise.resolve(statusResults.shift() ?? null);
+  });
   recordingCommands.finalizeSession = vi.fn(() => {
     finalizeCalls += 1;
     if (finalizeFailure) {
-      throw new Error("finalization unavailable");
+      return Promise.reject(new Error("finalization unavailable"));
     }
-    return Promise.resolve({ status: "ready" });
+    return Promise.resolve({ status: finalizeStatus });
   });
   function Host() {
     latest = useLiveRecording(recordingCommands);
@@ -193,6 +205,7 @@ afterEach(() => {
   latest = null;
   finalizeFailure = false;
   finalizeCalls = 0;
+  statusCalls = 0;
   FakeMediaRecorder.last = null;
 });
 
@@ -253,6 +266,25 @@ it("offers manual retry after rendered finalization failure", async () => {
   await act(() => latest?.retryFinalization());
   await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
   expect(finalizeCalls).toBe(2);
+});
+
+it("keeps polling through a missing status until finalization is ready", async () => {
+  mount(Number.POSITIVE_INFINITY, [null, "queued", "ready"], "queued");
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  await act(async () => {
+    await latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("normal");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"), {
+    timeout: 4000,
+  });
+  expect(statusCalls).toBe(3);
 });
 
 it("reports a rendered local write failure", async () => {

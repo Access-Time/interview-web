@@ -709,7 +709,11 @@ export function useLiveRecording(
     const poll = async (): Promise<void> => {
       try {
         const state = await options.getStatus({ sessionId });
-        if (generation !== pollGeneration.current || state === null) {
+        if (generation !== pollGeneration.current) {
+          return;
+        }
+        if (state === null) {
+          pollTimer.current = setTimeout(poll, 1000);
           return;
         }
         setFinalizationState({ error: null, state });

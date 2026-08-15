@@ -4,14 +4,24 @@ import {
   shouldWarnBeforeUnload,
 } from "../src/routes/index";
 
-it("warns while capture or unsent media remains", () => {
-  expect(
-    shouldWarnBeforeUnload({
-      hasIncompleteRecordingFinalization: false,
-      hasUnsentRecordingMedia: true,
-      recording: false,
-    })
-  ).toBe(true);
+it.each([
+  {
+    hasIncompleteRecordingFinalization: false,
+    hasUnsentRecordingMedia: false,
+    recording: true,
+  },
+  {
+    hasIncompleteRecordingFinalization: true,
+    hasUnsentRecordingMedia: false,
+    recording: false,
+  },
+  {
+    hasIncompleteRecordingFinalization: false,
+    hasUnsentRecordingMedia: true,
+    recording: false,
+  },
+])("warns before unload for active recording state %#", (input) => {
+  expect(shouldWarnBeforeUnload(input)).toBe(true);
 });
 
 it("hands off a local save failure as a blocking error", () => {

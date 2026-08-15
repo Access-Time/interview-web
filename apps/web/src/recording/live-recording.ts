@@ -136,6 +136,7 @@ interface RecordingJourneyState {
 
 const isPendingFinalizationState = (state: RecordingFinalizationState) =>
   state === "queued" || state === "finalizing";
+const RECORDING_TIMESLICE_MS = 5000;
 
 interface PartStore {
   delete: (part: RecordingPart) => Promise<void>;
@@ -647,9 +648,11 @@ export function useLiveRecording(
   const pollGeneration = useRef(0);
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
+  const startInFlight = useRef<Promise<void> | null>(null);
   const captureEndingRef = useRef<Promise<void> | null>(null);
   const captureCauseRef = useRef<unknown>(undefined);
   const finalizationInFlight = useRef(false);
+  const finalizationPromise = useRef<Promise<void> | null>(null);
   const sealedPumpLock = useRef(false);
   const sealedPlans = useRef<
     Array<{
@@ -678,15 +681,20 @@ export function useLiveRecording(
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
   }) => {
-    await outbox.current?.deleteSession(input.sessionId);
+    setFinalizationState({ error: null, state: "ready" });
+    setIncompleteFinalization(false);
+    cancelFinalizationPolling();
+    try {
+      await outbox.current?.deleteSession(input.sessionId);
+    } catch {
+      setError("Recording completed, but local cleanup failed.");
+    }
     sealedPlans.current = sealedPlans.current.filter(
       (plan) => plan.sessionId !== input.sessionId
     );
     if (finalizationInput.current?.sessionId === input.sessionId) {
       finalizationInput.current = null;
     }
-    setFinalizationState({ error: null, state: "ready" });
-    setIncompleteFinalization(false);
     if (
       !sealedPlans.current.length &&
       session.current?.status === "recording"
@@ -706,6 +714,7 @@ export function useLiveRecording(
       return;
     }
     const generation = pollGeneration.current;
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: polling handles transient, pending, and terminal states in one serialized loop.
     const poll = async (): Promise<void> => {
       try {
         const state = await options.getStatus({ sessionId });
@@ -723,6 +732,11 @@ export function useLiveRecording(
           await completeReadyFinalization(
             finalizationInput.current ?? { segments: [], sessionId }
           );
+        } else if (state === "failed") {
+          setFinalizationState({ error: null, state: "failed" });
+          setIncompleteFinalization(true);
+          setJourneyOutcome("manual-retry");
+          cancelFinalizationPolling();
         }
       } catch {
         if (generation === pollGeneration.current) {
@@ -780,7 +794,7 @@ export function useLiveRecording(
             await box.drain();
             finalizationAttempted.current = true;
             finalizationInFlight.current = true;
-            finalize(plan);
+            await finalize(plan);
             return;
           } catch (cause) {
             finalizationInFlight.current = false;
@@ -806,7 +820,12 @@ export function useLiveRecording(
       if (generation !== recoveryGeneration.current || isDisposed()) {
         return recovery;
       }
-      if (recovery.recovered) {
+      if (recovery.missing) {
+        ids.current = null;
+        session.current = null;
+        setRecovered(false);
+        setCanResetRecoveredRecording(false);
+      } else if (recovery.recovered) {
         setRecovered(true);
       }
       if (recovery.session) {
@@ -821,7 +840,7 @@ export function useLiveRecording(
       }
       if (recovery.missing) {
         setJourneyOutcome("missing-recovery");
-        setCanResetRecoveredRecording(Boolean(recovery.session && ids.current));
+        setCanResetRecoveredRecording(false);
       } else {
         revokeRecoveryReset();
       }
@@ -836,6 +855,14 @@ export function useLiveRecording(
             return;
           }
           await task();
+        })
+        .catch((cause) => {
+          if (generation === recoveryGeneration.current && !isDisposed()) {
+            setError(
+              `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`
+            );
+          }
+          throw cause;
         });
       recoveryPromise.current = next;
       return next;
@@ -958,6 +985,11 @@ export function useLiveRecording(
 
   const initialize = async () => {
     try {
+      await recoveryPromise.current;
+    } catch {
+      // Recovery remains blocking for Start, but device access can still report its own error.
+    }
+    try {
       const acquired = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: { facingMode: "user" },
@@ -985,26 +1017,23 @@ export function useLiveRecording(
 
   const retryRecordingPreflight = async () => {
     // biome-ignore lint/suspicious/noUnnecessaryConditions: retry is a no-op before a stream exists.
-    if (!streamRef.current) {
+    if (streamRef.current === null) {
       return;
     }
     await prepareRecording();
   };
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
-  const start = async () => {
+  const startRecording = async () => {
     await recoveryPromise.current;
     revokeRecoveryReset();
     if (sealedPlans.current.length) {
       throw new Error("The previous recording is still being finalized");
     }
-    if (!stream) {
+    if (streamRef.current === null) {
       throw new Error("Recording is not initialized");
     }
-    if (
-      recordingPreflightState !== "ready" ||
-      !preparedRecorderRef.current ||
-      !recordingPolicyRef.current
-    ) {
+    await prepareRecording();
+    if (!(preparedRecorderRef.current && recordingPolicyRef.current)) {
       return;
     }
     const requested =
@@ -1141,7 +1170,7 @@ export function useLiveRecording(
           setRecording(false);
         }
       };
-      instance.start(5000);
+      instance.start(RECORDING_TIMESLICE_MS);
       captureEndingRef.current = null;
       captureCauseRef.current = undefined;
       setCaptureEnded(false);
@@ -1155,27 +1184,47 @@ export function useLiveRecording(
         startError instanceof Error ? startError.message : String(startError)
       );
     };
-    if (recordingRemoteAction(previous, resumeTail) === "append") {
-      options.appendSegment(remoteMetadata).then(beginCapture).catch(failStart);
-      return;
+    try {
+      if (recordingRemoteAction(previous, resumeTail) === "append") {
+        await options.appendSegment(remoteMetadata);
+      } else {
+        await options.createSession(remoteMetadata);
+      }
+      beginCapture();
+    } catch (cause) {
+      failStart(cause);
+      throw cause;
     }
-    options.createSession(remoteMetadata).then(beginCapture).catch(failStart);
+  };
+  const start = () => {
+    if (startInFlight.current) {
+      return startInFlight.current;
+    }
+    const operation = startRecording().finally(() => {
+      startInFlight.current = null;
+    });
+    startInFlight.current = operation;
+    return operation;
   };
   const evaluateCapacityStop = async (policy: RecordingStoragePolicy) => {
     try {
       const estimate = await navigator.storage?.estimate();
       const quota = estimate?.quota;
       const usage = estimate?.usage;
-      const freeBytes =
-        Number.isFinite(quota) && Number.isFinite(usage)
-          ? Number(quota) - Number(usage)
-          : 0;
+      const persistedBytes = outbox.current?.getPersistedBytes() ?? 0;
+      const validEstimate =
+        Number.isFinite(quota) &&
+        Number.isFinite(usage) &&
+        Number(quota) >= 0 &&
+        Number(usage) >= 0;
+      const freeBytes = validEstimate
+        ? Number(quota) - Number(usage)
+        : Number.NaN;
       if (
-        wouldBreachRecordingCapacity(
-          outbox.current?.getPersistedBytes() ?? 0,
-          freeBytes,
-          policy
-        )
+        !Number.isFinite(persistedBytes) ||
+        persistedBytes < 0 ||
+        !Number.isFinite(freeBytes) ||
+        wouldBreachRecordingCapacity(persistedBytes, freeBytes, policy)
       ) {
         shouldSafetyStop.current = true;
       }
@@ -1344,57 +1393,63 @@ export function useLiveRecording(
     revokeRecoveryReset();
     requestStatus(null);
     setFinalizationState({ error: null, state: "finalizing" });
-    ignorePromise(
-      options.finalizeSession(input).then(
-        (result) => {
-          finalizationInFlight.current = false;
-          const state = normalizeFinalizationStatus(result);
-          if (state === null) {
-            setFinalizationState({
-              error: "Invalid finalization status",
-              state: "failed",
-            });
-            setIncompleteFinalization(true);
-            setJourneyOutcome("manual-retry");
-            return;
-          }
-          setFinalizationState({ error: null, state });
-          if (state === "ready") {
-            ignorePromise(completeReadyFinalization(input));
-          } else if (isPendingFinalizationState(state)) {
-            requestStatus(input.sessionId);
-          }
-        },
-        (finalizeError: unknown) => {
-          finalizationInFlight.current = false;
-          const retryable =
-            outbox.current?.saveState === "offline" ||
-            isRetryableRecordingFailure(finalizeError);
-          if (retryable) {
-            finalizationAttempted.current = false;
-            setFinalizationState({ error: null, state: "queued" });
-            return;
-          }
-          const message =
-            finalizeError instanceof Error
-              ? finalizeError.message
-              : String(finalizeError);
+    const operation = options.finalizeSession(input).then(
+      (result) => {
+        finalizationInFlight.current = false;
+        const state = normalizeFinalizationStatus(result);
+        if (state === null) {
           setFinalizationState({
-            error: message,
+            error: "Invalid finalization status",
             state: "failed",
           });
           setIncompleteFinalization(true);
           setJourneyOutcome("manual-retry");
-          setError(message);
+          return;
         }
-      )
+        setFinalizationState({ error: null, state });
+        if (state === "ready") {
+          return completeReadyFinalization(input);
+        }
+        if (isPendingFinalizationState(state)) {
+          requestStatus(input.sessionId);
+        } else if (state === "failed") {
+          setIncompleteFinalization(true);
+          setJourneyOutcome("manual-retry");
+        }
+      },
+      (finalizeError: unknown) => {
+        finalizationInFlight.current = false;
+        const retryable =
+          outbox.current?.saveState === "offline" ||
+          isRetryableRecordingFailure(finalizeError);
+        if (retryable) {
+          finalizationAttempted.current = false;
+          setFinalizationState({ error: null, state: "queued" });
+          return;
+        }
+        const message =
+          finalizeError instanceof Error
+            ? finalizeError.message
+            : String(finalizeError);
+        setFinalizationState({
+          error: message,
+          state: "failed",
+        });
+        setIncompleteFinalization(true);
+        setJourneyOutcome("manual-retry");
+        setError(message);
+      }
     );
+    finalizationPromise.current = operation;
+    ignorePromise(operation);
+    return operation;
   };
   const retryFinalization = async () => {
     if (finalization?.state !== "failed" || !finalizationInput.current) {
       return;
     }
     await submitSealedRef.current?.();
+    await finalizationPromise.current;
   };
   const resetRecoveredRecording = async () => {
     const currentIds = ids.current;

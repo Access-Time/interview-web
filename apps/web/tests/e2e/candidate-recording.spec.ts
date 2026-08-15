@@ -286,10 +286,11 @@ test("blocks Start when the device cannot pass the offline recovery check", asyn
     if (await enable.isVisible()) {
       await enable.click();
     }
-    await expect(page.getByRole("alert").first()).toContainText(blockedCopy, {
+    await expect(page.getByRole("alert")).toContainText(blockedCopy, {
       timeout: 500,
     });
   }).toPass({ timeout: 8000 });
+  await expect(page.getByRole("alert")).toHaveCount(1);
   await expect(
     page.getByRole("button", { name: START_BUTTON_PATTERN })
   ).toHaveCount(0);

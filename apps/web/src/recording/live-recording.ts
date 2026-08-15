@@ -649,6 +649,7 @@ export function useLiveRecording(
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
   const recoveryBlocked = useRef(false);
+  const recoveryError = useRef<string | null>(null);
   const deviceAccessFailed = useRef(false);
   const recoveredSessionId = useRef<string | null>(null);
   const startInFlight = useRef<Promise<void> | null>(null);
@@ -846,10 +847,12 @@ export function useLiveRecording(
       }
       if (recovery.missing) {
         recoveryBlocked.current = false;
+        recoveryError.current = null;
         setJourneyOutcome("missing-recovery");
         setCanResetRecoveredRecording(Boolean(recoveredSessionId.current));
       } else {
         recoveryBlocked.current = false;
+        recoveryError.current = null;
         revokeRecoveryReset();
       }
       return recovery;
@@ -865,15 +868,12 @@ export function useLiveRecording(
           await task();
         })
         .catch((cause) => {
-          if (
-            generation === recoveryGeneration.current &&
-            !isDisposed() &&
-            !deviceAccessFailed.current
-          ) {
+          if (generation === recoveryGeneration.current && !isDisposed()) {
             recoveryBlocked.current = true;
-            setError(
-              `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`
-            );
+            recoveryError.current = `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`;
+            if (!deviceAccessFailed.current) {
+              setError(recoveryError.current);
+            }
           }
           throw cause;
         });
@@ -1012,10 +1012,7 @@ export function useLiveRecording(
       streamRef.current = acquired;
       setStream(acquired);
       setReady(true);
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: mutable recovery state is updated by the lifecycle queue.
-      if (!recoveryBlocked.current) {
-        setError(null);
-      }
+      setError(recoveryBlocked.current ? recoveryError.current : null);
       try {
         await recoveryPromise.current;
       } catch {

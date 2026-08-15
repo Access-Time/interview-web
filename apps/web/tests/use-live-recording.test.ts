@@ -395,6 +395,30 @@ it("surfaces recovery failure before media acquisition and blocks Start", async 
   });
 });
 
+it("restores recovery failure after an early device error and later media success", async () => {
+  const manifest = deferred<RecordingManifestLookup>();
+  manifestOverride = () => manifest.promise;
+  mediaOverride = () => Promise.reject(new Error("device unavailable"));
+  mount(Number.POSITIVE_INFINITY, [], "ready", [storedRecording("precedence")]);
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.error).toContain("device unavailable"));
+  await act(async () => {
+    manifest.reject(new Error("recovery unavailable"));
+    await Promise.resolve();
+  });
+  mediaOverride = () =>
+    Promise.resolve({
+      getTracks: () => [{ stop: vi.fn() }],
+    } as unknown as MediaStream);
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.error).toContain("recovery unavailable"));
+  await act(async () => {
+    await expect(latest?.start()).rejects.toThrow("recovery unavailable");
+  });
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
+});
+
 it("blocks a fresh preflight without remote creation or recorder start", async () => {
   storageEstimateOverride = () => Promise.resolve({ quota: 1, usage: 1 });
   mount();
@@ -455,6 +479,7 @@ it("shares an in-flight rendered start", async () => {
   await act(async () => {
     await Promise.all([first, second]);
   });
+  expect(FakeMediaRecorder.starts).toBe(1);
 });
 
 it("keeps ready state when local cleanup fails", async () => {

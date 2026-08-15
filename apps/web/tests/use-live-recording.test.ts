@@ -1,6 +1,7 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
 import { afterEach, expect, it, vi } from "vitest";
+import type { RecordingSession } from "../src/recording/live-recording";
 import {
   type UseLiveRecordingResult,
   useLiveRecording,
@@ -8,6 +9,7 @@ import {
 import type {
   RecordingCommands,
   RecordingFinalizationState,
+  RecordingManifestLookup,
 } from "../src/recording/recording-commands";
 
 interface Records {
@@ -16,7 +18,14 @@ interface Records {
 }
 let latest: UseLiveRecordingResult | null = null;
 let finalizeFailure = false;
+let finalizeStatuses: RecordingFinalizationState[] = [];
 let createSessionOverride: (() => Promise<void>) | null = null;
+let manifestOverride: (() => Promise<RecordingManifestLookup>) | null = null;
+let storageEstimateOverride:
+  | (() => Promise<{ quota?: number; usage?: number }>)
+  | null = null;
+let cleanupFails = false;
+let lastCommands: RecordingCommands | null = null;
 let finalizeCalls = 0;
 let statusCalls = 0;
 
@@ -32,7 +41,11 @@ const commands = (): RecordingCommands => ({
   appendSegment: vi.fn().mockResolvedValue(undefined),
   createSession: vi.fn(() => createSessionOverride?.() ?? Promise.resolve()),
   finalizeSession: vi.fn().mockResolvedValue({ status: "ready" }),
-  getManifest: vi.fn().mockResolvedValue({ kind: "missing" }),
+  getManifest: vi.fn(() =>
+    manifestOverride
+      ? manifestOverride()
+      : Promise.resolve<RecordingManifestLookup>({ kind: "missing" })
+  ),
   getStatus: vi.fn().mockResolvedValue(null),
 });
 
@@ -79,6 +92,9 @@ function installIndexedDb(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
         error: null,
         objectStore: (name: "parts" | "sessions") => ({
           delete: (key: IDBValidKey) => {
+            if (cleanupFails && name === "sessions") {
+              throw new Error("cleanup failed");
+            }
             records[name].delete(String(key));
             queueMicrotask(() => transaction.oncomplete?.());
           },
@@ -127,6 +143,7 @@ function installIndexedDb(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
 
 class FakeMediaRecorder extends EventTarget {
   static last: FakeMediaRecorder | null = null;
+  static starts = 0;
   static isTypeSupported = () => true;
   audioBitsPerSecond = 128_000;
   videoBitsPerSecond = 1_000_000;
@@ -140,6 +157,7 @@ class FakeMediaRecorder extends EventTarget {
     FakeMediaRecorder.last = this;
   }
   start() {
+    FakeMediaRecorder.starts += 1;
     this.state = "recording";
   }
   stop() {
@@ -158,9 +176,13 @@ class FakeMediaRecorder extends EventTarget {
 function mount(
   writeFailsAfterPart = Number.POSITIVE_INFINITY,
   statusResults: Array<RecordingFinalizationState | null> = [],
-  finalizeStatus: RecordingFinalizationState = "ready"
+  finalizeStatus: RecordingFinalizationState = "ready",
+  initialSessions: RecordingSession[] = []
 ) {
   const records = installIndexedDb(writeFailsAfterPart);
+  for (const initialSession of initialSessions) {
+    records.sessions.set(initialSession.sessionId, initialSession);
+  }
   Object.defineProperty(navigator, "onLine", {
     configurable: true,
     value: true,
@@ -168,7 +190,11 @@ function mount(
   Object.defineProperty(navigator, "storage", {
     configurable: true,
     value: {
-      estimate: vi.fn().mockResolvedValue({ quota: 1_000_000_000, usage: 10 }),
+      estimate: vi.fn(() =>
+        storageEstimateOverride
+          ? storageEstimateOverride()
+          : Promise.resolve({ quota: 1_000_000_000, usage: 10 })
+      ),
       persist: vi.fn().mockResolvedValue(true),
       persisted: vi.fn().mockResolvedValue(true),
     },
@@ -190,6 +216,7 @@ function mount(
     value: vi.fn(async () => new Response(null, { status: 204 })),
   });
   const recordingCommands = commands();
+  lastCommands = recordingCommands;
   recordingCommands.getStatus = vi.fn(() => {
     statusCalls += 1;
     return Promise.resolve(statusResults.shift() ?? null);
@@ -199,7 +226,9 @@ function mount(
     if (finalizeFailure) {
       return Promise.reject(new Error("finalization unavailable"));
     }
-    return Promise.resolve({ status: finalizeStatus });
+    return Promise.resolve({
+      status: finalizeStatuses.shift() ?? finalizeStatus,
+    });
   });
   function Host() {
     latest = useLiveRecording(recordingCommands);
@@ -215,8 +244,14 @@ afterEach(() => {
   finalizeFailure = false;
   createSessionOverride = null;
   finalizeCalls = 0;
+  finalizeStatuses = [];
   statusCalls = 0;
   FakeMediaRecorder.last = null;
+  FakeMediaRecorder.starts = 0;
+  manifestOverride = null;
+  storageEstimateOverride = null;
+  cleanupFails = false;
+  lastCommands = null;
 });
 
 it("reports a preflight access error without delivery state", async () => {
@@ -256,6 +291,92 @@ it("completes a normal rendered recording", async () => {
   expect(finalizeCalls).toBe(1);
 });
 
+const storedRecording = (
+  sessionId: string,
+  status: "recording" | "sealed" = "recording"
+): RecordingSession => ({
+  recorderMimeType: "video/webm",
+  requestedMimeType: "video/webm",
+  segments: [
+    {
+      partCount: status === "sealed" ? 1 : 0,
+      segmentId: `${sessionId}-segment`,
+    },
+  ],
+  sessionId,
+  status,
+});
+
+it("waits for delayed recovery before making the remote start call", async () => {
+  const manifest = deferred<RecordingManifestLookup>();
+  manifestOverride = () => manifest.promise;
+  mount(Number.POSITIVE_INFINITY, [], "ready", [storedRecording("recovered")]);
+  let initialize: Promise<void> | undefined;
+  await act(async () => {
+    initialize = latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(lastCommands?.getManifest).toHaveBeenCalled());
+  let start: Promise<void> | undefined;
+  act(() => {
+    start = latest?.start();
+  });
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  manifest.resolve({ kind: "missing" });
+  await initialize;
+  await start;
+  expect(lastCommands?.createSession).toHaveBeenCalledOnce();
+});
+
+it("clears typed-missing recovery and resets by the retained local session ID", async () => {
+  manifestOverride = () => Promise.resolve({ kind: "missing" });
+  const records = mount(Number.POSITIVE_INFINITY, [], "ready", [
+    storedRecording("missing"),
+  ]);
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.canResetRecoveredRecording).toBe(true));
+  expect(latest?.recovered).toBe(false);
+  await act(async () => latest?.resetRecoveredRecording());
+  expect(records.sessions.has("missing")).toBe(false);
+  await act(async () => latest?.start());
+  expect(lastCommands?.createSession).toHaveBeenCalledOnce();
+  expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
+});
+
+it("keeps a non-missing recovery failure blocking through initialization and Start", async () => {
+  manifestOverride = () => Promise.reject(new Error("manifest unavailable"));
+  mount(Number.POSITIVE_INFINITY, [], "ready", [storedRecording("blocked")]);
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.error).toContain("manifest unavailable"));
+  await expect(latest?.start()).rejects.toThrow("manifest unavailable");
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
+});
+
+it("blocks a fresh preflight without remote creation or recorder start", async () => {
+  storageEstimateOverride = () => Promise.resolve({ quota: 1, usage: 1 });
+  mount();
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("blocked"));
+  await act(async () => latest?.start());
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
+  expect(FakeMediaRecorder.starts).toBe(0);
+});
+
+it("safety-stops after a fresh invalid capacity estimate", async () => {
+  mount();
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  await act(async () => latest?.start());
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  storageEstimateOverride = () =>
+    Promise.resolve({ quota: Number.NaN, usage: 0 });
+  FakeMediaRecorder.last?.emitPart("capacity");
+  await waitFor(() => expect(latest?.recordingStopReason).toBe("capacity"));
+  expect(latest?.isRecording).toBe(false);
+});
+
 it("shares an in-flight rendered start", async () => {
   const create = deferred<void>();
   createSessionOverride = () => create.promise;
@@ -271,13 +392,43 @@ it("shares an in-flight rendered start", async () => {
     first = latest?.start();
     second = latest?.start();
   });
+  expect(first).toBe(second);
+  await waitFor(() =>
+    expect(lastCommands?.createSession).toHaveBeenCalledOnce()
+  );
+  expect(lastCommands?.createSession).toHaveBeenCalledOnce();
   create.resolve();
   await act(async () => {
     await Promise.all([first, second]);
   });
 });
 
+it("keeps ready state when local cleanup fails", async () => {
+  cleanupFails = true;
+  mount();
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  await act(async () => latest?.start());
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("cleanup");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(latest?.error).toBe("Recording completed, but local cleanup failed.");
+  expect(latest?.hasIncompleteRecordingFinalization).toBe(false);
+});
+
+it("submits every recovered sealed plan when each finalizes immediately", async () => {
+  const plans = [
+    storedRecording("sealed-a", "sealed"),
+    storedRecording("sealed-b", "sealed"),
+  ];
+  mount(Number.POSITIVE_INFINITY, [], "ready", plans);
+  await waitFor(() => expect(finalizeCalls).toBe(2));
+  expect(lastCommands?.finalizeSession).toHaveBeenCalledTimes(2);
+});
+
 it("keeps remote failed finalization retryable", async () => {
+  finalizeStatuses = ["failed", "ready"];
   mount(Number.POSITIVE_INFINITY, [], "failed");
   await act(async () => {
     latest?.initialize();
@@ -290,6 +441,9 @@ it("keeps remote failed finalization retryable", async () => {
   await act(() => latest?.stop());
   await waitFor(() => expect(latest?.finalization?.state).toBe("failed"));
   expect(latest?.hasIncompleteRecordingFinalization).toBe(true);
+  await act(() => latest?.retryFinalization());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(finalizeCalls).toBe(2);
 });
 
 it("offers manual retry after rendered finalization failure", async () => {

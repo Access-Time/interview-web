@@ -864,7 +864,11 @@ export function useLiveRecording(
           await task();
         })
         .catch((cause) => {
-          if (generation === recoveryGeneration.current && !isDisposed()) {
+          if (
+            generation === recoveryGeneration.current &&
+            !isDisposed() &&
+            streamRef.current !== null
+          ) {
             recoveryBlocked.current = true;
             setError(
               `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`
@@ -993,11 +997,6 @@ export function useLiveRecording(
 
   const initialize = async () => {
     try {
-      await recoveryPromise.current;
-    } catch {
-      // Recovery remains blocking for Start, but device access can still report its own error.
-    }
-    try {
       const acquired = await navigator.mediaDevices.getUserMedia({
         audio: true,
         video: { facingMode: "user" },
@@ -1014,6 +1013,12 @@ export function useLiveRecording(
       // biome-ignore lint/suspicious/noUnnecessaryConditions: mutable recovery state is updated by the lifecycle queue.
       if (!recoveryBlocked.current) {
         setError(null);
+      }
+      try {
+        await recoveryPromise.current;
+      } catch {
+        // Recovery remains blocking for Start, but device access can still report its own error.
+        return;
       }
       await prepareRecording();
     } catch (cause) {

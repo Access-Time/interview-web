@@ -94,6 +94,37 @@ describe("recording outbox", () => {
     expect(calls).toEqual([1, 2, 10]);
   });
 
+  it("does not reorder separate sessions while ordering one segment numerically", async () => {
+    const parts = [
+      { ...part, sequence: 10, sessionId: "z-session" },
+      { ...part, sequence: 2, sessionId: "z-session" },
+      { ...part, sequence: 0, sessionId: "a-session" },
+    ];
+    const retained = [...parts];
+    const calls: string[] = [];
+    const box = createLiveRecordingOutbox(
+      {
+        delete: (value) => {
+          const index = retained.indexOf(value);
+          if (index >= 0) {
+            retained.splice(index, 1);
+          }
+          return Promise.resolve();
+        },
+        discardSession: async () => undefined,
+        listParts: async () => retained,
+        put: async () => undefined,
+      },
+      (url) => {
+        calls.push(String(url).split("/recordings/")[1]?.split("/")[0] ?? "");
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+    );
+    await box.hydrate();
+    await box.drain();
+    expect(calls).toEqual(["z-session", "z-session", "a-session"]);
+  });
+
   it("retains temporary failures and clears stale save state after success", async () => {
     const request = vi
       .fn()

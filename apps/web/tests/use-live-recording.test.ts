@@ -11,6 +11,8 @@ interface Records {
   sessions: Map<string, unknown>;
 }
 let latest: UseLiveRecordingResult | null = null;
+let finalizeFailure = false;
+let finalizeCalls = 0;
 
 function installIndexedDb(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
   const records: Records = { parts: new Map(), sessions: new Map() };
@@ -94,6 +96,7 @@ class FakeMediaRecorder extends EventTarget {
   stop() {
     this.state = "inactive";
     this.emitPart("terminal");
+    this.dispatchEvent(new Event("stop"));
     this.onstop?.();
   }
   emitPart(value: string) {
@@ -133,7 +136,14 @@ function mount(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
     configurable: true,
     value: vi.fn(async () => new Response(null, { status: 204 })),
   });
-  const finalizeSession = vi.fn();
+  const finalizeSession = vi.fn((_input, callbacks) => {
+    finalizeCalls += 1;
+    if (finalizeFailure) {
+      callbacks.onError(new Error("finalization unavailable"));
+      return;
+    }
+    callbacks.onSuccess({ status: "ready" });
+  });
   function Host() {
     latest = useLiveRecording({
       appendSegment: (_input, callbacks) => callbacks.onSuccess(undefined),
@@ -149,6 +159,8 @@ function mount(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
 afterEach(() => {
   cleanup();
   latest = null;
+  finalizeFailure = false;
+  finalizeCalls = 0;
   FakeMediaRecorder.last = null;
 });
 
@@ -168,33 +180,66 @@ it("reports a preflight access error without delivery state", async () => {
     return null;
   }
   render(React.createElement(Host));
-  await act(() => latest?.initialize());
-  expect(latest?.error).toContain("permission denied");
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(latest?.error).toContain("permission denied"));
   expect("recordingDeliveryPhase" in (latest ?? {})).toBe(false);
 });
 
 it("completes a normal rendered recording", async () => {
   mount();
-  await act(() => latest?.initialize());
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
-  expect(latest?.stop).toEqual(expect.any(Function));
-  expect(latest?.finalization).toBeNull();
+  act(() => {
+    latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("normal");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(finalizeCalls).toBe(1);
 });
 
 it("offers manual retry after rendered finalization failure", async () => {
+  finalizeFailure = true;
   mount();
-  await act(() => latest?.initialize());
-  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => {
-    await latest?.retryFinalization();
+    latest?.initialize();
+    await Promise.resolve();
   });
-  expect(latest?.retryFinalization).toEqual(expect.any(Function));
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  act(() => {
+    latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("normal");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("failed"));
+  expect(finalizeCalls).toBe(1);
+  finalizeFailure = false;
+  await act(() => latest?.retryFinalization());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(finalizeCalls).toBe(2);
 });
 
 it("reports a rendered local write failure", async () => {
-  mount(1);
-  await act(() => latest?.initialize());
+  mount(0);
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
-  expect(latest?.saveState).toBe("healthy");
-  expect(latest?.hasUnsentRecordingMedia).toBe(false);
+  act(() => {
+    latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("first");
+  await waitFor(() => expect(latest?.recordingStopReason).toBe("save-failure"));
+  expect(latest?.recordingStopReason).toBe("save-failure");
+  expect(latest?.saveState).toBe("error");
 });

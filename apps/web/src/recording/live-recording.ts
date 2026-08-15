@@ -434,14 +434,22 @@ export function createLiveRecordingOutbox(
       return Promise.resolve();
     }
 
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered drain keeps one active upload and preserves local state transitions.
     flushPromise = (async () => {
       while (online && !disposed) {
-        const [nextPart] = [...pending.values()].sort(
-          (left, right) =>
-            left.sessionId.localeCompare(right.sessionId) ||
-            left.segmentId.localeCompare(right.segmentId) ||
-            left.sequence - right.sequence
-        );
+        const [firstPart] = pending.values();
+        if (!firstPart) {
+          return;
+        }
+        const nextPart = [...pending.values()]
+          .filter(
+            (part) =>
+              part.sessionId === firstPart.sessionId &&
+              part.segmentId === firstPart.segmentId
+          )
+          .reduce((earliest, part) =>
+            part.sequence < earliest.sequence ? part : earliest
+          );
         if (!nextPart) {
           return;
         }
@@ -509,12 +517,10 @@ export function createLiveRecordingOutbox(
         throw failure;
       }
       rememberPendingPart(part);
-      saveState = "healthy";
       onChange?.();
       ignorePromise(flush());
     },
     async recover(lookup?: RecordingManifestLookup) {
-      await flush();
       const sessions = await (store.listSessions?.() ?? Promise.resolve([]));
       const session =
         sessions.find((item) => item.status === "recording") ?? null;
@@ -540,7 +546,6 @@ export function createLiveRecordingOutbox(
         throw failure;
       }
       rememberPendingPart(part);
-      saveState = "healthy";
       onChange?.();
       ignorePromise(flush());
     },
@@ -1017,8 +1022,8 @@ export function useLiveRecording(
   };
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
-    revokeRecoveryReset();
     await recoveryPromise.current;
+    revokeRecoveryReset();
     if (sealedPlans.current.length) {
       throw new Error("The previous recording is still being finalized");
     }

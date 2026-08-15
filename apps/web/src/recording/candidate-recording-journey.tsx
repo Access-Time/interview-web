@@ -2,11 +2,9 @@ import { Banner } from "@cloudflare/kumo/components/banner";
 import { Button } from "@cloudflare/kumo/components/button";
 import { useEffect, useRef } from "react";
 import type {
-  RecordingDeliveryPhase,
   RecordingFinalizationResult,
   RecordingJourneyOutcome,
   RecordingPreflightState,
-  RecordingSaveState,
   RecordingStopReason,
 } from "./live-recording";
 
@@ -35,11 +33,9 @@ export type CandidateRecordingJourneyProps = {
     | "start"
     | "stop"
     | null;
-  recordingDeliveryPhase: RecordingDeliveryPhase;
   recordingPreflightState: RecordingPreflightState;
   recordingStopReason: RecordingStopReason;
   recovered: boolean;
-  saveState: RecordingSaveState;
   savingNotice: string | null;
   stream: MediaStream | null;
 };
@@ -137,17 +133,12 @@ export const RECORDING_DELIVERY_COPY = {
   completionPending: "Your recording is saved. We’re completing it now.",
   finalizationFailure:
     "Your recording is still here, but we couldn’t finish it. Check your connection, then try again.",
-  offline:
-    "You’re offline. Your recording is still being saved on this device.",
   preflightBlocked:
     "This device isn’t ready to safely store a recording offline. Check your storage or browser, then try again.",
   ready:
     "This device is ready to protect up to 30 minutes of recording if you temporarily lose connection.",
-  reconnecting: "Connection restored. Saving your recording.",
-  retrying: "Connection trouble. We’ll keep trying.",
   saveFailure:
     "We couldn’t save this recording safely. Your camera and microphone are off. Contact the hiring team for help.",
-  saving: "Your recording is being saved.",
 } as const;
 
 export interface RecordingDeliveryPresentationInput {
@@ -158,7 +149,6 @@ export interface RecordingDeliveryPresentationInput {
   hasIncompleteRecordingFinalization?: boolean;
   hasUnsentRecordingMedia?: boolean;
   isRecording?: boolean;
-  recordingDeliveryPhase?: RecordingDeliveryPhase;
   recordingPreflightState?: RecordingPreflightState;
   recordingStopReason?: RecordingStopReason;
 }
@@ -229,42 +219,10 @@ export function getDeliveryPresentation(
       retryPreflight: false,
     };
   }
-  if (
-    props.recordingPreflightState === "ready" &&
-    props.recordingDeliveryPhase === "idle" &&
-    !props.isRecording
-  ) {
+  if (props.recordingPreflightState === "ready" && !props.isRecording) {
     return {
       kind: "status",
       message: RECORDING_DELIVERY_COPY.ready,
-      retryPreflight: false,
-    };
-  }
-  if (props.recordingDeliveryPhase === "saving") {
-    return {
-      kind: "status",
-      message: RECORDING_DELIVERY_COPY.saving,
-      retryPreflight: false,
-    };
-  }
-  if (props.recordingDeliveryPhase === "offline") {
-    return {
-      kind: "status",
-      message: RECORDING_DELIVERY_COPY.offline,
-      retryPreflight: false,
-    };
-  }
-  if (props.recordingDeliveryPhase === "reconnecting") {
-    return {
-      kind: "status",
-      message: RECORDING_DELIVERY_COPY.reconnecting,
-      retryPreflight: false,
-    };
-  }
-  if (props.recordingDeliveryPhase === "retrying") {
-    return {
-      kind: "status",
-      message: RECORDING_DELIVERY_COPY.retrying,
       retryPreflight: false,
     };
   }
@@ -275,15 +233,7 @@ function getAsyncSavingMessage(props: CandidateRecordingJourneyProps): string {
   if (props.journeyOutcome === "manual-retry") {
     return "Your recording is still here. Check your connection, then try again.";
   }
-  if (props.journeyOutcome !== "automatic-retry") {
-    return "";
-  }
-  if (props.savingNotice) {
-    return props.savingNotice;
-  }
-  return props.saveState === "offline"
-    ? "Saving will resume when you reconnect."
-    : "Keep this screen open; we’ll keep trying.";
+  return props.savingNotice ?? "";
 }
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: explicit finite journey states stay together for review.

@@ -1223,6 +1223,8 @@ export function useLiveRecording(
     if (finalizationInput.current?.sessionId === input.sessionId) {
       finalizationInput.current = null;
     }
+    setFinalizationState({ error: null, state: "ready" });
+    setIncompleteFinalization(false);
     if (
       !sealedPlans.current.length &&
       session.current?.status === "recording"
@@ -1294,6 +1296,8 @@ export function useLiveRecording(
               cause instanceof Error ? cause.message : String(cause);
             setError(message);
             setFinalizationState({ error: message, state: "failed" });
+            setIncompleteFinalization(true);
+            setJourneyOutcome("manual-retry");
             return;
           }
           finalizationInput.current = plan;
@@ -1932,6 +1936,7 @@ export function useLiveRecording(
           state: "failed",
         });
         setIncompleteFinalization(true);
+        setJourneyOutcome("manual-retry");
         setError(finalizeError.message);
       },
       onSuccess: (result) => {
@@ -1942,6 +1947,8 @@ export function useLiveRecording(
             error: "Invalid finalization status",
             state: "failed",
           });
+          setIncompleteFinalization(true);
+          setJourneyOutcome("manual-retry");
           return;
         }
         setFinalizationState({ error: null, state });

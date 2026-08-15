@@ -248,7 +248,9 @@ class FakeMediaRecorder extends EventTarget {
 
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
+let finalizeMode: "failed" | "queued" | "ready" = "ready";
 let resolveFinalization: (() => void) | null = null;
+let remoteStatus: "ready" | undefined;
 let manifestLookup: (() => Promise<RecordingManifestLookup>) | undefined;
 
 function RecordingHost() {
@@ -259,15 +261,20 @@ function RecordingHost() {
     createSession: (_input, { onSuccess }) => {
       onSuccess(undefined);
     },
-    finalizeSession: (_input, { onSuccess }) => {
+    finalizeSession: (_input, { onError, onSuccess }) => {
       finalizeCalls += 1;
       resolveFinalization = () => {
-        onSuccess({ status: "ready" });
+        if (finalizeMode === "failed") {
+          onError(new Error("finalization unavailable"));
+          return;
+        }
+        onSuccess({ status: finalizeMode });
       };
     },
     getManifest: manifestLookup
       ? async () => manifestLookup?.() ?? { kind: "missing" }
       : undefined,
+    status: remoteStatus,
   });
   return null;
 }
@@ -286,7 +293,9 @@ afterEach(() => {
   events.length = 0;
   latest = null;
   finalizeCalls = 0;
+  finalizeMode = "ready";
   resolveFinalization = null;
+  remoteStatus = undefined;
   manifestLookup = undefined;
   uploadStatus = 201;
   uploadCalls = 0;
@@ -642,8 +651,8 @@ function mountAdmittedHost(options?: {
       options?.fetch ??
       (() => Promise.resolve(new Response(null, { status: uploadStatus }))),
   });
-  render(React.createElement(RecordingHost));
-  return storage;
+  const view = render(React.createElement(RecordingHost));
+  return Object.assign(storage, { rerender: view.rerender });
 }
 
 it("admits capture after a successful preflight", async () => {
@@ -780,6 +789,49 @@ it("persists the terminal part, drains, then finalizes after a candidate stop", 
     resolveFinalization?.();
     await stopPromise;
   });
+});
+
+it("offers a manual retry when finalization fails", async () => {
+  finalizeMode = "failed";
+  mountAdmittedHost();
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await act(async () => {
+    await latest?.stop();
+  });
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(() => {
+    resolveFinalization?.();
+  });
+  await waitFor(() => expect(latest?.finalization?.state).toBe("failed"));
+  expect(latest?.journeyOutcome).toBe("manual-retry");
+});
+
+it("clears incomplete finalization when remote status becomes ready", async () => {
+  finalizeMode = "queued";
+  const view = mountAdmittedHost();
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await act(async () => {
+    await latest?.stop();
+  });
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(() => {
+    resolveFinalization?.();
+  });
+  await waitFor(() =>
+    expect(latest?.hasIncompleteRecordingFinalization).toBe(true)
+  );
+  remoteStatus = "ready";
+  view.rerender(React.createElement(RecordingHost));
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(latest?.hasIncompleteRecordingFinalization).toBe(false);
 });
 
 it("safety-stops before the next normal part would breach the admitted policy", async () => {

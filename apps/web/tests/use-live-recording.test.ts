@@ -16,12 +16,21 @@ interface Records {
 }
 let latest: UseLiveRecordingResult | null = null;
 let finalizeFailure = false;
+let createSessionOverride: (() => Promise<void>) | null = null;
 let finalizeCalls = 0;
 let statusCalls = 0;
 
+const deferred = <T>() => {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+};
+
 const commands = (): RecordingCommands => ({
   appendSegment: vi.fn().mockResolvedValue(undefined),
-  createSession: vi.fn().mockResolvedValue(undefined),
+  createSession: vi.fn(() => createSessionOverride?.() ?? Promise.resolve()),
   finalizeSession: vi.fn().mockResolvedValue({ status: "ready" }),
   getManifest: vi.fn().mockResolvedValue({ kind: "missing" }),
   getStatus: vi.fn().mockResolvedValue(null),
@@ -204,6 +213,7 @@ afterEach(() => {
   cleanup();
   latest = null;
   finalizeFailure = false;
+  createSessionOverride = null;
   finalizeCalls = 0;
   statusCalls = 0;
   FakeMediaRecorder.last = null;
@@ -244,6 +254,42 @@ it("completes a normal rendered recording", async () => {
   await act(() => latest?.stop());
   await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
   expect(finalizeCalls).toBe(1);
+});
+
+it("shares an in-flight rendered start", async () => {
+  const create = deferred<void>();
+  createSessionOverride = () => create.promise;
+  mount();
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  let first: Promise<void> | undefined;
+  let second: Promise<void> | undefined;
+  act(() => {
+    first = latest?.start();
+    second = latest?.start();
+  });
+  create.resolve();
+  await act(async () => {
+    await Promise.all([first, second]);
+  });
+});
+
+it("keeps remote failed finalization retryable", async () => {
+  mount(Number.POSITIVE_INFINITY, [], "failed");
+  await act(async () => {
+    latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  await act(async () => latest?.start());
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("failed");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("failed"));
+  expect(latest?.hasIncompleteRecordingFinalization).toBe(true);
 });
 
 it("offers manual retry after rendered finalization failure", async () => {

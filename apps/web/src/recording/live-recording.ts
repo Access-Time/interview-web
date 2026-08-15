@@ -648,6 +648,8 @@ export function useLiveRecording(
   const pollGeneration = useRef(0);
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
+  const recoveryBlocked = useRef(false);
+  const recoveredSessionId = useRef<string | null>(null);
   const startInFlight = useRef<Promise<void> | null>(null);
   const captureEndingRef = useRef<Promise<void> | null>(null);
   const captureCauseRef = useRef<unknown>(undefined);
@@ -795,7 +797,9 @@ export function useLiveRecording(
             finalizationAttempted.current = true;
             finalizationInFlight.current = true;
             await finalize(plan);
-            return;
+            if (finalizationInput.current?.sessionId === plan.sessionId) {
+              return;
+            }
           } catch (cause) {
             finalizationInFlight.current = false;
             if (
@@ -821,14 +825,15 @@ export function useLiveRecording(
         return recovery;
       }
       if (recovery.missing) {
+        recoveredSessionId.current = recovery.session?.sessionId ?? null;
         ids.current = null;
         session.current = null;
         setRecovered(false);
-        setCanResetRecoveredRecording(false);
+        setCanResetRecoveredRecording(Boolean(recoveredSessionId.current));
       } else if (recovery.recovered) {
         setRecovered(true);
       }
-      if (recovery.session) {
+      if (recovery.session && !recovery.missing) {
         session.current = recovery.session;
         const lastSegment = recovery.session.segments.at(-1);
         if (lastSegment) {
@@ -839,9 +844,11 @@ export function useLiveRecording(
         }
       }
       if (recovery.missing) {
+        recoveryBlocked.current = false;
         setJourneyOutcome("missing-recovery");
-        setCanResetRecoveredRecording(false);
+        setCanResetRecoveredRecording(Boolean(recoveredSessionId.current));
       } else {
+        recoveryBlocked.current = false;
         revokeRecoveryReset();
       }
       return recovery;
@@ -858,6 +865,7 @@ export function useLiveRecording(
         })
         .catch((cause) => {
           if (generation === recoveryGeneration.current && !isDisposed()) {
+            recoveryBlocked.current = true;
             setError(
               `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`
             );
@@ -1003,7 +1011,10 @@ export function useLiveRecording(
       streamRef.current = acquired;
       setStream(acquired);
       setReady(true);
-      setError(null);
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: mutable recovery state is updated by the lifecycle queue.
+      if (!recoveryBlocked.current) {
+        setError(null);
+      }
       await prepareRecording();
     } catch (cause) {
       if (lifecycle.current === true) {
@@ -1033,6 +1044,7 @@ export function useLiveRecording(
       throw new Error("Recording is not initialized");
     }
     await prepareRecording();
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: preflight mutates these refs asynchronously.
     if (!(preparedRecorderRef.current && recordingPolicyRef.current)) {
       return;
     }
@@ -1197,6 +1209,7 @@ export function useLiveRecording(
     }
   };
   const start = () => {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: this ref is the runtime start serialization lock.
     if (startInFlight.current) {
       return startInFlight.current;
     }
@@ -1456,12 +1469,14 @@ export function useLiveRecording(
     if (!canResetRecoveredRecording) {
       throw new Error("Recovered recording cannot be reset");
     }
-    if (currentIds === null) {
+    const sessionId = currentIds?.sessionId ?? recoveredSessionId.current;
+    if (sessionId === null || sessionId === undefined) {
       throw new Error("Recovered recording cannot be reset");
     }
-    await outbox.current?.discardSession(currentIds.sessionId);
+    await outbox.current?.discardSession(sessionId);
     ids.current = null;
     session.current = null;
+    recoveredSessionId.current = null;
     setRecovered(false);
     setCaptureEnded(false);
     finalizationInput.current = null;

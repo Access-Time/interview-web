@@ -649,6 +649,7 @@ export function useLiveRecording(
   const recoveryGeneration = useRef(0);
   const recoveryPromise = useRef<Promise<void> | null>(null);
   const recoveryBlocked = useRef(false);
+  const deviceAccessFailed = useRef(false);
   const recoveredSessionId = useRef<string | null>(null);
   const startInFlight = useRef<Promise<void> | null>(null);
   const captureEndingRef = useRef<Promise<void> | null>(null);
@@ -867,7 +868,7 @@ export function useLiveRecording(
           if (
             generation === recoveryGeneration.current &&
             !isDisposed() &&
-            streamRef.current !== null
+            !deviceAccessFailed.current
           ) {
             recoveryBlocked.current = true;
             setError(
@@ -996,6 +997,7 @@ export function useLiveRecording(
   };
 
   const initialize = async () => {
+    deviceAccessFailed.current = false;
     try {
       const acquired = await navigator.mediaDevices.getUserMedia({
         audio: true,
@@ -1025,6 +1027,7 @@ export function useLiveRecording(
       if (lifecycle.current === true) {
         return;
       }
+      deviceAccessFailed.current = true;
       setError(
         `Unable to access camera and microphone: ${cause instanceof Error ? cause.message : String(cause)}`
       );

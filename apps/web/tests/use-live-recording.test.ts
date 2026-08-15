@@ -24,17 +24,20 @@ let manifestOverride: (() => Promise<RecordingManifestLookup>) | null = null;
 let storageEstimateOverride:
   | (() => Promise<{ quota?: number; usage?: number }>)
   | null = null;
-let cleanupFails = false;
+let cleanupPromise: Promise<void> | null = null;
+let mediaOverride: (() => Promise<MediaStream>) | null = null;
 let lastCommands: RecordingCommands | null = null;
 let finalizeCalls = 0;
 let statusCalls = 0;
 
 const deferred = <T>() => {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((nextResolve) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
     resolve = nextResolve;
+    reject = nextReject;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 };
 
 const commands = (): RecordingCommands => ({
@@ -92,8 +95,19 @@ function installIndexedDb(writeFailsAfterPart = Number.POSITIVE_INFINITY) {
         error: null,
         objectStore: (name: "parts" | "sessions") => ({
           delete: (key: IDBValidKey) => {
-            if (cleanupFails && name === "sessions") {
-              throw new Error("cleanup failed");
+            if (cleanupPromise && name === "sessions") {
+              cleanupPromise.then(
+                () => {
+                  records[name].delete(String(key));
+                  queueMicrotask(() => transaction.oncomplete?.());
+                },
+                () =>
+                  queueMicrotask(() => {
+                    const onerror = transaction.onerror as (() => void) | null;
+                    onerror?.();
+                  })
+              );
+              return;
             }
             records[name].delete(String(key));
             queueMicrotask(() => transaction.oncomplete?.());
@@ -206,9 +220,13 @@ function mount(
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: {
-      getUserMedia: vi.fn(async () => ({
-        getTracks: () => [{ stop: vi.fn() }],
-      })),
+      getUserMedia: vi.fn(
+        () =>
+          mediaOverride?.() ??
+          Promise.resolve({
+            getTracks: () => [{ stop: vi.fn() }],
+          } as unknown as MediaStream)
+      ),
     },
   });
   Object.defineProperty(globalThis, "fetch", {
@@ -250,7 +268,8 @@ afterEach(() => {
   FakeMediaRecorder.starts = 0;
   manifestOverride = null;
   storageEstimateOverride = null;
-  cleanupFails = false;
+  cleanupPromise = null;
+  mediaOverride = null;
   lastCommands = null;
 });
 
@@ -322,9 +341,11 @@ it("waits for delayed recovery before making the remote start call", async () =>
     start = latest?.start();
   });
   expect(lastCommands?.createSession).not.toHaveBeenCalled();
-  manifest.resolve({ kind: "missing" });
-  await initialize;
-  await start;
+  await act(async () => {
+    manifest.resolve({ kind: "missing" });
+    await initialize;
+    await start;
+  });
   expect(lastCommands?.createSession).toHaveBeenCalledOnce();
 });
 
@@ -353,6 +374,27 @@ it("keeps a non-missing recovery failure blocking through initialization and Sta
   expect(lastCommands?.appendSegment).not.toHaveBeenCalled();
 });
 
+it("surfaces recovery failure before media acquisition and blocks Start", async () => {
+  const media = deferred<MediaStream>();
+  mediaOverride = () => media.promise;
+  manifestOverride = () => Promise.reject(new Error("early recovery failed"));
+  mount(Number.POSITIVE_INFINITY, [], "ready", [storedRecording("early")]);
+  let initialize: Promise<void> | undefined;
+  await act(async () => {
+    initialize = latest?.initialize();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(latest?.error).toContain("early recovery failed"));
+  await act(async () => {
+    await expect(latest?.start()).rejects.toThrow("early recovery failed");
+  });
+  expect(lastCommands?.createSession).not.toHaveBeenCalled();
+  await act(async () => {
+    media.resolve({ getTracks: () => [] } as unknown as MediaStream);
+    await initialize;
+  });
+});
+
 it("blocks a fresh preflight without remote creation or recorder start", async () => {
   storageEstimateOverride = () => Promise.resolve({ quota: 1, usage: 1 });
   mount();
@@ -373,6 +415,18 @@ it("safety-stops after a fresh invalid capacity estimate", async () => {
   storageEstimateOverride = () =>
     Promise.resolve({ quota: Number.NaN, usage: 0 });
   FakeMediaRecorder.last?.emitPart("capacity");
+  await waitFor(() => expect(latest?.recordingStopReason).toBe("capacity"));
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("safety-stops after a fresh valid low-capacity estimate", async () => {
+  mount();
+  await act(async () => latest?.initialize());
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  await act(async () => latest?.start());
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  storageEstimateOverride = () => Promise.resolve({ quota: 10, usage: 0 });
+  FakeMediaRecorder.last?.emitPart("low-capacity");
   await waitFor(() => expect(latest?.recordingStopReason).toBe("capacity"));
   expect(latest?.isRecording).toBe(false);
 });
@@ -404,15 +458,24 @@ it("shares an in-flight rendered start", async () => {
 });
 
 it("keeps ready state when local cleanup fails", async () => {
-  cleanupFails = true;
+  const cleanupDeferred = deferred<void>();
+  cleanupPromise = cleanupDeferred.promise;
   mount();
   await act(async () => latest?.initialize());
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => latest?.start());
   await waitFor(() => expect(latest?.isRecording).toBe(true));
   FakeMediaRecorder.last?.emitPart("cleanup");
-  await act(() => latest?.stop());
+  let stop: Promise<void> | undefined;
+  act(() => {
+    stop = latest?.stop();
+  });
   await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(latest?.error).toBeNull();
+  cleanupDeferred.reject(new Error("cleanup failed"));
+  await act(async () => {
+    await stop;
+  });
   expect(latest?.error).toBe("Recording completed, but local cleanup failed.");
   expect(latest?.hasIncompleteRecordingFinalization).toBe(false);
 });

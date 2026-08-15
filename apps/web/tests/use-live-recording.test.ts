@@ -349,15 +349,14 @@ it("waits for delayed recovery before making the remote start call", async () =>
   expect(lastCommands?.createSession).toHaveBeenCalledOnce();
 });
 
-it("clears typed-missing recovery and resets by the retained local session ID", async () => {
+it("automatically clears typed-missing recovery and returns to normal setup", async () => {
   manifestOverride = () => Promise.resolve({ kind: "missing" });
   const records = mount(Number.POSITIVE_INFINITY, [], "ready", [
     storedRecording("missing"),
   ]);
   await act(async () => latest?.initialize());
-  await waitFor(() => expect(latest?.canResetRecoveredRecording).toBe(true));
+  await waitFor(() => expect(latest?.canResetRecoveredRecording).toBe(false));
   expect(latest?.recovered).toBe(false);
-  await act(async () => latest?.resetRecoveredRecording());
   expect(records.sessions.has("missing")).toBe(false);
   await act(async () => latest?.start());
   expect(lastCommands?.createSession).toHaveBeenCalledOnce();
@@ -590,4 +589,5 @@ it("reports a rendered local write failure", async () => {
   await waitFor(() => expect(latest?.recordingStopReason).toBe("save-failure"));
   expect(latest?.recordingStopReason).toBe("save-failure");
   expect(latest?.saveState).toBe("error");
+  expect(finalizeCalls).toBe(0);
 });

@@ -848,8 +848,15 @@ export function useLiveRecording(
       if (recovery.missing) {
         recoveryBlocked.current = false;
         recoveryError.current = null;
-        setJourneyOutcome("missing-recovery");
-        setCanResetRecoveredRecording(Boolean(recoveredSessionId.current));
+        if (recovery.session) {
+          await box.discardSession(recovery.session.sessionId);
+        }
+        recoveredSessionId.current = null;
+        ids.current = null;
+        session.current = null;
+        setRecovered(false);
+        setCanResetRecoveredRecording(false);
+        revokeRecoveryReset();
       } else {
         recoveryBlocked.current = false;
         recoveryError.current = null;
@@ -871,6 +878,7 @@ export function useLiveRecording(
           if (generation === recoveryGeneration.current && !isDisposed()) {
             recoveryBlocked.current = true;
             recoveryError.current = `Unable to recover recording: ${cause instanceof Error ? cause.message : String(cause)}`;
+            // biome-ignore lint/suspicious/noUnnecessaryConditions: device access may fail before recovery and should retain presentation precedence.
             if (!deviceAccessFailed.current) {
               setError(recoveryError.current);
             }
@@ -934,7 +942,6 @@ export function useLiveRecording(
       lifecycle.current = true;
       recoveryGeneration.current += 1;
       pollGeneration.current += 1;
-      // biome-ignore lint/suspicious/noUnnecessaryConditions: timer refs are populated at runtime.
       if (pollTimer.current !== undefined) {
         clearTimeout(pollTimer.current);
       }
@@ -1012,6 +1019,7 @@ export function useLiveRecording(
       streamRef.current = acquired;
       setStream(acquired);
       setReady(true);
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: recovery can fail before or after media acquisition.
       setError(recoveryBlocked.current ? recoveryError.current : null);
       try {
         await recoveryPromise.current;
@@ -1032,7 +1040,6 @@ export function useLiveRecording(
   };
 
   const retryRecordingPreflight = async () => {
-    // biome-ignore lint/suspicious/noUnnecessaryConditions: retry is a no-op before a stream exists.
     if (streamRef.current === null) {
       return;
     }
@@ -1150,7 +1157,7 @@ export function useLiveRecording(
             await outbox.current?.savePartAndSession(part, updatedSession);
           } catch (cause) {
             failSave(cause);
-            return;
+            throw cause;
           }
           // biome-ignore lint/suspicious/noUnnecessaryConditions: terminal parts skip a second capacity check.
           if (persistingTerminalPart.current) {

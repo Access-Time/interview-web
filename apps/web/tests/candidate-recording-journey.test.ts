@@ -8,7 +8,10 @@ import {
 import React from "react";
 import { afterEach, expect, it } from "vitest";
 import type { CandidateRecordingJourneyProps } from "../src/recording/candidate-recording-journey";
-import { CandidateRecordingJourney } from "../src/recording/candidate-recording-journey";
+import {
+  CandidateRecordingJourney,
+  RECORDING_DELIVERY_COPY,
+} from "../src/recording/candidate-recording-journey";
 
 const CLOSE_TAB_PATTERN = /may close this tab/i;
 const CAMERA_OFF_PATTERN = /Your camera and microphone are off/i;
@@ -17,21 +20,31 @@ const RECORDING_GUIDANCE_PATTERN =
   /Keep this screen open and stay in this browser while you record/i;
 const IMPLEMENTATION_LANGUAGE_PATTERN =
   /\b(session|raw|storage|server|segment|part|queue|acknowledged|finalization|retrieve)\b/i;
+const START_BUTTON_PATTERN = /start/i;
+const TRY_AGAIN_PATTERN = /try again/i;
+const RETRY_SUBMIT_PATTERN = /try submitting again/i;
+const IMPLEMENTATION_TERM_PATTERN = /\b(part|queue|IndexedDB|quota)\b/i;
 
 const baseProps: CandidateRecordingJourneyProps = {
   blockingError: null,
   blockingErrorTitle: null,
   captureBlocked: false,
   finalization: null,
+  hasIncompleteRecordingFinalization: false,
   hasStopped: false,
+  hasUnsentRecordingMedia: false,
   isReady: false,
   isRecording: false,
   journeyOutcome: "none",
   onInitialize: () => undefined,
   onRetry: () => undefined,
+  onRetryPreflight: () => undefined,
   onStart: () => undefined,
   onStop: () => undefined,
   pendingAction: null,
+  recordingDeliveryPhase: "idle",
+  recordingPreflightState: "idle",
+  recordingStopReason: null,
   recovered: false,
   saveState: "healthy",
   savingNotice: null,
@@ -151,9 +164,9 @@ it("continues a recovered recording and retries a failed submission", () => {
   );
   fireEvent.click(screen.getByRole("button", { name: "Try submitting again" }));
   expect(retries).toBe(1);
-  expect(screen.getByRole("status").textContent).toBe(
-    "Your recording is still here. Check your connection, then try again."
-  );
+  expect(
+    screen.getByText(RECORDING_DELIVERY_COPY.finalizationFailure)
+  ).toBeTruthy();
   expect(screen.getAllByRole("button").length).toBe(1);
 });
 
@@ -393,7 +406,10 @@ it("suppresses a blocking error when submission has failed", () => {
   expect(screen.queryByText("Camera and microphone access was blocked.")).toBe(
     null
   );
-  expect(container.querySelectorAll('[role="alert"]').length).toBe(0);
+  expect(
+    screen.getByText(RECORDING_DELIVERY_COPY.finalizationFailure)
+  ).toBeTruthy();
+  expect(container.querySelectorAll('[role="alert"]').length).toBe(1);
 });
 
 it("announces honestly without invented progress or implementation language", () => {
@@ -497,7 +513,7 @@ it("moves focus through explicit recording state changes", async () => {
       })
     )
   );
-  expect(screen.queryByRole("alert")).toBe(null);
+  expect(screen.getByRole("alert")).toBeTruthy();
 });
 
 it("focuses Continue recording after recovered media becomes ready", async () => {
@@ -639,4 +655,175 @@ it("blocks only Start and Continue when beginning capture is unsafe", () => {
       .hasAttribute("disabled")
   ).toBe(true);
   expect(screen.getByRole("alert")).toBeTruthy();
+});
+
+function renderJourney(
+  overrides: Partial<CandidateRecordingJourneyProps> = {}
+) {
+  return render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      ...overrides,
+    })
+  );
+}
+
+it.each([
+  [
+    "checking",
+    "idle",
+    "Checking that this device is ready to record for up to 30 minutes offline.",
+  ],
+  [
+    "ready",
+    "idle",
+    "This device is ready to protect up to 30 minutes of recording if you temporarily lose connection.",
+  ],
+  ["ready", "saving", "Your recording is being saved."],
+  [
+    "ready",
+    "offline",
+    "You’re offline. Your recording is still being saved on this device.",
+  ],
+  ["ready", "reconnecting", "Connection restored. Saving your recording."],
+  ["ready", "retrying", "Connection trouble. We’ll keep trying."],
+] as const)("announces %s/%s once", (preflight, delivery, message) => {
+  renderJourney({
+    recordingDeliveryPhase: delivery,
+    recordingPreflightState: preflight,
+  });
+  expect(screen.getByRole("status").textContent).toBe(message);
+  expect(screen.queryAllByRole("status")).toHaveLength(1);
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it("alerts on blocked preflight and offers Try again without Start", () => {
+  const retries: string[] = [];
+  renderJourney({
+    onRetryPreflight: () => {
+      retries.push("retry");
+    },
+    recordingPreflightState: "blocked",
+  });
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.preflightBlocked
+  );
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(
+    screen.queryByRole("button", { name: START_BUTTON_PATTERN })
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: TRY_AGAIN_PATTERN }));
+  expect(retries).toEqual(["retry"]);
+});
+
+it("does not duplicate the blocked-preflight alert when the route hands off the same copy", () => {
+  renderJourney({
+    blockingError: RECORDING_DELIVERY_COPY.preflightBlocked,
+    blockingErrorTitle: "This device isn’t ready to record",
+    recordingPreflightState: "blocked",
+  });
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.preflightBlocked
+  );
+});
+
+it("alerts on device write failure", () => {
+  renderJourney({
+    hasStopped: true,
+    journeyOutcome: "terminal-restart",
+    recordingStopReason: "save-failure",
+  });
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.saveFailure
+  );
+});
+
+it("alerts on finalization failure", () => {
+  renderJourney({
+    finalization: { error: "hidden", state: "failed" },
+    hasStopped: true,
+    journeyOutcome: "manual-retry",
+  });
+  expect(
+    screen.getByText(RECORDING_DELIVERY_COPY.finalizationFailure)
+  ).toBeTruthy();
+});
+
+it("treats a failed finalization as a retryable alert even without a journey outcome", () => {
+  renderJourney({
+    finalization: { error: "hidden", state: "failed" },
+    hasStopped: true,
+  });
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.finalizationFailure
+  );
+  expect(
+    screen.getByRole("button", { name: RETRY_SUBMIT_PATTERN })
+  ).toBeTruthy();
+});
+
+it("announces candidate Stop while unsent media remains", () => {
+  renderJourney({
+    hasStopped: true,
+    hasUnsentRecordingMedia: true,
+    recordingPreflightState: "ready",
+    recordingStopReason: "candidate",
+  });
+  expect(screen.getByRole("status").textContent).toBe(
+    RECORDING_DELIVERY_COPY.candidateStop
+  );
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+it.each(["queued", "finalizing"] as const)(
+  "announces completion pending while finalization is %s",
+  (state) => {
+    renderJourney({
+      finalization: { error: null, state },
+      hasIncompleteRecordingFinalization: true,
+      hasStopped: true,
+    });
+    expect(screen.getByRole("status").textContent).toBe(
+      RECORDING_DELIVERY_COPY.completionPending
+    );
+  }
+);
+
+it("keeps a capacity safety-stop as status without retry", () => {
+  renderJourney({
+    hasStopped: true,
+    recordingStopReason: "capacity",
+  });
+  expect(screen.getByRole("status").textContent).toBe(
+    RECORDING_DELIVERY_COPY.capacity
+  );
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByRole("button", { name: TRY_AGAIN_PATTERN })).toBeNull();
+});
+
+it("does not keep finishing copy after finalization is ready", () => {
+  renderJourney({
+    finalization: { error: null, state: "ready" },
+    hasStopped: true,
+    recordingStopReason: "capacity",
+  });
+  expect(
+    screen.getByRole("heading", { name: "Submission complete." })
+  ).toBeTruthy();
+  expect(screen.queryByText(RECORDING_DELIVERY_COPY.capacity)).toBeNull();
+  expect(
+    screen.queryByText(RECORDING_DELIVERY_COPY.completionPending)
+  ).toBeNull();
+});
+
+it("does not expose progress UI or implementation terminology", () => {
+  const { container } = renderJourney({
+    isReady: true,
+    recordingDeliveryPhase: "saving",
+    recordingPreflightState: "ready",
+  });
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  expect(container.textContent ?? "").not.toMatch(IMPLEMENTATION_TERM_PATTERN);
+  expect((container.textContent ?? "").includes("%")).toBe(false);
 });

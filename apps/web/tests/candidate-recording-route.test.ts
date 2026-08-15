@@ -1,7 +1,9 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { RECORDING_DELIVERY_COPY } from "../src/recording/candidate-recording-journey";
 import {
   candidateJourneyHandoff,
   recordingManifestLookup,
+  shouldWarnBeforeUnload,
   usefulError,
 } from "../src/routes/index";
 
@@ -72,8 +74,10 @@ it("hands off blocking failures and suppresses them after failed submission", ()
     recordingError: null,
     saveState: "healthy",
   });
-  expect(failed.blockingError).toBe(null);
-  expect(failed.blockingErrorTitle).toBe(null);
+  expect(failed.blockingError).toBe(
+    RECORDING_DELIVERY_COPY.finalizationFailure
+  );
+  expect(failed.blockingError).not.toBe(classification.message);
   expect(failed.hasStopped).toBe(true);
   expect(failed.finalizationState).toBe("failed");
   expect(failed.journeyOutcome).toBe("manual-retry");
@@ -171,6 +175,92 @@ it("maps only typed RECORDING_NOT_FOUND manifest failures to missing", async () 
       sessionId: "recording-1",
     })
   ).resolves.toEqual({ kind: "missing" });
+});
+
+it("prefers capacity and save-failure delivery copy", () => {
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      hasUnsentRecordingMedia: true,
+      recordingStopReason: "capacity",
+    }).deliveryMessage
+  ).toBe(RECORDING_DELIVERY_COPY.capacity);
+
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      recordingStopReason: "save-failure",
+    }).blockingError
+  ).toBe(RECORDING_DELIVERY_COPY.saveFailure);
+});
+
+it("does not announce preflight-ready copy while recording", () => {
+  expect(
+    candidateJourneyHandoff({
+      isRecording: true,
+      recordingDeliveryPhase: "idle",
+      recordingPreflightState: "ready",
+    }).deliveryMessage
+  ).toBeNull();
+});
+
+it("prefers finalization failure over capacity copy", () => {
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      finalizationState: "failed",
+      recordingStopReason: "capacity",
+    }).blockingError
+  ).toBe(RECORDING_DELIVERY_COPY.finalizationFailure);
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      finalizationState: "failed",
+      recordingStopReason: "capacity",
+    }).deliveryMessage
+  ).toBeNull();
+});
+
+it("warns before unload during capture, unsent media, or incomplete finalization", () => {
+  const warn = (input: Parameters<typeof shouldWarnBeforeUnload>[0]) => {
+    const event = new Event("beforeunload") as BeforeUnloadEvent;
+    const preventDefault = vi.fn();
+    event.preventDefault = preventDefault;
+    if (shouldWarnBeforeUnload(input)) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    return preventDefault;
+  };
+
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: false,
+      recording: true,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: true,
+      recording: false,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: true,
+      hasUnsentRecordingMedia: false,
+      recording: false,
+    })
+  ).toHaveBeenCalled();
+  expect(
+    warn({
+      hasIncompleteRecordingFinalization: false,
+      hasUnsentRecordingMedia: false,
+      recording: false,
+    })
+  ).not.toHaveBeenCalled();
 });
 
 it("rethrows manifest transport failures unchanged", async () => {

@@ -1,13 +1,19 @@
 import { useMutation } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { CandidateRecordingJourney } from "@/recording/candidate-recording-journey";
 import {
+  CandidateRecordingJourney,
+  getDeliveryPresentation,
+} from "@/recording/candidate-recording-journey";
+import {
+  type RecordingDeliveryPhase,
   type RecordingFinalizationState,
   type RecordingJourneyOutcome,
   type RecordingManifestLookup,
   type RecordingManifestView,
+  type RecordingPreflightState,
   type RecordingSaveState,
+  type RecordingStopReason,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "@/recording/live-recording";
@@ -20,7 +26,12 @@ export const Route = createFileRoute("/")({
   head: () => ({ meta: [{ title: "Video introduction" }] }),
 });
 
-type PendingAction = "initialize" | "retry" | "start" | "stop";
+type PendingAction =
+  | "initialize"
+  | "retry"
+  | "retry-preflight"
+  | "start"
+  | "stop";
 
 const PERMISSION_ERROR = /permission|notallowed|denied|security/;
 const DEVICE_ERROR = /notfound|device|camera|microphone|media/;
@@ -92,45 +103,125 @@ export function recordingManifestLookup(
   );
 }
 
+function mapDeliveryHandoff(input: {
+  finalizationState?: RecordingFinalizationState | "idle";
+  hasIncompleteRecordingFinalization?: boolean;
+  hasUnsentRecordingMedia?: boolean;
+  isRecording?: boolean;
+  recordingDeliveryPhase?: RecordingDeliveryPhase;
+  recordingPreflightState?: RecordingPreflightState;
+  recordingStopReason?: RecordingStopReason;
+}) {
+  const presentation = getDeliveryPresentation({
+    finalization:
+      input.finalizationState && input.finalizationState !== "idle"
+        ? { state: input.finalizationState }
+        : null,
+    hasIncompleteRecordingFinalization:
+      input.hasIncompleteRecordingFinalization,
+    hasUnsentRecordingMedia: input.hasUnsentRecordingMedia,
+    isRecording: input.isRecording,
+    recordingDeliveryPhase: input.recordingDeliveryPhase,
+    recordingPreflightState: input.recordingPreflightState,
+    recordingStopReason: input.recordingStopReason,
+  });
+
+  if (presentation.kind === "alert") {
+    return {
+      blockingError: presentation.message,
+      blockingErrorTitle: presentation.retryPreflight
+        ? "This device isn’t ready to record"
+        : "Recording needs attention",
+      deliveryMessage: null,
+    };
+  }
+
+  return {
+    blockingError: null,
+    blockingErrorTitle: null,
+    deliveryMessage: presentation.message,
+  };
+}
+
 export function candidateJourneyHandoff(input: {
-  actionError: CandidateError | null;
-  captureEnded: boolean;
-  controlsHasStopped: boolean;
-  finalizationState: RecordingFinalizationState | "idle";
-  journeyOutcome: RecordingJourneyOutcome;
-  recordingError: string | null;
-  saveState: RecordingSaveState;
+  actionError?: CandidateError | null;
+  captureEnded?: boolean;
+  controlsHasStopped?: boolean;
+  finalizationState?: RecordingFinalizationState | "idle";
+  hasIncompleteRecordingFinalization?: boolean;
+  hasUnsentRecordingMedia?: boolean;
+  isRecording?: boolean;
+  journeyOutcome?: RecordingJourneyOutcome;
+  recordingDeliveryPhase?: RecordingDeliveryPhase;
+  recordingError?: string | null;
+  recordingPreflightState?: RecordingPreflightState;
+  recordingStopReason?: RecordingStopReason;
+  saveState?: RecordingSaveState;
 }) {
   const recordingError = input.recordingError
     ? usefulError(input.recordingError)
     : null;
   const visibleError = input.actionError ?? recordingError;
-  const blockingError =
+  const delivery = mapDeliveryHandoff(input);
+  const fallbackBlocking =
     input.journeyOutcome === "none" && input.finalizationState !== "failed"
-      ? (visibleError?.message ?? null)
+      ? visibleError
       : null;
-  let savingNotice: string | null = null;
-  if (input.journeyOutcome === "automatic-retry") {
-    savingNotice =
-      input.saveState === "offline"
-        ? "Saving will resume when you reconnect."
-        : "Keep this screen open; we’ll keep trying.";
-  }
+  const blockingError =
+    delivery.blockingError ?? fallbackBlocking?.message ?? null;
+  const blockingErrorTitle =
+    delivery.blockingErrorTitle ??
+    (blockingError ? (visibleError?.title ?? null) : null);
+  const { deliveryMessage } = delivery;
 
   return {
     blockingError,
-    blockingErrorTitle: blockingError ? (visibleError?.title ?? null) : null,
+    blockingErrorTitle,
     captureBlocked: Boolean(
       input.actionError?.captureBlocked || recordingError?.captureBlocked
     ),
-    finalizationState: input.finalizationState,
-    hasStopped:
+    deliveryMessage,
+    finalizationState: input.finalizationState ?? "idle",
+    hasStopped: Boolean(
       input.captureEnded ||
-      input.controlsHasStopped ||
-      input.finalizationState !== "idle",
-    journeyOutcome: input.journeyOutcome,
-    savingNotice,
+        input.controlsHasStopped ||
+        (input.finalizationState && input.finalizationState !== "idle")
+    ),
+    journeyOutcome: input.journeyOutcome ?? "none",
+    savingNotice: resolveSavingNotice(
+      deliveryMessage,
+      input.journeyOutcome,
+      input.saveState
+    ),
   };
+}
+
+function resolveSavingNotice(
+  deliveryMessage: string | null,
+  journeyOutcome?: RecordingJourneyOutcome,
+  saveState?: RecordingSaveState
+) {
+  if (deliveryMessage) {
+    return deliveryMessage;
+  }
+  if (journeyOutcome !== "automatic-retry") {
+    return null;
+  }
+  return saveState === "offline"
+    ? "Saving will resume when you reconnect."
+    : "Keep this screen open; we’ll keep trying.";
+}
+
+export function shouldWarnBeforeUnload(input: {
+  hasIncompleteRecordingFinalization: boolean;
+  hasUnsentRecordingMedia: boolean;
+  recording: boolean;
+}) {
+  return (
+    input.recording ||
+    input.hasUnsentRecordingMedia ||
+    input.hasIncompleteRecordingFinalization
+  );
 }
 
 function useRecordingControls(recording: UseLiveRecordingResult) {
@@ -158,6 +249,11 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
     onError: (error) => setActionError(usefulError(error)),
     onMutate: () => setActionError(null),
   });
+  const retryPreflight = useMutation({
+    mutationFn: recording.retryRecordingPreflight,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+  });
   const resetRecovered = useMutation({
     mutationFn: recording.resetRecoveredRecording,
   });
@@ -171,12 +267,15 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
     pendingAction = "stop";
   } else if (retry.isPending) {
     pendingAction = "retry";
+  } else if (retryPreflight.isPending) {
+    pendingAction = "retry-preflight";
   }
 
   return {
     actionError,
     handleInitialize: initialize.mutate,
     handleRetryFinalization: retry.mutate,
+    handleRetryPreflight: retryPreflight.mutate,
     handleStart: start.mutate,
     handleStop: stop.mutate,
     hasStopped,
@@ -207,13 +306,26 @@ function HomeComponent() {
     captureEnded: recording.captureEnded,
     controlsHasStopped: controls.hasStopped,
     finalizationState,
+    hasIncompleteRecordingFinalization:
+      recording.hasIncompleteRecordingFinalization,
+    hasUnsentRecordingMedia: recording.hasUnsentRecordingMedia,
+    isRecording: recording.isRecording,
     journeyOutcome: recording.journeyOutcome,
+    recordingDeliveryPhase: recording.recordingDeliveryPhase,
     recordingError: recording.error,
+    recordingPreflightState: recording.recordingPreflightState,
+    recordingStopReason: recording.recordingStopReason,
     saveState: recording.saveState,
+  });
+  const warnBeforeUnload = shouldWarnBeforeUnload({
+    hasIncompleteRecordingFinalization:
+      recording.hasIncompleteRecordingFinalization,
+    hasUnsentRecordingMedia: recording.hasUnsentRecordingMedia,
+    recording: recording.isRecording,
   });
 
   useEffect(() => {
-    if (recording.pendingPartCount === 0) {
+    if (!warnBeforeUnload) {
       return;
     }
     const warnPending = (event: BeforeUnloadEvent) => {
@@ -222,7 +334,7 @@ function HomeComponent() {
     };
     window.addEventListener("beforeunload", warnPending);
     return () => window.removeEventListener("beforeunload", warnPending);
-  }, [recording.pendingPartCount]);
+  }, [warnBeforeUnload]);
 
   return (
     <CandidateRecordingJourney
@@ -230,7 +342,11 @@ function HomeComponent() {
       blockingErrorTitle={handoff.blockingErrorTitle}
       captureBlocked={handoff.captureBlocked}
       finalization={recording.finalization}
+      hasIncompleteRecordingFinalization={
+        recording.hasIncompleteRecordingFinalization
+      }
       hasStopped={handoff.hasStopped}
+      hasUnsentRecordingMedia={recording.hasUnsentRecordingMedia}
       isReady={recording.isReady}
       isRecording={recording.isRecording}
       journeyOutcome={handoff.journeyOutcome}
@@ -241,9 +357,13 @@ function HomeComponent() {
           : undefined
       }
       onRetry={controls.handleRetryFinalization}
+      onRetryPreflight={controls.handleRetryPreflight}
       onStart={controls.handleStart}
       onStop={controls.handleStop}
       pendingAction={controls.pendingAction}
+      recordingDeliveryPhase={recording.recordingDeliveryPhase}
+      recordingPreflightState={recording.recordingPreflightState}
+      recordingStopReason={recording.recordingStopReason}
       recovered={recording.recovered}
       saveState={recording.saveState}
       savingNotice={handoff.savingNotice}

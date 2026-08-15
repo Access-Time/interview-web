@@ -147,8 +147,21 @@ export const RECORDING_DELIVERY_COPY = {
   saving: "Your recording is being saved.",
 } as const;
 
+export interface RecordingDeliveryPresentationInput {
+  finalization?: Pick<
+    NonNullable<CandidateRecordingJourneyProps["finalization"]>,
+    "state"
+  > | null;
+  hasIncompleteRecordingFinalization?: boolean;
+  hasUnsentRecordingMedia?: boolean;
+  isRecording?: boolean;
+  recordingDeliveryPhase?: RecordingDeliveryPhase;
+  recordingPreflightState?: RecordingPreflightState;
+  recordingStopReason?: RecordingStopReason;
+}
+
 export function getDeliveryPresentation(
-  props: CandidateRecordingJourneyProps
+  props: RecordingDeliveryPresentationInput
 ): {
   kind: "alert" | "status" | null;
   message: string | null;
@@ -656,6 +669,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         </div>
       )}
       {props.blockingError &&
+      !delivery.retryPreflight &&
       state !== "manual-retry" &&
       state !== "missing-recovery" &&
       state !== "terminal-restart" ? (

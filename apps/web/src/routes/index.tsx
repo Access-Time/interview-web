@@ -3,7 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import {
   CandidateRecordingJourney,
-  RECORDING_DELIVERY_COPY,
+  getDeliveryPresentation,
 } from "@/recording/candidate-recording-journey";
 import {
   type RecordingDeliveryPhase,
@@ -107,80 +107,39 @@ function mapDeliveryHandoff(input: {
   finalizationState?: RecordingFinalizationState | "idle";
   hasIncompleteRecordingFinalization?: boolean;
   hasUnsentRecordingMedia?: boolean;
+  isRecording?: boolean;
   recordingDeliveryPhase?: RecordingDeliveryPhase;
   recordingPreflightState?: RecordingPreflightState;
   recordingStopReason?: RecordingStopReason;
 }) {
-  if (input.recordingPreflightState === "blocked") {
+  const presentation = getDeliveryPresentation({
+    finalization:
+      input.finalizationState && input.finalizationState !== "idle"
+        ? { state: input.finalizationState }
+        : null,
+    hasIncompleteRecordingFinalization:
+      input.hasIncompleteRecordingFinalization,
+    hasUnsentRecordingMedia: input.hasUnsentRecordingMedia,
+    isRecording: input.isRecording,
+    recordingDeliveryPhase: input.recordingDeliveryPhase,
+    recordingPreflightState: input.recordingPreflightState,
+    recordingStopReason: input.recordingStopReason,
+  });
+
+  if (presentation.kind === "alert") {
     return {
-      blockingError: RECORDING_DELIVERY_COPY.preflightBlocked,
-      blockingErrorTitle: "This device isn’t ready to record",
+      blockingError: presentation.message,
+      blockingErrorTitle: presentation.retryPreflight
+        ? "This device isn’t ready to record"
+        : "Recording needs attention",
       deliveryMessage: null,
     };
   }
-  if (input.recordingStopReason === "save-failure") {
-    return {
-      blockingError: RECORDING_DELIVERY_COPY.saveFailure,
-      blockingErrorTitle: "Recording needs attention",
-      deliveryMessage: null,
-    };
-  }
-  if (input.recordingStopReason === "capacity") {
-    return {
-      blockingError: null,
-      blockingErrorTitle: null,
-      deliveryMessage: RECORDING_DELIVERY_COPY.capacity,
-    };
-  }
-  if (
-    input.recordingStopReason === "candidate" &&
-    input.hasUnsentRecordingMedia
-  ) {
-    return {
-      blockingError: null,
-      blockingErrorTitle: null,
-      deliveryMessage: RECORDING_DELIVERY_COPY.candidateStop,
-    };
-  }
-  if (
-    input.hasIncompleteRecordingFinalization ||
-    input.finalizationState === "queued" ||
-    input.finalizationState === "finalizing"
-  ) {
-    return {
-      blockingError: null,
-      blockingErrorTitle: null,
-      deliveryMessage: RECORDING_DELIVERY_COPY.completionPending,
-    };
-  }
-  if (input.recordingPreflightState === "checking") {
-    return {
-      blockingError: null,
-      blockingErrorTitle: null,
-      deliveryMessage: RECORDING_DELIVERY_COPY.checking,
-    };
-  }
-  if (
-    input.recordingPreflightState === "ready" &&
-    (input.recordingDeliveryPhase ?? "idle") === "idle"
-  ) {
-    return {
-      blockingError: null,
-      blockingErrorTitle: null,
-      deliveryMessage: RECORDING_DELIVERY_COPY.ready,
-    };
-  }
-  const phaseCopy = {
-    idle: null,
-    offline: RECORDING_DELIVERY_COPY.offline,
-    reconnecting: RECORDING_DELIVERY_COPY.reconnecting,
-    retrying: RECORDING_DELIVERY_COPY.retrying,
-    saving: RECORDING_DELIVERY_COPY.saving,
-  } as const;
+
   return {
     blockingError: null,
     blockingErrorTitle: null,
-    deliveryMessage: phaseCopy[input.recordingDeliveryPhase ?? "idle"],
+    deliveryMessage: presentation.message,
   };
 }
 
@@ -191,6 +150,7 @@ export function candidateJourneyHandoff(input: {
   finalizationState?: RecordingFinalizationState | "idle";
   hasIncompleteRecordingFinalization?: boolean;
   hasUnsentRecordingMedia?: boolean;
+  isRecording?: boolean;
   journeyOutcome?: RecordingJourneyOutcome;
   recordingDeliveryPhase?: RecordingDeliveryPhase;
   recordingError?: string | null;
@@ -349,6 +309,7 @@ function HomeComponent() {
     hasIncompleteRecordingFinalization:
       recording.hasIncompleteRecordingFinalization,
     hasUnsentRecordingMedia: recording.hasUnsentRecordingMedia,
+    isRecording: recording.isRecording,
     journeyOutcome: recording.journeyOutcome,
     recordingDeliveryPhase: recording.recordingDeliveryPhase,
     recordingError: recording.error,

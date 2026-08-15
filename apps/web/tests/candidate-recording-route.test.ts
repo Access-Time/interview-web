@@ -74,8 +74,10 @@ it("hands off blocking failures and suppresses them after failed submission", ()
     recordingError: null,
     saveState: "healthy",
   });
-  expect(failed.blockingError).toBe(null);
-  expect(failed.blockingErrorTitle).toBe(null);
+  expect(failed.blockingError).toBe(
+    RECORDING_DELIVERY_COPY.finalizationFailure
+  );
+  expect(failed.blockingError).not.toBe(classification.message);
   expect(failed.hasStopped).toBe(true);
   expect(failed.finalizationState).toBe("failed");
   expect(failed.journeyOutcome).toBe("manual-retry");
@@ -190,6 +192,33 @@ it("prefers capacity and save-failure delivery copy", () => {
       recordingStopReason: "save-failure",
     }).blockingError
   ).toBe(RECORDING_DELIVERY_COPY.saveFailure);
+});
+
+it("does not announce preflight-ready copy while recording", () => {
+  expect(
+    candidateJourneyHandoff({
+      isRecording: true,
+      recordingDeliveryPhase: "idle",
+      recordingPreflightState: "ready",
+    }).deliveryMessage
+  ).toBeNull();
+});
+
+it("prefers finalization failure over capacity copy", () => {
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      finalizationState: "failed",
+      recordingStopReason: "capacity",
+    }).blockingError
+  ).toBe(RECORDING_DELIVERY_COPY.finalizationFailure);
+  expect(
+    candidateJourneyHandoff({
+      captureEnded: true,
+      finalizationState: "failed",
+      recordingStopReason: "capacity",
+    }).deliveryMessage
+  ).toBeNull();
 });
 
 it("warns before unload during capture, unsent media, or incomplete finalization", () => {

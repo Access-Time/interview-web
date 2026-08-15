@@ -707,11 +707,24 @@ it("alerts on blocked preflight and offers Try again without Start", () => {
   expect(screen.getByRole("alert").textContent ?? "").toContain(
     RECORDING_DELIVERY_COPY.preflightBlocked
   );
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
   expect(
     screen.queryByRole("button", { name: START_BUTTON_PATTERN })
   ).toBeNull();
   fireEvent.click(screen.getByRole("button", { name: TRY_AGAIN_PATTERN }));
   expect(retries).toEqual(["retry"]);
+});
+
+it("does not duplicate the blocked-preflight alert when the route hands off the same copy", () => {
+  renderJourney({
+    blockingError: RECORDING_DELIVERY_COPY.preflightBlocked,
+    blockingErrorTitle: "This device isn’t ready to record",
+    recordingPreflightState: "blocked",
+  });
+  expect(screen.getAllByRole("alert")).toHaveLength(1);
+  expect(screen.getByRole("alert").textContent ?? "").toContain(
+    RECORDING_DELIVERY_COPY.preflightBlocked
+  );
 });
 
 it("alerts on device write failure", () => {

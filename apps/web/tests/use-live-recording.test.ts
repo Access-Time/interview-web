@@ -1,7 +1,8 @@
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import React from "react";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import {
+  getRecordingStoragePolicy,
   type RecordingManifestLookup,
   type UseLiveRecordingResult,
   useLiveRecording,
@@ -17,12 +18,16 @@ const globalProperties = [
   "fetch",
 ];
 
-function installIndexedDb() {
+function installIndexedDb(options?: {
+  probeFails?: boolean;
+  writeFailsAfterPart?: number;
+}) {
   const records = {
     parts: new Map<string, unknown>(),
     sessions: new Map<string, unknown>(),
   };
   const storeNames = new Set<string>();
+  let successfulPartWrites = 0;
 
   const requestFor = <T>(result: T) => {
     const request = {
@@ -74,6 +79,24 @@ function installIndexedDb() {
             if (!key) {
               throw new Error(`Missing ${name} key`);
             }
+            if (
+              name === "parts" &&
+              options?.probeFails &&
+              key === "__recording_preflight_probe__"
+            ) {
+              throw new Error("probe failed");
+            }
+            if (
+              name === "parts" &&
+              key !== "__recording_preflight_probe__" &&
+              options?.writeFailsAfterPart !== undefined &&
+              successfulPartWrites >= options.writeFailsAfterPart
+            ) {
+              throw new Error("IndexedDB write failed");
+            }
+            if (name === "parts" && key !== "__recording_preflight_probe__") {
+              successfulPartWrites += 1;
+            }
             values.set(key, value);
             complete();
             return {} as IDBRequest;
@@ -116,7 +139,36 @@ function installIndexedDb() {
   };
 }
 
-function installBrowserGlobals() {
+function installStorage(overrides?: {
+  estimate?: { quota?: number; usage?: number };
+  persist?: boolean;
+  persisted?: boolean;
+}) {
+  const storage = {
+    estimate: vi
+      .fn()
+      .mockResolvedValue(
+        overrides?.estimate ?? { quota: 1_000_000_000, usage: 10 }
+      ),
+    persist: vi.fn().mockResolvedValue(overrides?.persist ?? true),
+    persisted: vi.fn().mockResolvedValue(overrides?.persisted ?? true),
+  };
+  Object.defineProperty(navigator, "storage", {
+    configurable: true,
+    value: storage,
+  });
+  return storage;
+}
+
+function installBrowserGlobals(options?: {
+  probeFails?: boolean;
+  storage?: {
+    estimate?: { quota?: number; usage?: number };
+    persist?: boolean;
+    persisted?: boolean;
+  };
+  writeFailsAfterPart?: number;
+}) {
   for (const property of globalProperties) {
     originalDescriptors.set(
       property,
@@ -127,7 +179,11 @@ function installBrowserGlobals() {
     configurable: true,
     value: true,
   });
-  return installIndexedDb();
+  installStorage(options?.storage);
+  return installIndexedDb({
+    probeFails: options?.probeFails,
+    writeFailsAfterPart: options?.writeFailsAfterPart,
+  });
 }
 
 const events: string[] = [];
@@ -144,11 +200,13 @@ class FakeMediaRecorder extends EventTarget {
     return true;
   }
 
+  audioBitsPerSecond = 128_000;
   mimeType = "video/webm";
   ondataavailable: ((event: BlobEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
   onstop: ((event: Event) => void) | null = null;
   state: RecordingState = "inactive";
+  videoBitsPerSecond = 1_000_000;
 
   static last: FakeMediaRecorder | null = null;
 
@@ -190,7 +248,9 @@ class FakeMediaRecorder extends EventTarget {
 
 let latest: UseLiveRecordingResult | null = null;
 let finalizeCalls = 0;
+let finalizeMode: "failed" | "queued" | "ready" = "ready";
 let resolveFinalization: (() => void) | null = null;
+let remoteStatus: "ready" | undefined;
 let manifestLookup: (() => Promise<RecordingManifestLookup>) | undefined;
 
 function RecordingHost() {
@@ -201,15 +261,20 @@ function RecordingHost() {
     createSession: (_input, { onSuccess }) => {
       onSuccess(undefined);
     },
-    finalizeSession: (_input, { onSuccess }) => {
+    finalizeSession: (_input, { onError, onSuccess }) => {
       finalizeCalls += 1;
       resolveFinalization = () => {
-        onSuccess({ status: "ready" });
+        if (finalizeMode === "failed") {
+          onError(new Error("finalization unavailable"));
+          return;
+        }
+        onSuccess({ status: finalizeMode });
       };
     },
     getManifest: manifestLookup
       ? async () => manifestLookup?.() ?? { kind: "missing" }
       : undefined,
+    status: remoteStatus,
   });
   return null;
 }
@@ -228,7 +293,9 @@ afterEach(() => {
   events.length = 0;
   latest = null;
   finalizeCalls = 0;
+  finalizeMode = "ready";
   resolveFinalization = null;
+  remoteStatus = undefined;
   manifestLookup = undefined;
   uploadStatus = 201;
   uploadCalls = 0;
@@ -553,4 +620,333 @@ it("does not offer reset for terminal recovery without a complete session", asyn
   );
   expect(storage.sessions.size).toBe(1);
   expect(storage.parts.size).toBe(1);
+});
+
+function mountAdmittedHost(options?: {
+  fetch?: typeof fetch;
+  probeFails?: boolean;
+  storage?: {
+    estimate?: { quota?: number; usage?: number };
+    persist?: boolean;
+    persisted?: boolean;
+  };
+  writeFailsAfterPart?: number;
+}) {
+  const storage = installBrowserGlobals({
+    probeFails: options?.probeFails,
+    storage: options?.storage,
+    writeFailsAfterPart: options?.writeFailsAfterPart,
+  });
+  Object.defineProperty(globalThis, "MediaRecorder", {
+    configurable: true,
+    value: FakeMediaRecorder,
+  });
+  Object.defineProperty(globalThis.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    value:
+      options?.fetch ??
+      (() => Promise.resolve(new Response(null, { status: uploadStatus }))),
+  });
+  const view = render(React.createElement(RecordingHost));
+  return Object.assign(storage, { rerender: view.rerender });
+}
+
+it("admits capture after a successful preflight", async () => {
+  mountAdmittedHost();
+  await act(async () => {
+    await latest?.initialize();
+  });
+  expect(latest?.recordingPreflightState).toBe("ready");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(latest?.isRecording).toBe(true);
+});
+
+it("blocks Start when persistence is denied", async () => {
+  const storage = {
+    estimate: vi.fn().mockResolvedValue({ quota: 1_000_000_000, usage: 10 }),
+    persist: vi.fn().mockResolvedValue(false),
+    persisted: vi.fn().mockResolvedValue(false),
+  };
+  mountAdmittedHost();
+  Object.defineProperty(navigator, "storage", {
+    configurable: true,
+    value: storage,
+  });
+  await act(async () => {
+    await latest?.initialize();
+  });
+  storage.persisted.mockResolvedValueOnce(false);
+  storage.persist.mockResolvedValueOnce(false);
+  await act(async () => {
+    await latest?.retryRecordingPreflight();
+  });
+  expect(latest?.recordingPreflightState).toBe("blocked");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(FakeMediaRecorder.last?.state).not.toBe("recording");
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("does not start when storage APIs are missing", async () => {
+  mountAdmittedHost();
+  Object.defineProperty(navigator, "storage", {
+    configurable: true,
+    value: undefined,
+  });
+  await act(async () => {
+    await latest?.initialize();
+  });
+  expect(latest?.recordingPreflightState).toBe("blocked");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("does not start when the storage estimate is not finite", async () => {
+  mountAdmittedHost({
+    storage: { estimate: { quota: Number.NaN, usage: 10 } },
+  });
+  await act(async () => {
+    await latest?.initialize();
+  });
+  expect(latest?.recordingPreflightState).toBe("blocked");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("does not start when headroom is insufficient", async () => {
+  mountAdmittedHost({
+    storage: { estimate: { quota: 100, usage: 0 } },
+  });
+  await act(async () => {
+    await latest?.initialize();
+  });
+  expect(latest?.recordingPreflightState).toBe("blocked");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("does not start when the IndexedDB probe rejects", async () => {
+  mountAdmittedHost({ probeFails: true });
+  await act(async () => {
+    await latest?.initialize();
+  });
+  expect(latest?.recordingPreflightState).toBe("blocked");
+  await act(async () => {
+    await latest?.start();
+  });
+  expect(latest?.isRecording).toBe(false);
+});
+
+it("persists the terminal part, drains, then finalizes after a candidate stop", async () => {
+  const calls: string[] = [];
+  const terminalUpload = {
+    promise: Promise.resolve(new Response(null, { status: 204 })),
+    resolve: (_value: Response) => undefined,
+  };
+  terminalUpload.promise = new Promise((resolve) => {
+    terminalUpload.resolve = resolve;
+  });
+  mountAdmittedHost({
+    fetch: async (input) => {
+      const url = input.toString();
+      calls.push(url);
+      if (calls.length === 2) {
+        return await terminalUpload.promise;
+      }
+      return new Response(null, { status: 204 });
+    },
+  });
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await waitFor(() => expect(calls).toHaveLength(1));
+  let stopPromise: Promise<void> | undefined;
+  await act(async () => {
+    stopPromise = latest?.stop();
+    await Promise.resolve();
+  });
+  await waitFor(() => expect(calls).toHaveLength(2));
+  expect(finalizeCalls).toBe(0);
+  expect(latest?.recordingStopReason).toBe("candidate");
+  terminalUpload.resolve(new Response(null, { status: 204 }));
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(async () => {
+    resolveFinalization?.();
+    await stopPromise;
+  });
+});
+
+it("offers a manual retry when finalization fails", async () => {
+  finalizeMode = "failed";
+  mountAdmittedHost();
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await act(async () => {
+    await latest?.stop();
+  });
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(() => {
+    resolveFinalization?.();
+  });
+  await waitFor(() => expect(latest?.finalization?.state).toBe("failed"));
+  expect(latest?.journeyOutcome).toBe("manual-retry");
+});
+
+it("clears incomplete finalization when remote status becomes ready", async () => {
+  finalizeMode = "queued";
+  const view = mountAdmittedHost();
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await act(async () => {
+    await latest?.stop();
+  });
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(() => {
+    resolveFinalization?.();
+  });
+  await waitFor(() =>
+    expect(latest?.hasIncompleteRecordingFinalization).toBe(true)
+  );
+  remoteStatus = "ready";
+  view.rerender(React.createElement(RecordingHost));
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+  expect(latest?.hasIncompleteRecordingFinalization).toBe(false);
+});
+
+it("safety-stops before the next normal part would breach the admitted policy", async () => {
+  const policy = getRecordingStoragePolicy(128_000, 1_000_000);
+  if (!policy) {
+    throw new Error("expected policy");
+  }
+  const storage = installStorage({
+    estimate: { quota: 1_000_000_000, usage: 10 },
+  });
+  mountAdmittedHost();
+  Object.defineProperty(navigator, "storage", {
+    configurable: true,
+    value: storage,
+  });
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  storage.estimate.mockResolvedValue({
+    quota: policy.predictedPartBytes * 2 + policy.safetyMarginBytes,
+    usage: 0,
+  });
+  FakeMediaRecorder.last?.emitData("normal");
+  await waitFor(() => expect(latest?.recordingStopReason).toBe("capacity"));
+  expect(events).toContain("audio-track-stopped");
+  expect(events).toContain("video-track-stopped");
+  await waitFor(() => expect(finalizeCalls).toBe(1));
+  await act(() => {
+    resolveFinalization?.();
+  });
+});
+
+it("treats an IndexedDB write failure as a save failure, not a capacity stop", async () => {
+  const durable = mountAdmittedHost({ writeFailsAfterPart: 1 });
+  await act(async () => {
+    window.dispatchEvent(new Event("offline"));
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("first");
+  await waitFor(() => expect(latest?.hasUnsentRecordingMedia).toBe(true));
+  FakeMediaRecorder.last?.emitData("second");
+  await waitFor(() => expect(latest?.recordingStopReason).toBe("save-failure"));
+  expect(events).toContain("audio-track-stopped");
+  expect(events).toContain("video-track-stopped");
+  expect(latest?.finalization?.state).not.toBe("ready");
+  expect(
+    [...durable.parts.values()].some(
+      (value) => (value as { sequence?: number }).sequence === 0
+    )
+  ).toBe(true);
+});
+
+it("reconciles before reconnect drain", async () => {
+  const calls: string[] = [];
+  const manifestReady = {
+    promise: Promise.resolve({
+      kind: "found" as const,
+      manifest: {
+        segments: [{ id: "segment", parts: [] }],
+        sessionId: "held",
+      },
+    }),
+    resolve: (_value: RecordingManifestLookup) => undefined,
+  };
+  manifestReady.promise = new Promise((resolve) => {
+    manifestReady.resolve = resolve;
+  });
+  manifestLookup = () => manifestReady.promise;
+  mountAdmittedHost({
+    fetch: async (input) => {
+      calls.push(input.toString());
+      return await new Promise<Response>(() => undefined);
+    },
+  });
+  await act(async () => {
+    window.dispatchEvent(new Event("offline"));
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("offline-part");
+  await waitFor(() => expect(latest?.hasUnsentRecordingMedia).toBe(true));
+  expect(latest?.recordingDeliveryPhase).toBe("offline");
+  const putCountBeforeOnline = calls.length;
+  await act(() => {
+    Object.defineProperty(globalThis.navigator, "onLine", {
+      configurable: true,
+      value: true,
+    });
+    window.dispatchEvent(new Event("online"));
+  });
+  await waitFor(() =>
+    expect(latest?.recordingDeliveryPhase).toBe("reconnecting")
+  );
+  expect(calls).toHaveLength(putCountBeforeOnline);
+  manifestReady.resolve({
+    kind: "found",
+    manifest: {
+      segments: [{ id: "segment", parts: [] }],
+      sessionId: "held",
+    },
+  });
+  await waitFor(() => expect(latest?.recordingDeliveryPhase).toBe("saving"));
+});
+
+it("reports retry without hiding retained media", async () => {
+  mountAdmittedHost({
+    fetch: async () => new Response(null, { status: 503 }),
+  });
+  await act(async () => {
+    await latest?.initialize();
+    await latest?.start();
+  });
+  FakeMediaRecorder.last?.emitData("retry-part");
+  await waitFor(() => expect(latest?.recordingDeliveryPhase).toBe("retrying"));
+  expect(latest?.hasUnsentRecordingMedia).toBe(true);
 });

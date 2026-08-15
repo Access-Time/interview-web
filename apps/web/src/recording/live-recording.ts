@@ -38,15 +38,21 @@ export interface UseLiveRecordingResult {
   captureEnded: boolean;
   error: string | null;
   finalization: RecordingFinalizationResult | null;
+  hasIncompleteRecordingFinalization: boolean;
+  hasUnsentRecordingMedia: boolean;
   initialize: () => Promise<void>;
   integrity: RecordingIntegrity;
   isReady: boolean;
   isRecording: boolean;
   journeyOutcome: RecordingJourneyOutcome;
   pendingPartCount: number;
+  recordingDeliveryPhase: RecordingDeliveryPhase;
+  recordingPreflightState: RecordingPreflightState;
+  recordingStopReason: RecordingStopReason;
   recovered: boolean;
   resetRecoveredRecording: () => Promise<void>;
   retryFinalization: () => Promise<void>;
+  retryRecordingPreflight: () => Promise<void>;
   saveState: RecordingSaveState;
   start: () => Promise<void>;
   stop: () => Promise<void>;
@@ -1042,11 +1048,20 @@ export function createLiveRecordingOutbox(
     get saveState(): RecordingSaveState {
       return currentSaveState();
     },
-    async setOnline(value: boolean, options?: { flush?: boolean }) {
+    async setOnline(
+      value: boolean,
+      options?: { flush?: boolean; reconnect?: boolean }
+    ) {
       online = value;
-      if (!value && retryTimer) {
-        clearTimeout(retryTimer);
-        retryTimer = undefined;
+      if (value && options?.reconnect) {
+        reconnecting = true;
+      }
+      if (!value) {
+        reconnecting = false;
+        if (retryTimer) {
+          clearTimeout(retryTimer);
+          retryTimer = undefined;
+        }
       }
       if (value && options?.flush !== false) {
         await flush();
@@ -1096,11 +1111,16 @@ export function useLiveRecording(
     null
   );
   const recorder = useRef<MediaRecorder | undefined>(undefined);
+  const preparedRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingPolicyRef = useRef<RecordingStoragePolicy | null>(null);
+  const recoveryStoreRef = useRef<RecordingRecoveryStore | null>(null);
   const sequence = useRef(0);
-  const processing = useRef<Promise<void>[]>([]);
+  const processing = useRef(new Set<Promise<void>>());
   const ids = useRef<{ sessionId: string; segmentId: string } | null>(null);
   const session = useRef<RecordingSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const persistingTerminalPart = useRef(false);
+  const shouldSafetyStop = useRef(false);
   const terminalDataRef = useRef<{
     awaiting: boolean;
     promise: Promise<void>;
@@ -1121,6 +1141,21 @@ export function useLiveRecording(
   const integrity = useRecordingStore((state) => state.integrity);
   const pendingPartCount = useRecordingStore((state) => state.pendingPartCount);
   const saveState = useRecordingStore((state) => state.saveState);
+  const recordingPreflightState = useRecordingStore(
+    (state) => state.recordingPreflightState
+  );
+  const recordingDeliveryPhase = useRecordingStore(
+    (state) => state.recordingDeliveryPhase
+  );
+  const recordingStopReason = useRecordingStore(
+    (state) => state.recordingStopReason
+  );
+  const hasUnsentRecordingMedia = useRecordingStore(
+    (state) => state.hasUnsentRecordingMedia
+  );
+  const hasIncompleteRecordingFinalization = useRecordingStore(
+    (state) => state.hasIncompleteRecordingFinalization
+  );
 
   const { setJourney } = useRecordingStore.getState();
   const setStream = (next: MediaStream | null) => setJourney({ stream: next });
@@ -1133,6 +1168,12 @@ export function useLiveRecording(
     setJourney({ journeyOutcome: next });
   const setCanResetRecoveredRecording = (next: boolean) =>
     setJourney({ canResetRecoveredRecording: next });
+  const setRecordingPreflightState = (next: RecordingPreflightState) =>
+    setJourney({ recordingPreflightState: next });
+  const setRecordingStopReason = (next: RecordingStopReason) =>
+    setJourney({ recordingStopReason: next });
+  const setIncompleteFinalization = (next: boolean) =>
+    setJourney({ hasIncompleteRecordingFinalization: next });
   const finalizationInput = useRef<{
     sessionId: string;
     segments: Array<{ segmentId: string; partCount: number }>;
@@ -1182,6 +1223,8 @@ export function useLiveRecording(
     if (finalizationInput.current?.sessionId === input.sessionId) {
       finalizationInput.current = null;
     }
+    setFinalizationState({ error: null, state: "ready" });
+    setIncompleteFinalization(false);
     if (
       !sealedPlans.current.length &&
       session.current?.status === "recording"
@@ -1200,7 +1243,9 @@ export function useLiveRecording(
     useRecordingStore.getState().reset();
     lifecycle.current = false;
     const isDisposed = () => lifecycle.current === true;
-    const box = createLiveRecordingOutbox(undefined, undefined, (cause) => {
+    const recoveryStore = browserStore();
+    recoveryStoreRef.current = recoveryStore;
+    const box = createLiveRecordingOutbox(recoveryStore, undefined, (cause) => {
       if (isDisposed()) {
         return;
       }
@@ -1214,10 +1259,19 @@ export function useLiveRecording(
     });
     outbox.current = box;
     const emitOutbox = () => {
+      const {
+        deliveryPhase,
+        hasUnsentMedia,
+        integrity: nextIntegrity,
+        pendingPartCount: nextPendingPartCount,
+        saveState: nextSaveState,
+      } = box.snapshot;
       useRecordingStore.getState().syncOutbox({
-        integrity: box.integrity,
-        pendingPartCount: box.pendingCount,
-        saveState: box.saveState,
+        hasUnsentRecordingMedia: hasUnsentMedia,
+        integrity: nextIntegrity,
+        pendingPartCount: nextPendingPartCount,
+        recordingDeliveryPhase: deliveryPhase,
+        saveState: nextSaveState,
       });
     };
     const unsubscribe = box.subscribe(() => {
@@ -1242,6 +1296,8 @@ export function useLiveRecording(
               cause instanceof Error ? cause.message : String(cause);
             setError(message);
             setFinalizationState({ error: message, state: "failed" });
+            setIncompleteFinalization(true);
+            setJourneyOutcome("manual-retry");
             return;
           }
           finalizationInput.current = plan;
@@ -1343,7 +1399,7 @@ export function useLiveRecording(
     const online = () => {
       ignorePromise(
         enqueueRecovery(async () => {
-          await box.setOnline(true, { flush: false });
+          await box.setOnline(true, { flush: false, reconnect: true });
           await recoverFromStore();
           await submitSealed();
         })
@@ -1422,6 +1478,49 @@ export function useLiveRecording(
     requestStatus(null);
   }, [isRemoteReady]);
 
+  const createRecorder = (media: MediaStream) => {
+    const requested =
+      MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
+    return requested
+      ? new MediaRecorder(media, { mimeType: requested })
+      : new MediaRecorder(media);
+  };
+
+  const prepareRecording = async () => {
+    const media = streamRef.current;
+    const recoveryStore = recoveryStoreRef.current;
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: refs are populated after initialize.
+    if (!(media && recoveryStore)) {
+      setRecordingPreflightState("blocked");
+      return;
+    }
+    setRecordingPreflightState("checking");
+    const nextRecorder = createRecorder(media);
+    const policy = getRecordingStoragePolicy(
+      nextRecorder.audioBitsPerSecond,
+      nextRecorder.videoBitsPerSecond
+    );
+    const result = await runRecordingPreflight(
+      {
+        probe: () => recoveryStore.probe(),
+        storage: navigator.storage ?? null,
+      },
+      policy
+    );
+    if (lifecycle.current === true) {
+      return;
+    }
+    if (result.state === "blocked") {
+      preparedRecorderRef.current = null;
+      recordingPolicyRef.current = null;
+      setRecordingPreflightState("blocked");
+      return;
+    }
+    preparedRecorderRef.current = nextRecorder;
+    recordingPolicyRef.current = result.policy;
+    setRecordingPreflightState("ready");
+  };
+
   const initialize = async () => {
     try {
       const acquired = await navigator.mediaDevices.getUserMedia({
@@ -1440,6 +1539,7 @@ export function useLiveRecording(
       if (outbox.current?.integrity === "ok") {
         setError(null);
       }
+      await prepareRecording();
     } catch (cause) {
       if (lifecycle.current === true) {
         return;
@@ -1448,6 +1548,14 @@ export function useLiveRecording(
         `Unable to access camera and microphone: ${cause instanceof Error ? cause.message : String(cause)}`
       );
     }
+  };
+
+  const retryRecordingPreflight = async () => {
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: retry is a no-op before a stream exists.
+    if (!streamRef.current) {
+      return;
+    }
+    await prepareRecording();
   };
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: start coordinates the persisted intent, remote intent, and recorder lifecycle.
   const start = async () => {
@@ -1458,6 +1566,13 @@ export function useLiveRecording(
     }
     if (!stream) {
       throw new Error("Recording is not initialized");
+    }
+    if (
+      useRecordingStore.getState().recordingPreflightState !== "ready" ||
+      !preparedRecorderRef.current ||
+      !recordingPolicyRef.current
+    ) {
+      return;
     }
     const requested =
       MIME_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null;
@@ -1473,12 +1588,14 @@ export function useLiveRecording(
     const segmentId = resumeTail
       ? (previous.segments.at(-1)?.segmentId ?? crypto.randomUUID())
       : crypto.randomUUID();
-    const instance = requested
-      ? new MediaRecorder(stream, { mimeType: requested })
-      : new MediaRecorder(stream);
+    const instance = preparedRecorderRef.current;
     cancelFinalizationPolling();
     finalizationAttempted.current = false;
     finalizationInput.current = null;
+    shouldSafetyStop.current = false;
+    persistingTerminalPart.current = false;
+    setRecordingStopReason(null);
+    setIncompleteFinalization(false);
     setFinalizationState(null);
     ids.current = { segmentId, sessionId };
     sequence.current = 0;
@@ -1516,8 +1633,10 @@ export function useLiveRecording(
         return;
       }
       instance.ondataavailable = (event) => {
-        if (terminalDataRef.current?.awaiting) {
-          terminalDataRef.current.resolve();
+        const isTerminalPart = Boolean(terminalDataRef.current?.awaiting);
+        if (isTerminalPart) {
+          persistingTerminalPart.current = true;
+          terminalDataRef.current?.resolve();
         }
         if (!(event.data.size && ids.current && outbox.current)) {
           return;
@@ -1547,19 +1666,34 @@ export function useLiveRecording(
           status: currentSession.status,
         };
         session.current = updatedSession;
-        const work = outbox.current.savePartAndSession(part, updatedSession);
-        processing.current.push(work);
-        work.then(
-          () => {
-            processing.current = processing.current.filter(
-              (item) => item !== work
-            );
-          },
-          () => {
-            processing.current = processing.current.filter(
-              (item) => item !== work
-            );
+        const persistPart = async () => {
+          try {
+            await outbox.current?.savePartAndSession(part, updatedSession);
+          } catch (cause) {
+            failSave(cause);
+            return;
           }
+          // biome-ignore lint/suspicious/noUnnecessaryConditions: terminal parts skip a second capacity check.
+          if (persistingTerminalPart.current) {
+            return;
+          }
+          const policy = recordingPolicyRef.current;
+          // biome-ignore lint/suspicious/noUnnecessaryConditions: start is gated on an admitted policy.
+          if (!policy) {
+            return;
+          }
+          await evaluateCapacityStop(policy);
+        };
+        const work = persistPart();
+        processing.current.add(work);
+        ignorePromise(
+          work.finally(() => {
+            processing.current.delete(work);
+            // biome-ignore lint/suspicious/noUnnecessaryConditions: capacity is evaluated after each durable part.
+            if (shouldSafetyStop.current && !captureEndingRef.current) {
+              ignorePromise(endCapture(undefined, "capacity"));
+            }
+          })
         );
       };
       instance.onerror = (event) => {
@@ -1600,9 +1734,56 @@ export function useLiveRecording(
       onSuccess: beginCapture,
     });
   };
-  const endCapture = (cause?: unknown): Promise<void> => {
+  const evaluateCapacityStop = async (policy: RecordingStoragePolicy) => {
+    try {
+      const estimate = await navigator.storage?.estimate();
+      const quota = estimate?.quota;
+      const usage = estimate?.usage;
+      const freeBytes =
+        Number.isFinite(quota) && Number.isFinite(usage)
+          ? Number(quota) - Number(usage)
+          : 0;
+      if (
+        wouldBreachRecordingCapacity(
+          outbox.current?.snapshot.pendingBytes ?? 0,
+          freeBytes,
+          policy
+        )
+      ) {
+        shouldSafetyStop.current = true;
+      }
+    } catch {
+      shouldSafetyStop.current = true;
+    }
+  };
+
+  const failSave = (cause: unknown) => {
+    setRecordingStopReason("save-failure");
+    captureCauseRef.current = cause;
+    setError(cause instanceof Error ? cause.message : String(cause));
+    setJourneyOutcome("terminal-restart");
+    setCaptureEnded(true);
+    setRecording(false);
+    for (const track of streamRef.current?.getTracks() ?? []) {
+      track.stop();
+    }
+    streamRef.current = null;
+    setStream(null);
+    setReady(false);
+    const instance = recorder.current;
+    // biome-ignore lint/suspicious/noUnnecessaryConditions: save failure can race recorder shutdown.
+    if (instance && instance.state !== "inactive") {
+      instance.stop();
+    }
+  };
+
+  const endCapture = (
+    cause?: unknown,
+    reason: Exclude<RecordingStopReason, null> = "candidate"
+  ): Promise<void> => {
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: capture shutdown serializes media, persistence, and finalization failures.
     captureEndingRef.current ??= (async () => {
+      setRecordingStopReason(reason);
       setCaptureEnded(true);
       setRecording(false);
 
@@ -1633,7 +1814,7 @@ export function useLiveRecording(
           await terminalData.promise;
         }
 
-        while (processing.current.length) {
+        while (processing.current.size) {
           // biome-ignore lint/performance/noAwaitInLoops: capture processing can enqueue during drain.
           await Promise.all(processing.current);
         }
@@ -1675,6 +1856,7 @@ export function useLiveRecording(
         await box.saveSession(session.current);
         sealedPlans.current.push(plan);
         finalizationInput.current ??= plan;
+        setIncompleteFinalization(true);
         setFinalizationState({ error: null, state: "queued" });
         await submitSealedRef.current?.();
 
@@ -1699,6 +1881,7 @@ export function useLiveRecording(
           setError(failure.message);
         }
         if (useRecordingStore.getState().finalization?.state === "failed") {
+          setIncompleteFinalization(true);
           setJourneyOutcome("manual-retry");
         } else if (isFatalRecordingFailure(failureCause)) {
           setJourneyOutcome("terminal-restart");
@@ -1727,7 +1910,7 @@ export function useLiveRecording(
     if (recorder.current?.state !== "recording") {
       return Promise.resolve();
     }
-    return endCapture();
+    return endCapture(undefined, "candidate");
   };
   const finalize = (input: {
     sessionId: string;
@@ -1752,6 +1935,8 @@ export function useLiveRecording(
           error: finalizeError.message,
           state: "failed",
         });
+        setIncompleteFinalization(true);
+        setJourneyOutcome("manual-retry");
         setError(finalizeError.message);
       },
       onSuccess: (result) => {
@@ -1762,10 +1947,13 @@ export function useLiveRecording(
             error: "Invalid finalization status",
             state: "failed",
           });
+          setIncompleteFinalization(true);
+          setJourneyOutcome("manual-retry");
           return;
         }
         setFinalizationState({ error: null, state });
         if (state === "ready") {
+          setIncompleteFinalization(false);
           ignorePromise(
             (async () => {
               await outbox.current?.deleteSession(input.sessionId);
@@ -1817,6 +2005,7 @@ export function useLiveRecording(
     finalizationInput.current = null;
     finalizationAttempted.current = false;
     setFinalizationState(null);
+    setIncompleteFinalization(false);
     setError(null);
     setJourneyOutcome("none");
     setCanResetRecoveredRecording(false);
@@ -1829,15 +2018,21 @@ export function useLiveRecording(
       options.status === undefined || options.status === null
         ? finalization
         : { error: null, state: options.status },
+    hasIncompleteRecordingFinalization,
+    hasUnsentRecordingMedia,
     initialize,
     integrity,
     isReady,
     isRecording,
     journeyOutcome,
     pendingPartCount,
+    recordingDeliveryPhase,
+    recordingPreflightState,
+    recordingStopReason,
     recovered,
     resetRecoveredRecording,
     retryFinalization,
+    retryRecordingPreflight,
     saveState,
     start,
     stop,

@@ -802,6 +802,21 @@ it("keeps a capacity safety-stop as status without retry", () => {
   expect(screen.queryByRole("button", { name: TRY_AGAIN_PATTERN })).toBeNull();
 });
 
+it("does not keep finishing copy after finalization is ready", () => {
+  renderJourney({
+    finalization: { error: null, state: "ready" },
+    hasStopped: true,
+    recordingStopReason: "capacity",
+  });
+  expect(
+    screen.getByRole("heading", { name: "Submission complete." })
+  ).toBeTruthy();
+  expect(screen.queryByText(RECORDING_DELIVERY_COPY.capacity)).toBeNull();
+  expect(
+    screen.queryByText(RECORDING_DELIVERY_COPY.completionPending)
+  ).toBeNull();
+});
+
 it("does not expose progress UI or implementation terminology", () => {
   const { container } = renderJourney({
     isReady: true,

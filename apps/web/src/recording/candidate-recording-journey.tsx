@@ -191,6 +191,9 @@ export function getDeliveryPresentation(
       retryPreflight: false,
     };
   }
+  if (props.finalization?.state === "ready") {
+    return { kind: null, message: null, retryPreflight: false };
+  }
   if (props.recordingStopReason === "capacity") {
     return {
       kind: "status",

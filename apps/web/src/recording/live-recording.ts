@@ -441,7 +441,7 @@ export function createLiveRecordingOutbox(
             left.sessionId.localeCompare(right.sessionId) ||
             left.segmentId.localeCompare(right.segmentId) ||
             left.sequence - right.sequence
-        )[0];
+        );
         if (!nextPart) {
           return;
         }
@@ -505,6 +505,7 @@ export function createLiveRecordingOutbox(
         const failure = markRecordingFailure(error, "fatal");
         saveState = "error";
         onError?.(failure);
+        onChange?.();
         throw failure;
       }
       rememberPendingPart(part);
@@ -554,9 +555,11 @@ export function createLiveRecordingOutbox(
       options?: { flush?: boolean; reconnect?: boolean }
     ) {
       online = value;
+      onChange?.();
       if (value && options?.flush !== false) {
         await flush();
       }
+      onChange?.();
     },
   };
 }

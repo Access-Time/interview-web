@@ -1,27 +1,14 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import {
-  claimRecordingFinalization,
-  completeRecordingFinalization,
   createDb,
   type Database,
-  failRecordingFinalization,
-  getReadyRecordingSubmission,
   listRecordingsForFinalization,
-  releaseRecordingFinalizationForRetry,
-  renewRecordingFinalizationLease,
 } from "@interview-web/db";
-import { InvalidManifest, isTerminalFinalization } from "./domain/errors.ts";
-import {
-  deterministicJobName,
-  isExactFinalizerOutput,
-  isExactPublishedObject,
-  normalizeSha256Checksum,
-  outputMediaType,
-  validateFinalizePlan,
-  validateManifest,
-} from "./pure";
-
-const CHECKSUM = /^[a-f\d]{64}$/;
+import { Effect, Layer } from "effect";
+import { ContainerClient } from "./worker/container.ts";
+import { makeFinalizerDb } from "./worker/db.ts";
+import { processFinalization as processEffect } from "./worker/process.ts";
+import { makeRecordings } from "./worker/recordings.ts";
 
 export type {
   FinalizerManifest,
@@ -78,22 +65,6 @@ export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
   return getContainer(env.FINALIZER);
 }
 
-class TransientFinalizationError extends Error {
-  terminal = false;
-}
-export function isTerminalFinalizationStatus(status: number) {
-  return [400, 413, 415, 422].includes(status);
-}
-export function check(response: Response, what: string) {
-  if (response.ok) {
-    return response;
-  }
-  if (isTerminalFinalizationStatus(response.status)) {
-    throw new InvalidManifest({ message: `${what}: ${response.status}` });
-  }
-  throw new TransientFinalizationError(`${what}: ${response.status}`);
-}
-
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered finalization protocol.
 export async function processFinalization(input: {
   db: FinalizerDb;
@@ -102,234 +73,80 @@ export async function processFinalization(input: {
     attempt: number
   ) => FinalizerContainer | Promise<FinalizerContainer>;
   sessionId: string;
-  dbFns?: Partial<DbFns>;
-  heartbeatMs?: number;
 }) {
-  const f = { ...defaultDbFns, ...input.dbFns };
-  const claimed = await f.claim(input.db, input.sessionId);
-  if (!claimed) {
-    return;
-  }
-  const { attempt, manifest } = claimed;
-  let outputKey: string | undefined;
-  let candidateOutput:
-    | {
-        objectKey: string;
-        mediaType: string;
-        byteSize: number;
-        checksum: string;
-      }
-    | undefined;
-  let published = false;
-  let leaseLost = false;
-  const abort = new AbortController();
-  const renew = async () => {
-    if (
-      leaseLost ||
-      !(await f.renew(input.db, { attempt, sessionId: input.sessionId }))
-    ) {
-      leaseLost = true;
-      abort.abort();
-      throw new TransientFinalizationError("finalization lease lost");
-    }
-  };
-  const timer = setInterval(() => {
-    f.renew(input.db, { attempt, sessionId: input.sessionId }).then(
-      (ok) => {
-        if (!ok) {
-          leaseLost = true;
-          abort.abort();
-        }
-      },
-      () => {
-        leaseLost = true;
-        abort.abort();
-      }
-    );
-  }, input.heartbeatMs ?? 60_000);
-  let container: FinalizerContainer | undefined;
-  try {
-    validateManifest(manifest);
-    validateFinalizePlan(manifest, claimed.finalizePlan);
-    await renew();
-    container = await input.containerForAttempt(attempt);
-    const job = await deterministicJobName(input.sessionId, attempt);
-    const activeContainer = container;
-    // Local miniflare Container.fetch uses the standard URL parser and rejects
-    // relative paths. Production accepts them; resolve against a dummy origin.
-    const fetch = (url: string, init: RequestInit = {}) =>
-      activeContainer.fetch(new URL(url, "http://container"), {
-        ...init,
-        signal: abort.signal,
-      });
-    const plan = manifest.segments.map((s) => ({
-      partIndexes: s.parts.map((p) => p.sequence),
-      segmentIndex: s.index,
-    }));
-    for (const segment of manifest.segments) {
-      for (const part of segment.parts) {
-        // biome-ignore lint/performance/noAwaitInLoops: media parts must upload in manifest order.
-        await renew();
-        const object = await input.recordings.get(part.objectKey);
-        if (
-          !object?.body ||
-          object.size !== part.byteSize ||
-          !object.checksums?.sha256 ||
-          normalizeSha256Checksum(object.checksums.sha256) !==
-            part.checksum.toLowerCase()
-        ) {
-          throw new InvalidManifest({ message: "missing or corrupt part" });
-        }
-        const r = await fetch(
-          `/jobs/${job}/parts/${segment.index}/${part.sequence}`,
+  const container = await input.containerForAttempt(0);
+  const client = Layer.succeed(ContainerClient, {
+    deleteJob: (job: string) =>
+      Effect.tryPromise(() =>
+        container.fetch(new URL(`/jobs/${job}`, "http://container"), {
+          method: "DELETE",
+        })
+      ).pipe(Effect.asVoid, Effect.orDie),
+    finalize: (value: {
+      job: string;
+      outputMediaType: "video/webm" | "video/mp4";
+      segments: ReadonlyArray<{ partIndexes: number[]; segmentIndex: number }>;
+    }) =>
+      Effect.tryPromise(() =>
+        container.fetch(
+          new URL(`/jobs/${value.job}/finalize`, "http://container"),
           {
-            body: object.body,
-            headers: {
-              "content-length": String(part.byteSize),
-              "x-content-sha256": part.checksum,
-            },
-            method: "PUT",
+            body: JSON.stringify({
+              outputMediaType: value.outputMediaType,
+              segments: value.segments,
+            }),
+            headers: { "content-type": "application/json" },
+            method: "POST",
           }
+        )
+      ).pipe(Effect.asVoid, Effect.orDie),
+    getOutput: (job: string) =>
+      Effect.tryPromise(async () => {
+        const response = await container.fetch(
+          new URL(`/jobs/${job}/output`, "http://container")
         );
-        check(r, "part upload");
-        await renew();
-      }
-    }
-    await renew();
-    check(
-      await fetch(`/jobs/${job}/finalize`, {
-        body: JSON.stringify({
-          outputMediaType: outputMediaType(manifest),
-          segments: plan,
-        }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      }),
-      "finalize"
-    );
-    await renew();
-    const out = check(await fetch(`/jobs/${job}/output`), "output");
-    await renew();
-    const type = out.headers.get("content-type");
-    const size = Number(out.headers.get("content-length"));
-    const checksum = out.headers.get("x-content-sha256")?.toLowerCase();
-    if (
-      (type !== "video/webm" && type !== "video/mp4") ||
-      !Number.isSafeInteger(size) ||
-      size <= 0 ||
-      !checksum ||
-      !CHECKSUM.test(checksum) ||
-      !out.body
-    ) {
-      throw new InvalidManifest({ message: "invalid output" });
-    }
-    outputKey = `recordings/${encodeURIComponent(input.sessionId)}/finalizations/attempt-${attempt}/output.${type === "video/mp4" ? "mp4" : "webm"}`;
-    candidateOutput = {
-      byteSize: size,
-      checksum,
-      mediaType: type,
-      objectKey: outputKey,
-    };
-    const exact = (meta: Omit<FinalizerObject, "body"> | null) =>
-      isExactPublishedObject(meta, {
-        checksum,
-        mediaType: type,
-        size,
-      });
-    let written: Omit<FinalizerObject, "body"> | null = null;
-    let publishError: unknown;
-    try {
-      written = await input.recordings.put(outputKey, out.body, {
-        httpMetadata: { contentType: type },
-        onlyIf: { etagDoesNotMatch: "*" },
-        sha256: checksum,
-      });
-    } catch (error) {
-      publishError = error;
-    }
-    if (written === null && !exact(await input.recordings.head(outputKey))) {
-      throw new TransientFinalizationError("output publication not proven", {
-        cause: publishError,
-      });
-    }
-    if (written !== null && !exact(written)) {
-      throw new TransientFinalizationError(
-        "output publication metadata mismatch"
-      );
-    }
-    if (leaseLost) {
-      throw new TransientFinalizationError("finalization lease lost");
-    }
-    published = await f.complete(input.db, {
-      attempt,
-      output: {
-        byteSize: size,
-        checksum,
-        mediaType: type,
-        objectKey: outputKey,
-      },
-      sessionId: input.sessionId,
-    });
-    if (!published) {
-      const ready = await f.ready(input.db, input.sessionId);
-      if (
-        !(candidateOutput && isExactFinalizerOutput(candidateOutput, ready))
-      ) {
-        await input.recordings.delete(outputKey);
-      }
-    }
-  } catch (e) {
-    if (isTerminalFinalization(e)) {
-      await f.fail(input.db, {
-        attempt,
-        failureCode: String((e as { message?: unknown }).message ?? e),
-        sessionId: input.sessionId,
-      });
-    } else {
-      await f.release(input.db, { attempt, sessionId: input.sessionId });
-      if (outputKey) {
-        try {
-          const ready = await f.ready(input.db, input.sessionId);
-          if (
-            !(candidateOutput && isExactFinalizerOutput(candidateOutput, ready))
-          ) {
-            await input.recordings.delete(outputKey);
-          }
-        } catch {
-          /* cleanup is best effort */
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const mediaType = response.headers.get("content-type");
+        const checksum = response.headers.get("x-content-sha256");
+        if (
+          !response.ok ||
+          (mediaType !== "video/webm" && mediaType !== "video/mp4") ||
+          !checksum
+        ) {
+          throw new Error("invalid container output");
         }
-      }
-      throw e;
-    }
-  } finally {
-    clearInterval(timer);
-    if (container) {
-      try {
-        await container.fetch(
+        return {
+          bytes,
+          checksum: checksum as never,
+          mediaType: mediaType as "video/webm" | "video/mp4",
+        };
+      }).pipe(Effect.orDie),
+    putPart: (part: {
+      job: string;
+      segment: number;
+      sequence: number;
+      body: Uint8Array;
+      checksum: string;
+    }) =>
+      Effect.tryPromise(() =>
+        container.fetch(
           new URL(
-            `/jobs/${await deterministicJobName(input.sessionId, attempt)}`,
+            `/jobs/${part.job}/parts/${part.segment}/${part.sequence}`,
             "http://container"
           ),
-          {
-            method: "DELETE",
-          }
-        );
-      } catch {
-        /* best effort */
-      }
-    }
-  }
+          { body: part.body, method: "PUT" }
+        )
+      ).pipe(Effect.asVoid, Effect.orDie),
+  });
+  const layer = Layer.mergeAll(
+    makeFinalizerDb(input.db),
+    makeRecordings(input.recordings as unknown as R2Bucket),
+    client
+  );
+  return Effect.runPromise(
+    processEffect(input.sessionId as never).pipe(Effect.provide(layer))
+  );
 }
-
-const defaultDbFns = {
-  claim: claimRecordingFinalization,
-  complete: completeRecordingFinalization,
-  fail: failRecordingFinalization,
-  ready: getReadyRecordingSubmission,
-  release: releaseRecordingFinalizationForRetry,
-  renew: renewRecordingFinalizationLease,
-};
-type DbFns = typeof defaultDbFns;
 export interface FinalizationQueue {
   send: (message: { sessionId: string }) => Promise<unknown>;
 }

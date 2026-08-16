@@ -92,6 +92,20 @@ interface RecordingStoragePreflightDependencies {
   } | null;
 }
 
+const requestPersistentStorage = async (
+  storage: NonNullable<RecordingStoragePreflightDependencies["storage"]>
+) => {
+  try {
+    if (await storage.persisted()) {
+      return;
+    }
+    await storage.persist();
+  } catch {
+    // persist() is best-effort. Chrome, Safari, and Firefox commonly deny it
+    // unless the origin is installed or already highly engaged.
+  }
+};
+
 export const runRecordingPreflight = async (
   dependencies: RecordingStoragePreflightDependencies,
   policy: RecordingStoragePolicy | null
@@ -101,10 +115,7 @@ export const runRecordingPreflight = async (
     return { state: "blocked" };
   }
   try {
-    const persistent = await dependencies.storage.persisted();
-    if (!(persistent || (await dependencies.storage.persist()))) {
-      return { state: "blocked" };
-    }
+    await requestPersistentStorage(dependencies.storage);
     const { quota, usage } = await dependencies.storage.estimate();
     if (
       !(isFiniteNonNegative(quota) && isFiniteNonNegative(usage)) ||

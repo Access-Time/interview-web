@@ -62,15 +62,58 @@ it("rejects finite positive bitrates whose derived bytes overflow", () => {
   expect(getRecordingStoragePolicy(bitrate, bitrate)).toBeNull();
 });
 
-it("blocks preflight when persistence is denied", async () => {
+it("still admits when persistence is denied if quota and probe succeed", async () => {
+  await expect(
+    runRecordingPreflight(
+      dependencies({ persist: false, persisted: false }),
+      validPolicy
+    )
+  ).resolves.toEqual({ policy: validPolicy, state: "ready" });
+});
+
+it("still requests persistent storage before measuring quota", async () => {
+  const calls: string[] = [];
+  const result = await runRecordingPreflight(
+    {
+      probe: () => {
+        calls.push("probe");
+        return Promise.resolve();
+      },
+      storage: {
+        estimate: () => {
+          calls.push("estimate");
+          return Promise.resolve({ quota: 1_000_000_000, usage: 10 });
+        },
+        persist: () => {
+          calls.push("persist");
+          return Promise.resolve(false);
+        },
+        persisted: () => {
+          calls.push("persisted");
+          return Promise.resolve(false);
+        },
+      },
+    },
+    validPolicy
+  );
+  expect(result).toEqual({ policy: validPolicy, state: "ready" });
+  expect(calls.slice(0, 3)).toEqual(["persisted", "persist", "estimate"]);
+});
+
+it("still admits when persist throws if quota and probe succeed", async () => {
   await expect(
     runRecordingPreflight(
       {
-        ...dependencies({ persist: false, persisted: false }),
+        probe: () => Promise.resolve(),
+        storage: {
+          estimate: () => Promise.resolve({ quota: 1_000_000_000, usage: 10 }),
+          persist: () => Promise.reject(new Error("persist unavailable")),
+          persisted: () => Promise.resolve(false),
+        },
       },
       validPolicy
     )
-  ).resolves.toEqual({ state: "blocked" });
+  ).resolves.toEqual({ policy: validPolicy, state: "ready" });
 });
 
 it("blocks preflight when storage is absent", async () => {

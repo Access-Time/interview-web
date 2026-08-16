@@ -203,6 +203,8 @@ const MIME_TYPES = [
   "video/mp4",
   "video/webm",
 ];
+const FALLBACK_AUDIO_BITS_PER_SECOND = 128_000;
+const FALLBACK_VIDEO_BITS_PER_SECOND = 1_000_000;
 const PREFLIGHT_PROBE_KEY = "__recording_preflight_probe__";
 
 const ignorePromise = (promise: Promise<unknown>) => {
@@ -979,8 +981,8 @@ export function useLiveRecording(
     setRecordingPreflightState("checking");
     const nextRecorder = createRecorder(media);
     const policy = getRecordingStoragePolicy(
-      nextRecorder.audioBitsPerSecond,
-      nextRecorder.videoBitsPerSecond
+      nextRecorder.audioBitsPerSecond || FALLBACK_AUDIO_BITS_PER_SECOND,
+      nextRecorder.videoBitsPerSecond || FALLBACK_VIDEO_BITS_PER_SECOND
     );
     const result = await runRecordingPreflight(
       {

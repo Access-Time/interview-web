@@ -100,6 +100,24 @@ function profile(type) {
       ];
 }
 
+async function assemblePartFiles(dir, filenames, destName) {
+  const dest = path.join(dir, destName);
+  await fsp.writeFile(dest, Buffer.alloc(0), { flag: "wx" });
+  try {
+    for (const name of filenames) {
+      // biome-ignore lint/performance/noAwaitInLoops: parts must be appended in manifest order.
+      await pipeline(
+        fs.createReadStream(path.join(dir, name)),
+        fs.createWriteStream(dest, { flags: "a" })
+      );
+    }
+  } catch (error) {
+    await fsp.rm(dest, { force: true });
+    throw error;
+  }
+  return destName;
+}
+
 async function streamPart(req, temp, maxBytes, expected) {
   const out = fs.createWriteStream(temp, { flags: "wx" });
   const hash = crypto.createHash("sha256");
@@ -234,25 +252,27 @@ export function createFinalizerServer({
         normalized = [],
         format = ext(data.outputMediaType);
       for (let i = 0; i < data.segments.length; i += 1) {
-        const list = `run-${runId}-segment-${i}-parts.txt`,
-          output = `run-${runId}-segment-${i}.${format}`;
-        // biome-ignore lint/performance/noAwaitInLoops: segments must normalize serially because media state is reused between steps.
-        await fsp.writeFile(
-          path.join(dir, list),
-          `${data.segments[i].partIndexes
-            .map((part) => `file '${state.parts.get(`${i}:${part}`).filename}'`)
-            .join("\n")}\n`
+        const output = `run-${runId}-segment-${i}.${format}`;
+        const partFiles = data.segments[i].partIndexes.map(
+          (part) => state.parts.get(`${i}:${part}`).filename
         );
+        // Timeslice blobs are one WebM bitstream: only part 0 has an EBML
+        // header. Concat-demuxing them keeps ~one timeslice of media.
+        const input =
+          partFiles.length === 1
+            ? partFiles[0]
+            : // biome-ignore lint/performance/noAwaitInLoops: segments must normalize serially because media state is reused between steps.
+              await assemblePartFiles(
+                dir,
+                partFiles,
+                `run-${runId}-segment-${i}-assembled.bin`
+              );
         await invoke(
           "ffmpeg",
           [
             "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
             "-i",
-            list,
+            input,
             ...profile(data.outputMediaType),
             "-f",
             format,

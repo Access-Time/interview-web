@@ -80,7 +80,10 @@ export const makeContainerClient = (
         `/jobs/${job}`,
         { method: "DELETE" },
         "delete job"
-      ).pipe(Effect.asVoid, Effect.orDie),
+      ).pipe(
+        Effect.asVoid,
+        Effect.catchAll(() => Effect.void)
+      ),
     finalize: (input) =>
       request(
         namespace,

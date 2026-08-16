@@ -10,6 +10,7 @@ import path from "node:path";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Effect } from "effect";
 import { afterEach, expect, it } from "vitest";
+import { FfmpegFailed } from "../src/domain/errors.ts";
 import { makeFfmpegTest } from "../src/server/ffmpeg.ts";
 import { finalizerHttpApp } from "../src/server/http.ts";
 import { makeJobStoreTest } from "../src/server/job-store.ts";
@@ -31,7 +32,7 @@ interface Harness {
 const harnesses: Harness[] = [];
 const sha = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 
-async function harness(): Promise<Harness> {
+async function harness(failFfmpeg = false): Promise<Harness> {
   const root = await mkdtemp(path.join(tmpdir(), "finalizer-test-"));
   const ffmpeg = {
     concat: (input: { listPath: string; outputPath: string; cwd: string }) =>
@@ -40,9 +41,11 @@ async function harness(): Promise<Harness> {
       }),
     probe: () => Effect.succeed(undefined),
     remux: (input: { inputPath: string; outputPath: string; cwd: string }) =>
-      Effect.tryPromise(async () => {
-        await writeFile(input.outputPath, await readFile(input.inputPath));
-      }),
+      failFfmpeg
+        ? Effect.fail(new FfmpegFailed({ message: "ffmpeg failed" }))
+        : Effect.tryPromise(async () => {
+            await writeFile(input.outputPath, await readFile(input.inputPath));
+          }),
   } as unknown as Parameters<typeof makeFfmpegTest>[0];
   const app = finalizerHttpApp.pipe(
     Effect.provide(makeJobStoreTest(root)),
@@ -120,6 +123,54 @@ it("preserves health, method, checksum, and idempotent part protocol", async () 
       })
     ).status
   ).toBe(400);
+  expect(
+    (
+      await h.request("PUT", "/jobs/job/parts/0/0", Buffer.from("other"), {
+        "x-content-sha256": sha(Buffer.from("other")),
+      })
+    ).status
+  ).toBe(409);
+});
+
+it("rejects missing parts and byte-concatenates timeslices before remux", async () => {
+  const h = await harness();
+  const missing = await h.request(
+    "POST",
+    "/jobs/job/finalize",
+    JSON.stringify({
+      outputMediaType: "video/webm",
+      segments: [{ partIndexes: [0], segmentIndex: 0 }],
+    }),
+    { "content-type": "application/json" }
+  );
+  expect(missing.status).toBe(409);
+  for (const [index, value] of ["a", "b"].entries()) {
+    const bytes = Buffer.from(value);
+    // biome-ignore lint/performance/noAwaitInLoops: ordered uploads model timeslice arrival.
+    const response = await h.request(
+      "PUT",
+      `/jobs/job/parts/0/${index}`,
+      bytes,
+      { "x-content-sha256": sha(bytes) }
+    );
+    expect(response.status).toBe(201);
+  }
+  expect(
+    (
+      await h.request(
+        "POST",
+        "/jobs/job/finalize",
+        JSON.stringify({
+          outputMediaType: "video/webm",
+          segments: [{ partIndexes: [0, 1], segmentIndex: 0 }],
+        }),
+        { "content-type": "application/json" }
+      )
+    ).status
+  ).toBe(200);
+  expect((await h.request("GET", "/jobs/job/output")).body).toEqual(
+    Buffer.from("ab")
+  );
 });
 
 it("preserves finalize, output, cleanup, and plan validation statuses", async () => {
@@ -177,4 +228,23 @@ it("publishes finalized output with protocol metadata", async () => {
   expect(output.headers["content-type"]).toContain("video/webm");
   expect(output.headers["content-length"]).toBe(String(part.length));
   expect(output.headers["x-content-sha256"]).toBe(sha(part));
+});
+
+it("keeps failed finalization output unavailable with 409", async () => {
+  const h = await harness(true);
+  const part = Buffer.from("media");
+  await h.request("PUT", "/jobs/job/parts/0/0", part, {
+    "x-content-sha256": sha(part),
+  });
+  const result = await h.request(
+    "POST",
+    "/jobs/job/finalize",
+    JSON.stringify({
+      outputMediaType: "video/webm",
+      segments: [{ partIndexes: [0], segmentIndex: 0 }],
+    }),
+    { "content-type": "application/json" }
+  );
+  expect(result.status).toBe(422);
+  expect((await h.request("GET", "/jobs/job/output")).status).toBe(409);
 });

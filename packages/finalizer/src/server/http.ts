@@ -26,6 +26,8 @@ const errorStatus = (error: unknown) => {
       case "JobNotOpen":
       case "PartAlreadyDiffers":
         return 409;
+      case "InputTooLarge":
+        return 413;
       case "FfmpegFailed":
       case "NoMediaStream":
         return 422;
@@ -73,6 +75,18 @@ const route = Effect.gen(function* () {
     const checksum = request.headers["x-content-sha256"];
     if (!(checksum && checksumPattern.test(checksum))) {
       return json(400, { error: "invalid checksum" });
+    }
+    const declaredLength =
+      request.headers["content-length"] === undefined
+        ? undefined
+        : Number(request.headers["content-length"]);
+    if (
+      declaredLength !== undefined &&
+      (!Number.isSafeInteger(declaredLength) ||
+        declaredLength < 0 ||
+        declaredLength > maxPartBytes)
+    ) {
+      return json(413, { error: "part too large" });
     }
     const bytes = yield* body(request, maxPartBytes);
     if (
@@ -135,7 +149,8 @@ const route = Effect.gen(function* () {
         segment.segmentIndex !== index ||
         !Array.isArray(segment.partIndexes) ||
         segment.partIndexes.length === 0 ||
-        segment.partIndexes.length > 10_000
+        segment.partIndexes.length > 10_000 ||
+        segment.partIndexes.some((part, partIndex) => part !== partIndex)
       ) {
         return json(400, { error: "invalid or duplicate segment parts" });
       }

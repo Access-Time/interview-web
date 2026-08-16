@@ -100,6 +100,21 @@ const runAttempt = (
         mediaType: output.mediaType,
         size: output.size,
       };
+      yield* Effect.addFinalizer(() =>
+        Effect.gen(function* () {
+          const ready = yield* db.ready(sessionId);
+          const exactReady =
+            Option.isSome(ready) &&
+            ready.value.objectKey === outputKey &&
+            ready.value.mediaType === expected.mediaType &&
+            ready.value.byteSize === expected.size &&
+            ready.value.checksum.toLowerCase() ===
+              expected.checksum.toLowerCase();
+          if (!exactReady) {
+            yield* recordings.delete(outputKey);
+          }
+        }).pipe(Effect.ignore)
+      );
       const published = yield* Effect.gen(function* () {
         const written = yield* recordings.put(outputKey, output.body, {
           httpMetadata: { contentType: output.mediaType },
@@ -150,7 +165,6 @@ export const processFinalization = Effect.fn("processFinalization")(function* (
   sessionId: SessionId
 ) {
   const db = yield* FinalizerDb;
-  const recordings = yield* Recordings;
   const claimed = yield* db.claim(sessionId);
   if (Option.isNone(claimed)) {
     return;
@@ -158,17 +172,8 @@ export const processFinalization = Effect.fn("processFinalization")(function* (
   const job = claimed.value;
   const manifest = yield* decodeManifest(job.manifest);
   yield* decodeFinalizePlan(manifest, job.finalizePlan);
-  const mediaType = outputMediaType(manifest as never);
-  const outputKey = `recordings/${encodeURIComponent(sessionId)}/finalizations/attempt-${job.attempt}/output.${mediaType === "video/mp4" ? "mp4" : "webm"}`;
-  const cleanup = Effect.gen(function* () {
-    const ready = yield* db.ready(sessionId);
-    if (!(Option.isSome(ready) && ready.value.objectKey === outputKey)) {
-      yield* recordings.delete(outputKey);
-    }
-  }).pipe(Effect.ignore);
   return yield* runAttempt(sessionId, job.attempt, manifest as never).pipe(
     Effect.scoped,
-    Effect.tapError(() => cleanup),
     Effect.catchIf(isTerminalFinalization, (error) =>
       db
         .fail({ attempt: job.attempt, failureCode: error._tag, sessionId })

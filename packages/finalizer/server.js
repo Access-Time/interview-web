@@ -66941,6 +66941,7 @@ import { createReadStream as createReadStream2, createWriteStream as createWrite
 import os from "node:os";
 import path from "node:path";
 import { pipeline as pipeline4 } from "node:stream/promises";
+var maxJobBytes = 2 * 1024 * 1024 * 1024;
 var makeStore = (root) => {
   const dir = (job) => path.join(root, job);
   const state = (job) => path.join(dir(job), "state.json");
@@ -66957,7 +66958,7 @@ var makeStore = (root) => {
     }
   };
   const putPart = (input) => Effect_exports.tryPromise({
-    catch: (error) => error instanceof PartAlreadyDiffers || error instanceof JobNotOpen ? error : new Error(String(error)),
+    catch: (error) => error instanceof PartAlreadyDiffers || error instanceof JobNotOpen || error instanceof InputTooLarge ? error : new Error(String(error)),
     try: async () => {
       const current = await ensureState(input.job);
       if (current.status !== "open") {
@@ -66975,6 +66976,13 @@ var makeStore = (root) => {
       } catch (error) {
         if (error.code !== "ENOENT") {
           throw error;
+        }
+        const names = await fs.readdir(dir(input.job));
+        const partNames = names.filter((name) => name.startsWith("part-") && name.endsWith(".bin"));
+        const sizes = await Promise.all(partNames.map((name) => fs.stat(path.join(dir(input.job), name))));
+        const total = sizes.reduce((sum3, entry) => sum3 + entry.size, 0);
+        if (total + input.bytes.byteLength > maxJobBytes) {
+          throw new InputTooLarge({ message: "job too large" });
         }
         await fs.writeFile(file4, input.bytes, { flag: "wx" });
       }
@@ -67153,6 +67161,8 @@ var errorStatus = (error) => {
       case "JobNotOpen":
       case "PartAlreadyDiffers":
         return 409;
+      case "InputTooLarge":
+        return 413;
       case "FfmpegFailed":
       case "NoMediaStream":
         return 422;
@@ -67192,6 +67202,10 @@ var route = Effect_exports.gen(function* () {
     const checksum = request4.headers["x-content-sha256"];
     if (!(checksum && checksumPattern.test(checksum))) {
       return json5(400, { error: "invalid checksum" });
+    }
+    const declaredLength = request4.headers["content-length"] === void 0 ? void 0 : Number(request4.headers["content-length"]);
+    if (declaredLength !== void 0 && (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > maxPartBytes)) {
+      return json5(413, { error: "part too large" });
     }
     const bytes = yield* body(request4, maxPartBytes);
     if (request4.headers["content-length"] !== void 0 && Number(request4.headers["content-length"]) !== bytes.byteLength) {
@@ -67236,7 +67250,7 @@ var route = Effect_exports.gen(function* () {
       return json5(400, { error: "invalid finalize request" });
     }
     for (const [index, segment] of finalizeData.segments.entries()) {
-      if (segment.segmentIndex !== index || !Array.isArray(segment.partIndexes) || segment.partIndexes.length === 0 || segment.partIndexes.length > 1e4) {
+      if (segment.segmentIndex !== index || !Array.isArray(segment.partIndexes) || segment.partIndexes.length === 0 || segment.partIndexes.length > 1e4 || segment.partIndexes.some((part, partIndex) => part !== partIndex)) {
         return json5(400, { error: "invalid or duplicate segment parts" });
       }
       const seen = /* @__PURE__ */ new Set();

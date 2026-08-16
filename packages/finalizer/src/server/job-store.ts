@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Effect, Layer, Option } from "effect";
-import { JobNotOpen, PartAlreadyDiffers } from "../domain/errors.ts";
+import {
+  InputTooLarge,
+  JobNotOpen,
+  PartAlreadyDiffers,
+} from "../domain/errors.ts";
+
+const maxJobBytes = 2 * 1024 * 1024 * 1024;
 
 export interface StoredOutput {
   readonly checksum: string;
@@ -59,7 +65,9 @@ const makeStore = (root: string): Store => {
   const putPart = (input: PartInput) =>
     Effect.tryPromise({
       catch: (error) =>
-        error instanceof PartAlreadyDiffers || error instanceof JobNotOpen
+        error instanceof PartAlreadyDiffers ||
+        error instanceof JobNotOpen ||
+        error instanceof InputTooLarge
           ? error
           : new Error(String(error)),
       try: async () => {
@@ -83,6 +91,18 @@ const makeStore = (root: string): Store => {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
             throw error;
+          }
+          const names = await fs.readdir(dir(input.job));
+          const partNames = names.filter(
+            (name) => name.startsWith("part-") && name.endsWith(".bin")
+          );
+          const sizes = await Promise.all(
+            partNames.map((name) => fs.stat(path.join(dir(input.job), name)))
+          );
+          const total = sizes.reduce((sum, entry) => sum + entry.size, 0);
+          if (total + input.bytes.byteLength > maxJobBytes) {
+            // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
+            throw new InputTooLarge({ message: "job too large" });
           }
           await fs.writeFile(file, input.bytes, { flag: "wx" });
         }

@@ -4,10 +4,18 @@ import {
   type Database,
   listRecordingsForFinalization,
 } from "@interview-web/db";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Schema } from "effect";
+import { SessionId } from "./domain/brands.ts";
 import { ContainerClient } from "./worker/container.ts";
 import { makeFinalizerDb } from "./worker/db.ts";
+import {
+  dispatchFinalization,
+  handleQueueMessage as handleQueueMessageEffect,
+  reconciliationBatch as reconciliationBatchEffect,
+  WorkerLive,
+} from "./worker/dispatch.ts";
 import { processFinalization as processEffect } from "./worker/process.ts";
+import { FinalizationQueue as FinalizationQueueEffect } from "./worker/queue.ts";
 import { makeRecordings } from "./worker/recordings.ts";
 
 export type {
@@ -227,7 +235,9 @@ export async function reconciliationBatch(db: FinalizerDb) {
 }
 export default {
   fetch(request: Request, env: FinalizerEnv) {
-    return dispatchFinalizationRequest(request, env);
+    return Effect.runPromise(
+      dispatchFinalization(request).pipe(Effect.provide(WorkerLive(env)))
+    );
   },
   async queue(
     batch: {
@@ -237,13 +247,33 @@ export default {
   ) {
     for (const message of batch.messages) {
       // biome-ignore lint/performance/noAwaitInLoops: queue messages are processed one at a time to preserve finalization ordering.
-      await handleQueueMessage(message, env);
+      await Effect.runPromise(
+        handleQueueMessageEffect(
+          Schema.decodeUnknownSync(SessionId)(message.body.sessionId)
+        ).pipe(
+          Effect.provide(WorkerLive(env)),
+          Effect.tap(() => Effect.sync(() => message.ack()))
+        )
+      );
     }
   },
   async scheduled(_event: ScheduledEvent, env: FinalizerEnv) {
-    for (const message of await reconciliationBatch(createDb(env.DB))) {
-      // biome-ignore lint/performance/noAwaitInLoops: queue sends are intentionally ordered and bounded.
-      await env.FINALIZATION_QUEUE.send(message);
-    }
+    await Effect.runPromise(
+      reconciliationBatchEffect().pipe(
+        Effect.flatMap((ids) =>
+          Effect.forEach(
+            ids,
+            (id) =>
+              Effect.flatMap(FinalizationQueueEffect, (queue) =>
+                queue.send(id)
+              ),
+            {
+              discard: true,
+            }
+          )
+        ),
+        Effect.provide(WorkerLive(env))
+      )
+    );
   },
 };

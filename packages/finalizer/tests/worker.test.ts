@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@cloudflare/containers", () => ({
@@ -18,8 +19,9 @@ vi.mock("@interview-web/db", () => ({
 
 import { getContainer } from "@cloudflare/containers";
 import { listRecordingsForFinalization } from "@interview-web/db";
+import { dispatchFinalization } from "../src/worker/dispatch.ts";
+import { makeFinalizationQueue } from "../src/worker/queue.ts";
 import worker, {
-  dispatchFinalizationRequest,
   type FinalizerEnv,
   getFinalizerContainer,
   isExactFinalizerOutput,
@@ -38,19 +40,14 @@ const dispatchRequest = (body = JSON.stringify({ sessionId: "session-1" })) =>
     method: "POST",
   });
 
-const dispatchEnv = (send: ReturnType<typeof vi.fn>) =>
-  ({ FINALIZATION_QUEUE: { send } }) as Pick<
-    FinalizerEnv,
-    "FINALIZATION_QUEUE"
-  >;
-
-describe("dispatchFinalizationRequest", () => {
+describe("dispatchFinalization", () => {
   it("queues one valid internal dispatch", async () => {
     const send = vi.fn().mockResolvedValue(undefined);
 
-    const response = await dispatchFinalizationRequest(
-      dispatchRequest(),
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(dispatchRequest()).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(202);
@@ -75,9 +72,10 @@ describe("dispatchFinalizationRequest", () => {
   ])("rejects an invalid dispatch with %i", async (request, status) => {
     const send = vi.fn();
 
-    const response = await dispatchFinalizationRequest(
-      request,
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(request).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(status);
@@ -87,9 +85,10 @@ describe("dispatchFinalizationRequest", () => {
   it("returns 503 when queueing fails", async () => {
     const send = vi.fn().mockRejectedValue(new Error("queue down"));
 
-    const response = await dispatchFinalizationRequest(
-      dispatchRequest(),
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(dispatchRequest()).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(503);

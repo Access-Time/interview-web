@@ -4,5 +4,8 @@
     "ultracite/biome/core",
     "ultracite/biome/react",
     "ultracite/biome/tanstack"
-  ]
+  ],
+  "files": {
+    "includes": ["!!packages/env/env.d.ts"]
+  }
 }

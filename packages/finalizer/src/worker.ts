@@ -13,6 +13,8 @@ import {
 import {
   deterministicJobName,
   isExactFinalizerOutput,
+  isExactPublishedObject,
+  normalizeSha256Checksum,
   outputMediaType,
   TerminalFinalizationError,
   validateFinalizePlan,
@@ -29,6 +31,8 @@ export type {
 export {
   deterministicJobName,
   isExactFinalizerOutput,
+  isExactPublishedObject,
+  normalizeSha256Checksum,
   outputMediaType,
   TerminalFinalizationError,
   validateFinalizePlan,
@@ -37,7 +41,7 @@ export {
 export type FinalizerDb = Database;
 export interface FinalizerObject {
   body: ReadableStream<Uint8Array> | null;
-  checksums?: { sha256?: ArrayBuffer };
+  checksums?: { sha256?: ArrayBuffer | string };
   httpMetadata?: { contentType?: string };
   size: number;
 }
@@ -47,7 +51,7 @@ export interface FinalizerBucket {
   head: (key: string) => Promise<Omit<FinalizerObject, "body"> | null>;
   put: (
     key: string,
-    value: ReadableStream<Uint8Array>,
+    value: ReadableStream<Uint8Array> | ArrayBuffer | Uint8Array,
     options: Record<string, unknown>
   ) => Promise<Omit<FinalizerObject, "body"> | null>;
 }
@@ -197,7 +201,8 @@ export async function processFinalization(input: {
           !object?.body ||
           object.size !== part.byteSize ||
           !object.checksums?.sha256 ||
-          hex(object.checksums.sha256) !== part.checksum.toLowerCase()
+          normalizeSha256Checksum(object.checksums.sha256) !==
+            part.checksum.toLowerCase()
         ) {
           throw new TerminalFinalizationError("missing or corrupt part");
         }
@@ -251,23 +256,34 @@ export async function processFinalization(input: {
       mediaType: type,
       objectKey: outputKey,
     };
+    const payload = new Uint8Array(await out.arrayBuffer());
+    if (payload.byteLength !== size) {
+      throw new TransientFinalizationError("output size mismatch");
+    }
+    if (hex(await crypto.subtle.digest("SHA-256", payload)) !== checksum) {
+      throw new TransientFinalizationError("output checksum mismatch");
+    }
     const exact = (meta: Omit<FinalizerObject, "body"> | null) =>
-      !!meta &&
-      meta.size === size &&
-      hex(meta.checksums?.sha256 ?? new ArrayBuffer(0)) === checksum &&
-      meta.httpMetadata?.contentType === type;
+      isExactPublishedObject(meta, {
+        checksum,
+        mediaType: type,
+        size,
+      });
     let written: Omit<FinalizerObject, "body"> | null = null;
+    let publishError: unknown;
     try {
-      written = await input.recordings.put(outputKey, out.body, {
+      written = await input.recordings.put(outputKey, payload, {
         httpMetadata: { contentType: type },
         onlyIf: { etagDoesNotMatch: "*" },
         sha256: checksum,
       });
-    } catch {
-      /* verify collision or partial publication below */
+    } catch (error) {
+      publishError = error;
     }
     if (written === null && !exact(await input.recordings.head(outputKey))) {
-      throw new TransientFinalizationError("output publication not proven");
+      throw new TransientFinalizationError("output publication not proven", {
+        cause: publishError,
+      });
     }
     if (written !== null && !exact(written)) {
       throw new TransientFinalizationError(

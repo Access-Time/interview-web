@@ -119,6 +119,49 @@ export function isExactFinalizerOutput(
   );
 }
 
+export type Sha256Checksum = string | ArrayBuffer | ArrayBufferView;
+
+export function normalizeSha256Checksum(
+  checksum: Sha256Checksum | undefined
+): string | undefined {
+  if (checksum === undefined) {
+    return undefined;
+  }
+  if (typeof checksum === "string") {
+    return checksum.toLowerCase();
+  }
+  const bytes =
+    checksum instanceof ArrayBuffer
+      ? new Uint8Array(checksum)
+      : new Uint8Array(
+          checksum.buffer,
+          checksum.byteOffset,
+          checksum.byteLength
+        );
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    ""
+  );
+}
+
+export function isExactPublishedObject(
+  meta:
+    | {
+        checksums?: { sha256?: Sha256Checksum };
+        httpMetadata?: { contentType?: string };
+        size: number;
+      }
+    | null
+    | undefined,
+  expected: { checksum: string; mediaType: string; size: number }
+) {
+  return (
+    !!meta &&
+    meta.size === expected.size &&
+    normalizeSha256Checksum(meta.checksums?.sha256) === expected.checksum &&
+    meta.httpMetadata?.contentType === expected.mediaType
+  );
+}
+
 export async function deterministicJobName(sessionId: string, attempt: number) {
   const digest = await crypto.subtle.digest(
     "SHA-256",

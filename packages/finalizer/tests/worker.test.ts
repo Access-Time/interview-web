@@ -23,7 +23,10 @@ import worker, {
   type FinalizerEnv,
   getFinalizerContainer,
   isExactFinalizerOutput,
+  isExactPublishedObject,
+  normalizeSha256Checksum,
   outputMediaType,
+  processFinalization,
   reconciliationBatch,
   validateFinalizePlan,
   validateManifest,
@@ -238,4 +241,205 @@ it("media type defaults safely and exact output matching is strict", () => {
   expect(isExactFinalizerOutput(output, { ...output, byteSize: 2 })).toBe(
     false
   );
+});
+
+const digestHex = async (bytes: Uint8Array) =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+
+it("published object matching accepts hex-string and binary R2 checksums", async () => {
+  const bytes = new Uint8Array([9, 8, 7, 6]);
+  const checksum = await digestHex(bytes);
+  const expected = {
+    checksum,
+    mediaType: "video/webm",
+    size: bytes.byteLength,
+  };
+  expect(
+    isExactPublishedObject(
+      {
+        checksums: { sha256: checksum },
+        httpMetadata: { contentType: "video/webm" },
+        size: bytes.byteLength,
+      },
+      expected
+    )
+  ).toBe(true);
+  expect(
+    isExactPublishedObject(
+      {
+        checksums: { sha256: await crypto.subtle.digest("SHA-256", bytes) },
+        httpMetadata: { contentType: "video/webm" },
+        size: bytes.byteLength,
+      },
+      expected
+    )
+  ).toBe(true);
+  expect(normalizeSha256Checksum(checksum.toUpperCase())).toBe(checksum);
+  expect(
+    isExactPublishedObject(
+      {
+        checksums: { sha256: checksum },
+        httpMetadata: { contentType: "video/webm" },
+        size: bytes.byteLength + 1,
+      },
+      expected
+    )
+  ).toBe(false);
+});
+
+describe("processFinalization publication", () => {
+  const partBytes = new Uint8Array([1, 2, 3, 4]);
+  const outputBytes = new Uint8Array([9, 8, 7, 6, 5]);
+
+  const digestPart = () => digestHex(partBytes);
+  const digestOutput = () => digestHex(outputBytes);
+
+  const setup = async (recordings: {
+    delete?: (key: string) => Promise<void>;
+    head?: (key: string) => Promise<{
+      checksums?: { sha256?: ArrayBuffer | string };
+      httpMetadata?: { contentType?: string };
+      size: number;
+    } | null>;
+    put: (
+      key: string,
+      value: ReadableStream<Uint8Array> | ArrayBuffer | Uint8Array,
+      options: Record<string, unknown>
+    ) => Promise<{
+      checksums?: { sha256?: ArrayBuffer | string };
+      httpMetadata?: { contentType?: string };
+      size: number;
+    } | null>;
+  }) => {
+    const partChecksum = await digestPart();
+    const outputChecksum = await digestOutput();
+    const complete = vi.fn().mockResolvedValue(true);
+    const release = vi.fn().mockResolvedValue(true);
+    await processFinalization({
+      containerForAttempt: () => ({
+        fetch: (input, init) => {
+          const path = (input instanceof URL ? input : new URL(String(input)))
+            .pathname;
+          const method = init?.method ?? "GET";
+          if (method === "PUT" && path.includes("/parts/")) {
+            return new Response(null, { status: 201 });
+          }
+          if (method === "POST" && path.endsWith("/finalize")) {
+            return Response.json({ finalized: true });
+          }
+          if (method === "GET" && path.endsWith("/output")) {
+            return new Response(outputBytes, {
+              headers: {
+                "content-length": String(outputBytes.byteLength),
+                "content-type": "video/webm",
+                "x-content-sha256": outputChecksum,
+              },
+            });
+          }
+          if (method === "DELETE") {
+            return new Response(null, { status: 204 });
+          }
+          return new Response(null, { status: 404 });
+        },
+      }),
+      db: {} as never,
+      dbFns: {
+        claim: async () => ({
+          attempt: 1,
+          finalizePlan: JSON.stringify([{ partCount: 1, segmentId: "seg" }]),
+          manifest: {
+            segments: [
+              {
+                id: "seg",
+                index: 0,
+                parts: [
+                  {
+                    byteSize: partBytes.byteLength,
+                    checksum: partChecksum,
+                    mediaType: "video/webm",
+                    objectKey: "part-0",
+                    sequence: 0,
+                  },
+                ],
+              },
+            ],
+            sessionId: "s1",
+          },
+        }),
+        complete,
+        fail: vi.fn(),
+        ready: vi.fn().mockResolvedValue(null),
+        release,
+        renew: vi.fn().mockResolvedValue(true),
+      },
+      heartbeatMs: 60_000,
+      recordings: {
+        delete: recordings.delete ?? (async () => undefined),
+        get: async () => ({
+          body: new Blob([partBytes]).stream(),
+          checksums: {
+            sha256: await crypto.subtle.digest("SHA-256", partBytes),
+          },
+          size: partBytes.byteLength,
+        }),
+        head: recordings.head ?? (async () => null),
+        put: recordings.put,
+      },
+      sessionId: "s1",
+    });
+    return { complete, outputChecksum, release };
+  };
+
+  it("buffers container output so R2 put does not need the live stream", async () => {
+    const puts: unknown[] = [];
+    const { complete, outputChecksum } = await setup({
+      put: async (_key, value) => {
+        puts.push(value);
+        if (value instanceof ReadableStream) {
+          throw new Error("ReadableStream cannot be piped to local R2");
+        }
+        return {
+          checksums: {
+            sha256: await crypto.subtle.digest("SHA-256", outputBytes),
+          },
+          httpMetadata: { contentType: "video/webm" },
+          size: outputBytes.byteLength,
+        };
+      },
+    });
+    expect(puts[0] instanceof Uint8Array).toBe(true);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(
+      {},
+      expect.objectContaining({
+        output: expect.objectContaining({ checksum: outputChecksum }),
+      })
+    );
+  });
+
+  it("proves publication from a hex-string head when put returns null", async () => {
+    const outputChecksum = await digestOutput();
+    const { complete } = await setup({
+      head: async () => ({
+        checksums: { sha256: outputChecksum },
+        httpMetadata: { contentType: "video/webm" },
+        size: outputBytes.byteLength,
+      }),
+      put: async () => null,
+    });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts put metadata that reports a hex-string checksum", async () => {
+    const outputChecksum = await digestOutput();
+    const { complete } = await setup({
+      put: async () => ({
+        checksums: { sha256: outputChecksum },
+        httpMetadata: { contentType: "video/webm" },
+        size: outputBytes.byteLength,
+      }),
+    });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
 });

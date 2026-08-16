@@ -10,6 +10,18 @@ import {
   isExactPublishedObject,
   normalizeSha256Checksum,
 } from "../src/domain/media.ts";
+import { decodeFinalizePlan, decodeManifest } from "../src/domain/validate.ts";
+
+const part = {
+  byteSize: 1,
+  checksum: "a".repeat(64),
+  objectKey: "p",
+  sequence: 0,
+};
+const manifest = {
+  segments: [{ id: "seg", index: 0, parts: [part] }],
+  sessionId: "s",
+};
 
 it.effect("SessionId rejects empty and overlong values", () =>
   Effect.gen(function* () {
@@ -55,3 +67,31 @@ it("terminal predicate distinguishes tagged errors", () => {
     )
   ).toBe(false);
 });
+
+it.effect("decodeManifest accepts a contiguous part and rejects a gap", () =>
+  Effect.gen(function* () {
+    const ok = yield* decodeManifest(manifest);
+    expect(ok.segments[0]?.parts.length).toBe(1);
+    const gap = yield* decodeManifest({
+      ...manifest,
+      segments: [{ id: "seg", index: 0, parts: [{ ...part, sequence: 1 }] }],
+    }).pipe(Effect.either);
+    expect(gap._tag).toBe("Left");
+    if (gap._tag === "Left") {
+      expect(gap.left._tag).toBe("InvalidPart");
+    }
+  })
+);
+
+it.effect("decodeFinalizePlan requires matching segmentId and partCount", () =>
+  Effect.gen(function* () {
+    const decoded = yield* decodeManifest(manifest);
+    const plan = yield* decodeFinalizePlan(
+      decoded,
+      JSON.stringify([{ partCount: 1, segmentId: "seg" }])
+    );
+    expect(plan).toEqual([{ partCount: 1, segmentId: "seg" }]);
+    const bad = yield* decodeFinalizePlan(decoded, "[]").pipe(Effect.either);
+    expect(bad._tag).toBe("Left");
+  })
+);

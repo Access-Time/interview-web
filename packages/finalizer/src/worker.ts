@@ -10,13 +10,13 @@ import {
   releaseRecordingFinalizationForRetry,
   renewRecordingFinalizationLease,
 } from "@interview-web/db";
+import { InvalidManifest, isTerminalFinalization } from "./domain/errors.ts";
 import {
   deterministicJobName,
   isExactFinalizerOutput,
   isExactPublishedObject,
   normalizeSha256Checksum,
   outputMediaType,
-  TerminalFinalizationError,
   validateFinalizePlan,
   validateManifest,
 } from "./pure";
@@ -89,7 +89,7 @@ export function check(response: Response, what: string) {
     return response;
   }
   if (isTerminalFinalizationStatus(response.status)) {
-    throw new TerminalFinalizationError(`${what}: ${response.status}`);
+    throw new InvalidManifest({ message: `${what}: ${response.status}` });
   }
   throw new TransientFinalizationError(`${what}: ${response.status}`);
 }
@@ -178,7 +178,7 @@ export async function processFinalization(input: {
           normalizeSha256Checksum(object.checksums.sha256) !==
             part.checksum.toLowerCase()
         ) {
-          throw new TerminalFinalizationError("missing or corrupt part");
+          throw new InvalidManifest({ message: "missing or corrupt part" });
         }
         const r = await fetch(
           `/jobs/${job}/parts/${segment.index}/${part.sequence}`,
@@ -221,7 +221,7 @@ export async function processFinalization(input: {
       !CHECKSUM.test(checksum) ||
       !out.body
     ) {
-      throw new TerminalFinalizationError("invalid output");
+      throw new InvalidManifest({ message: "invalid output" });
     }
     outputKey = `recordings/${encodeURIComponent(input.sessionId)}/finalizations/attempt-${attempt}/output.${type === "video/mp4" ? "mp4" : "webm"}`;
     candidateOutput = {
@@ -279,10 +279,10 @@ export async function processFinalization(input: {
       }
     }
   } catch (e) {
-    if (e instanceof TerminalFinalizationError) {
+    if (isTerminalFinalization(e)) {
       await f.fail(input.db, {
         attempt,
-        failureCode: e.message,
+        failureCode: String((e as { message?: unknown }).message ?? e),
         sessionId: input.sessionId,
       });
     } else {

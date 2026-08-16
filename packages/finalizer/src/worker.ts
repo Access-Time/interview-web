@@ -1,22 +1,17 @@
 import { Container, getContainer } from "@cloudflare/containers";
 import {
-  createDb,
   type Database,
   listRecordingsForFinalization,
 } from "@interview-web/db";
-import { Effect, Layer, Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { SessionId } from "./domain/brands.ts";
-import { ContainerClient } from "./worker/container.ts";
-import { makeFinalizerDb } from "./worker/db.ts";
 import {
   dispatchFinalization,
   handleQueueMessage as handleQueueMessageEffect,
   reconciliationBatch as reconciliationBatchEffect,
   WorkerLive,
 } from "./worker/dispatch.ts";
-import { processFinalization as processEffect } from "./worker/process.ts";
 import { FinalizationQueue as FinalizationQueueEffect } from "./worker/queue.ts";
-import { makeRecordings } from "./worker/recordings.ts";
 
 export type {
   FinalizerManifest,
@@ -73,91 +68,6 @@ export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
   return getContainer(env.FINALIZER);
 }
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered finalization protocol.
-export async function processFinalization(input: {
-  db: FinalizerDb;
-  recordings: FinalizerBucket;
-  containerForAttempt: (
-    attempt: number
-  ) => FinalizerContainer | Promise<FinalizerContainer>;
-  sessionId: string;
-}) {
-  const container = await input.containerForAttempt(0);
-  const client = Layer.succeed(ContainerClient, {
-    deleteJob: (job: string) =>
-      Effect.tryPromise(() =>
-        container.fetch(new URL(`/jobs/${job}`, "http://container"), {
-          method: "DELETE",
-        })
-      ).pipe(Effect.asVoid, Effect.orDie),
-    finalize: (value: {
-      job: string;
-      outputMediaType: "video/webm" | "video/mp4";
-      segments: ReadonlyArray<{ partIndexes: number[]; segmentIndex: number }>;
-    }) =>
-      Effect.tryPromise(() =>
-        container.fetch(
-          new URL(`/jobs/${value.job}/finalize`, "http://container"),
-          {
-            body: JSON.stringify({
-              outputMediaType: value.outputMediaType,
-              segments: value.segments,
-            }),
-            headers: { "content-type": "application/json" },
-            method: "POST",
-          }
-        )
-      ).pipe(Effect.asVoid, Effect.orDie),
-    getOutput: (job: string) =>
-      Effect.tryPromise(async () => {
-        const response = await container.fetch(
-          new URL(`/jobs/${job}/output`, "http://container")
-        );
-        const mediaType = response.headers.get("content-type");
-        const checksum = response.headers.get("x-content-sha256");
-        const size = Number(response.headers.get("content-length"));
-        if (
-          !(response.ok && response.body) ||
-          (mediaType !== "video/webm" && mediaType !== "video/mp4") ||
-          !checksum ||
-          !Number.isInteger(size) ||
-          size < 0
-        ) {
-          throw new Error("invalid container output");
-        }
-        return {
-          body: response.body,
-          checksum: checksum as never,
-          mediaType: mediaType as "video/webm" | "video/mp4",
-          size,
-        };
-      }).pipe(Effect.orDie),
-    putPart: (part: {
-      job: string;
-      segment: number;
-      sequence: number;
-      body: Uint8Array;
-      checksum: string;
-    }) =>
-      Effect.tryPromise(() =>
-        container.fetch(
-          new URL(
-            `/jobs/${part.job}/parts/${part.segment}/${part.sequence}`,
-            "http://container"
-          ),
-          { body: part.body, method: "PUT" }
-        )
-      ).pipe(Effect.asVoid, Effect.orDie),
-  });
-  const layer = Layer.mergeAll(
-    makeFinalizerDb(input.db),
-    makeRecordings(input.recordings as unknown as R2Bucket),
-    client
-  );
-  return Effect.runPromise(
-    processEffect(input.sessionId as never).pipe(Effect.provide(layer))
-  );
-}
 export interface FinalizationQueue {
   send: (message: { sessionId: string }) => Promise<unknown>;
 }
@@ -208,27 +118,6 @@ export async function dispatchFinalizationRequest(
   }
 
   return new Response(null, { status: 202 });
-}
-
-export async function handleQueueMessage(
-  message: { body: { sessionId: string }; ack?: () => void },
-  env: FinalizerEnv
-) {
-  try {
-    await processFinalization({
-      containerForAttempt: () => getFinalizerContainer(env),
-      db: createDb(env.DB),
-      recordings: env.RECORDINGS,
-      sessionId: message.body.sessionId,
-    });
-  } catch (error) {
-    console.error("Recording finalization failed", {
-      error,
-      sessionId: message.body.sessionId,
-    });
-    throw error;
-  }
-  message.ack?.();
 }
 
 export async function reconciliationBatch(db: FinalizerDb) {

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import {
   createServer,
   request as httpRequest,
@@ -34,9 +34,15 @@ const sha = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 async function harness(): Promise<Harness> {
   const root = await mkdtemp(path.join(tmpdir(), "finalizer-test-"));
   const ffmpeg = {
-    concat: () => Effect.succeed(undefined),
+    concat: (input: { listPath: string; outputPath: string; cwd: string }) =>
+      Effect.tryPromise(async () => {
+        await writeFile(input.outputPath, await readFile(input.listPath));
+      }),
     probe: () => Effect.succeed(undefined),
-    remux: () => Effect.succeed(undefined),
+    remux: (input: { inputPath: string; outputPath: string; cwd: string }) =>
+      Effect.tryPromise(async () => {
+        await writeFile(input.outputPath, await readFile(input.inputPath));
+      }),
   } as unknown as Parameters<typeof makeFfmpegTest>[0];
   const app = finalizerHttpApp.pipe(
     Effect.provide(makeJobStoreTest(root)),
@@ -114,4 +120,61 @@ it("preserves health, method, checksum, and idempotent part protocol", async () 
       })
     ).status
   ).toBe(400);
+});
+
+it("preserves finalize, output, cleanup, and plan validation statuses", async () => {
+  const h = await harness();
+  expect((await h.request("GET", "/jobs/job/output")).status).toBe(404);
+  expect(
+    (
+      await h.request(
+        "POST",
+        "/jobs/job/finalize",
+        JSON.stringify({ outputMediaType: "video/webm", segments: [] }),
+        { "content-type": "application/json" }
+      )
+    ).status
+  ).toBe(400);
+  expect(
+    (
+      await h.request(
+        "POST",
+        "/jobs/job/finalize",
+        JSON.stringify({
+          outputMediaType: "video/webm",
+          segments: [{ partIndexes: [0], segmentIndex: 1 }],
+        }),
+        { "content-type": "application/json" }
+      )
+    ).status
+  ).toBe(400);
+  expect((await h.request("DELETE", "/jobs/job")).status).toBe(204);
+  expect((await h.request("DELETE", "/jobs/job")).status).toBe(204);
+});
+
+it("publishes finalized output with protocol metadata", async () => {
+  const h = await harness();
+  const part = Buffer.from("media");
+  expect(
+    (
+      await h.request("PUT", "/jobs/job/parts/0/0", part, {
+        "x-content-sha256": sha(part),
+      })
+    ).status
+  ).toBe(201);
+  const finalized = await h.request(
+    "POST",
+    "/jobs/job/finalize",
+    JSON.stringify({
+      outputMediaType: "video/webm",
+      segments: [{ partIndexes: [0], segmentIndex: 0 }],
+    }),
+    { "content-type": "application/json" }
+  );
+  expect(finalized.status).toBe(200);
+  const output = await h.request("GET", "/jobs/job/output");
+  expect(output.status).toBe(200);
+  expect(output.headers["content-type"]).toContain("video/webm");
+  expect(output.headers["content-length"]).toBe(String(part.length));
+  expect(output.headers["x-content-sha256"]).toBe(sha(part));
 });

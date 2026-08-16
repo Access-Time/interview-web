@@ -25,16 +25,29 @@ const run = (program: string, args: string[], cwd: string) =>
       });
       let stdout = "";
       let stderr = "";
+      let killed = false;
+      const timer = setTimeout(() => {
+        killed = true;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 5000).unref();
+      }, 120_000);
       child.stdout.on("data", (chunk) => {
-        stdout += chunk;
+        stdout += String(chunk).slice(
+          0,
+          Math.max(0, 1024 * 1024 - stdout.length)
+        );
       });
       child.stderr.on("data", (chunk) => {
-        stderr += chunk;
+        stderr += String(chunk).slice(
+          0,
+          Math.max(0, 1024 * 1024 - stderr.length)
+        );
       });
       child.once("error", reject);
-      child.once("close", (code) =>
-        resolve({ code: code ?? 1, stderr, stdout })
-      );
+      child.once("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code: killed ? 124 : (code ?? 1), stderr, stdout });
+      });
     }
   );
 const command = (program: string, args: string[], cwd: string) =>

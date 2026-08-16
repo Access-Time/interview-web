@@ -23,14 +23,17 @@ export class ContainerClient extends Context.Tag("ContainerClient")<
       sequence: number;
       body: Uint8Array;
       checksum: string;
+      signal?: AbortSignal;
     }) => Effect.Effect<void, ContainerRejected | ContainerUnavailable>;
     readonly finalize: (input: {
       job: string;
       outputMediaType: "video/webm" | "video/mp4";
       segments: ReadonlyArray<{ partIndexes: number[]; segmentIndex: number }>;
+      signal?: AbortSignal;
     }) => Effect.Effect<void, ContainerRejected | ContainerUnavailable>;
     readonly getOutput: (
-      job: string
+      job: string,
+      signal?: AbortSignal
     ) => Effect.Effect<
       ContainerOutput,
       InvalidContainerOutput | ContainerUnavailable
@@ -44,16 +47,39 @@ const statusError = (status: number, what: string) =>
     ? new ContainerRejected({ message: `${what}: ${status}`, status })
     : new ContainerUnavailable({ message: `${what}: ${status}`, status });
 type ContainerNamespace = Parameters<typeof getContainer>[0];
+const request = (
+  namespace: ContainerNamespace,
+  urlPath: string,
+  init: RequestInit,
+  what: string
+) =>
+  Effect.tryPromise({
+    catch: (error) =>
+      error instanceof ContainerRejected ||
+      error instanceof ContainerUnavailable
+        ? error
+        : new ContainerUnavailable({ message: `${what} unavailable` }),
+    try: async () => {
+      const response = await getContainer(namespace).fetch(
+        new URL(urlPath, "http://container"),
+        init
+      );
+      if (!response.ok) {
+        throw statusError(response.status, what);
+      }
+    },
+  });
+
 export const makeContainerClient = (
   namespace: ContainerNamespace
 ): Layer.Layer<ContainerClient> =>
   Layer.succeed(ContainerClient, {
     deleteJob: (job) =>
-      Effect.tryPromise(() =>
-        getContainer(namespace).fetch(
-          new URL(`/jobs/${job}`, "http://container"),
-          { method: "DELETE" }
-        )
+      request(
+        namespace,
+        `/jobs/${job}`,
+        { method: "DELETE" },
+        "delete job"
       ).pipe(Effect.asVoid, Effect.orDie),
     finalize: (input) =>
       request(
@@ -66,10 +92,11 @@ export const makeContainerClient = (
           }),
           headers: { "content-type": "application/json" },
           method: "POST",
+          signal: input.signal,
         },
         "finalize"
       ),
-    getOutput: (job) =>
+    getOutput: (job, signal) =>
       Effect.tryPromise({
         catch: (error) =>
           error instanceof InvalidContainerOutput ||
@@ -78,7 +105,8 @@ export const makeContainerClient = (
             : new ContainerUnavailable({ message: "output unavailable" }),
         try: async () => {
           const response = await getContainer(namespace).fetch(
-            new URL(`/jobs/${job}/output`, "http://container")
+            new URL(`/jobs/${job}/output`, "http://container"),
+            { signal }
           );
           if (!response.ok) {
             throw statusError(response.status, "output");
@@ -116,29 +144,8 @@ export const makeContainerClient = (
             "x-content-sha256": input.checksum,
           },
           method: "PUT",
+          signal: input.signal,
         },
         "part upload"
       ),
-  });
-const request = (
-  namespace: ContainerNamespace,
-  path: string,
-  init: RequestInit,
-  what: string
-) =>
-  Effect.tryPromise({
-    catch: (error) =>
-      error instanceof ContainerRejected ||
-      error instanceof ContainerUnavailable
-        ? error
-        : new ContainerUnavailable({ message: `${what} unavailable` }),
-    try: async () => {
-      const response = await getContainer(namespace).fetch(
-        new URL(path, "http://container"),
-        init
-      );
-      if (!response.ok) {
-        throw statusError(response.status, what);
-      }
-    },
   });

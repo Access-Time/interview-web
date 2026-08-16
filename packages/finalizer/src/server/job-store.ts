@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { createReadStream, createWriteStream, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { Effect, Layer, Option } from "effect";
 import { JobNotOpen, PartAlreadyDiffers } from "../domain/errors.ts";
 
@@ -26,8 +27,10 @@ interface Store {
   }) => Effect.Effect<{ path: string }, Error | JobNotOpen>;
   deleteJob: (job: string) => Effect.Effect<void>;
   getOutput: (job: string) => Effect.Effect<Option.Option<StoredOutput>, Error>;
+  getStatus: (job: string) => Effect.Effect<string, Error>;
   listParts: (job: string) => Effect.Effect<readonly string[], Error>;
   putPart: (input: PartInput) => Effect.Effect<void, Error>;
+  setFailed: (job: string) => Effect.Effect<void, Error>;
   setOutput: (input: {
     job: string;
     output: StoredOutput;
@@ -40,6 +43,7 @@ const makeStore = (root: string): Store => {
   const readState = (job: string) =>
     fs.readFile(state(job), "utf8").then(JSON.parse) as Promise<{
       status: string;
+      output?: StoredOutput;
     }>;
   const ensureState = async (job: string) => {
     await fs.mkdir(dir(job), { recursive: true });
@@ -104,12 +108,14 @@ const makeStore = (root: string): Store => {
             dir(input.job),
             `assembled-${input.segment}.bin`
           );
-          await fs.writeFile(
-            output,
-            Buffer.concat(
-              await Promise.all(files.map((file) => fs.readFile(file)))
-            )
-          );
+          await fs.writeFile(output, Buffer.alloc(0));
+          for (const file of files) {
+            // biome-ignore lint/performance/noAwaitInLoops: parts must be appended in manifest order.
+            await pipeline(
+              createReadStream(file),
+              createWriteStream(output, { flags: "a" })
+            );
+          }
           return { path: output };
         },
       }),
@@ -124,6 +130,8 @@ const makeStore = (root: string): Store => {
           return Option.none();
         }
       }),
+    getStatus: (job) =>
+      Effect.tryPromise(async () => (await ensureState(job)).status),
     listParts: (job) =>
       Effect.tryPromise(async () => {
         const current = await ensureState(job);
@@ -135,6 +143,14 @@ const makeStore = (root: string): Store => {
         );
       }),
     putPart,
+    setFailed: (job) =>
+      Effect.tryPromise(async () => {
+        const current = await ensureState(job);
+        await fs.writeFile(
+          state(job),
+          JSON.stringify({ output: current.output ?? null, status: "failed" })
+        );
+      }),
     setOutput: (input) =>
       Effect.tryPromise({
         catch: (error) =>

@@ -10,11 +10,16 @@ const jobPattern =
   /^\/jobs\/([A-Za-z0-9_-]{1,128})(?:\/parts\/(0|[1-9][0-9]*)\/(0|[1-9][0-9]*)|\/(finalize|output))?$/;
 const checksumPattern = /^[a-f\d]{64}$/i;
 const mediaTypes = new Set(["video/webm", "video/mp4"]);
+const maxPartBytes = 512 * 1024 * 1024;
+const maxJsonBytes = 2 * 1024 * 1024;
 const sealing = new Set<string>();
 
 const json = (status: number, value: unknown) =>
   HttpServerResponse.unsafeJson(value, { status });
 const errorStatus = (error: unknown) => {
+  if (error instanceof Error && error.message === "request too large") {
+    return 413;
+  }
   if (typeof error === "object" && error !== null && "_tag" in error) {
     switch (error._tag) {
       case "PartsPlanMismatch":
@@ -35,8 +40,12 @@ const message = (error: unknown) =>
     ? String(error.message)
     : "internal error";
 
-const body = (request: HttpServerRequest.HttpServerRequest) =>
-  Effect.map(request.arrayBuffer, (value) => new Uint8Array(value));
+const body = (request: HttpServerRequest.HttpServerRequest, limit: number) =>
+  Effect.flatMap(request.arrayBuffer, (value) =>
+    value.byteLength > limit
+      ? Effect.fail(new Error("request too large"))
+      : Effect.succeed(new Uint8Array(value))
+  );
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this is the protocol dispatcher.
 const route = Effect.gen(function* () {
@@ -65,7 +74,7 @@ const route = Effect.gen(function* () {
     if (!(checksum && checksumPattern.test(checksum))) {
       return json(400, { error: "invalid checksum" });
     }
-    const bytes = yield* body(request);
+    const bytes = yield* body(request, maxPartBytes);
     if (
       request.headers["content-length"] !== undefined &&
       Number(request.headers["content-length"]) !== bytes.byteLength
@@ -94,7 +103,13 @@ const route = Effect.gen(function* () {
     if (sealing.has(job)) {
       return json(409, { error: "job is not open" });
     }
-    const data = yield* request.json;
+    const jsonBytes = yield* body(request, maxJsonBytes);
+    let data: unknown;
+    try {
+      data = JSON.parse(new TextDecoder().decode(jsonBytes));
+    } catch {
+      return json(400, { error: "invalid JSON" });
+    }
     if (
       !data ||
       typeof data !== "object" ||
@@ -109,9 +124,40 @@ const route = Effect.gen(function* () {
       outputMediaType: "video/webm" | "video/mp4";
       segments: ReadonlyArray<{ partIndexes: number[]; segmentIndex: number }>;
     };
+    if (
+      finalizeData.segments.length === 0 ||
+      finalizeData.segments.length > 20
+    ) {
+      return json(400, { error: "invalid finalize request" });
+    }
+    for (const [index, segment] of finalizeData.segments.entries()) {
+      if (
+        segment.segmentIndex !== index ||
+        !Array.isArray(segment.partIndexes) ||
+        segment.partIndexes.length === 0 ||
+        segment.partIndexes.length > 10_000
+      ) {
+        return json(400, { error: "invalid or duplicate segment parts" });
+      }
+      const seen = new Set<number>();
+      for (const part of segment.partIndexes) {
+        if (!Number.isSafeInteger(part) || part < 0 || seen.has(part)) {
+          return json(400, { error: "invalid or duplicate segment parts" });
+        }
+        seen.add(part);
+      }
+    }
     sealing.add(job);
     return yield* finalizeJob({ ...finalizeData, job }).pipe(
       Effect.as(json(200, { finalized: true })),
+      Effect.tapError((error) =>
+        typeof error === "object" &&
+        error !== null &&
+        "_tag" in error &&
+        (error._tag === "FfmpegFailed" || error._tag === "NoMediaStream")
+          ? store.setFailed(job)
+          : Effect.void
+      ),
       Effect.ensuring(Effect.sync(() => sealing.delete(job)))
     );
   }
@@ -121,7 +167,9 @@ const route = Effect.gen(function* () {
     }
     const output = yield* store.getOutput(job);
     if (Option.isNone(output)) {
-      return json(404, { error: "output unavailable" });
+      return (yield* store.getStatus(job)) === "failed"
+        ? json(409, { error: "output unavailable" })
+        : json(404, { error: "output unavailable" });
     }
     yield* Effect.tryPromise(() => fs.access(output.value.path));
     return yield* HttpServerResponse.file(output.value.path, {

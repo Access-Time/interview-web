@@ -2,9 +2,11 @@ import { expect, it } from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import { SessionId } from "../src/domain/brands.ts";
 import {
+  FinalizerDbUnavailable,
   InvalidManifest,
   isTerminalFinalization,
   LeaseLost,
+  RecordingsUnavailable,
 } from "../src/domain/errors.ts";
 import {
   isExactPublishedObject,
@@ -64,6 +66,16 @@ it("terminal predicate distinguishes tagged errors", () => {
   expect(
     isTerminalFinalization(
       new LeaseLost({ message: "finalization lease lost" })
+    )
+  ).toBe(false);
+  expect(
+    isTerminalFinalization(
+      new RecordingsUnavailable({ message: "r2 unavailable" })
+    )
+  ).toBe(false);
+  expect(
+    isTerminalFinalization(
+      new FinalizerDbUnavailable({ message: "d1 unavailable" })
     )
   ).toBe(false);
 });

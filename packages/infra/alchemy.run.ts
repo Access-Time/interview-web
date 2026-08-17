@@ -78,6 +78,7 @@ export const web = await TanStackStart("web", {
     RECORDINGS: recordings,
   },
   cwd: "../../apps/web",
+  name: "interview",
 });
 
 console.log(`Web    -> ${web.url}`);

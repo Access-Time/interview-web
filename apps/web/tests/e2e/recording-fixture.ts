@@ -47,22 +47,52 @@ export interface CandidateBindingFixture {
       input: RecordingFinalizeInput
     ) => Promise<RecordingFinalizeResult>;
   };
+  createCallCount: () => number;
   createRecordingSession: (
     input: AppendRecordingSegmentInput
   ) => Promise<unknown>;
+  deferCreate: () => Deferred<void>;
+  deferManifest: (sessionId: string) => Deferred<RecordingManifest>;
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;
   getRecordingStatus: (sessionId: string) => Promise<RecordingStatus | null>;
+  markAllFailed: () => void;
   markAllReady: () => void;
+  uploadedPartCount: () => number;
+}
+
+export interface Deferred<T> {
+  promise: Promise<T>;
+  reject: (error: unknown) => void;
+  resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+const uploadedPartCounts = new WeakMap<CandidateBindingFixture, number>();
+
+function recordUploadedPart(fixture: CandidateBindingFixture) {
+  uploadedPartCounts.set(fixture, (uploadedPartCounts.get(fixture) ?? 0) + 1);
 }
 
 export function createCandidateBindings(): CandidateBindingFixture {
   const manifests = new Map<string, RecordingManifest>();
   const statuses = new Map<string, RecordingStatus>();
   const appendedSegments = new Map<string, AppendRecordingSegmentInput[]>();
+  const manifestDeferrals = new Map<string, Deferred<RecordingManifest>>();
+  let createCalls = 0;
+  let createDeferral: Deferred<void> | undefined;
 
-  return {
+  const fixture: CandidateBindingFixture = {
     appendRecordingSegment: (input) => {
       const segments = appendedSegments.get(input.sessionId) ?? [];
       segments.push(input);
@@ -95,7 +125,10 @@ export function createCandidateBindings(): CandidateBindingFixture {
         return Promise.resolve({ status: "queued" });
       },
     },
-    createRecordingSession: (input) => {
+    createCallCount: () => createCalls,
+    createRecordingSession: async (input) => {
+      createCalls += 1;
+      await createDeferral?.promise;
       manifests.set(input.sessionId, {
         createdAt: Date.now(),
         segments: [],
@@ -109,16 +142,36 @@ export function createCandidateBindings(): CandidateBindingFixture {
         sessionId: input.sessionId,
       });
     },
-    getRecordingManifest: (sessionId) =>
-      Promise.resolve(manifests.get(sessionId) ?? null),
+    deferCreate: () => {
+      createDeferral = deferred<void>();
+      return createDeferral;
+    },
+    deferManifest: (sessionId) => {
+      const pending = deferred<RecordingManifest>();
+      manifestDeferrals.set(sessionId, pending);
+      return pending;
+    },
+    getRecordingManifest: async (sessionId) => {
+      const manifest = await manifestDeferrals.get(sessionId)?.promise;
+      return manifest ?? manifests.get(sessionId) ?? null;
+    },
     getRecordingStatus: (sessionId) =>
       Promise.resolve(statuses.get(sessionId) ?? null),
+    markAllFailed: () => {
+      for (const sessionId of statuses.keys()) {
+        statuses.set(sessionId, { status: "failed" });
+      }
+    },
     markAllReady: () => {
       for (const sessionId of statuses.keys()) {
         statuses.set(sessionId, { status: "ready" });
       }
     },
+    uploadedPartCount: () => uploadedPartCounts.get(fixture) ?? 0,
   };
+
+  uploadedPartCounts.set(fixture, 0);
+  return fixture;
 }
 
 function createCandidateRecordingRouter(fixture: CandidateBindingFixture) {
@@ -223,6 +276,7 @@ export async function installRecordingApi(
         status: uploadStatus >= 400 ? uploadStatus : 409,
       });
     }
+    recordUploadedPart(fixture);
     return route.fulfill({ body: "", status: 201 });
   });
 }

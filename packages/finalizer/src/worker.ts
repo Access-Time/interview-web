@@ -13,6 +13,8 @@ import {
 import {
   deterministicJobName,
   isExactFinalizerOutput,
+  isExactPublishedObject,
+  normalizeSha256Checksum,
   outputMediaType,
   TerminalFinalizationError,
   validateFinalizePlan,
@@ -29,6 +31,8 @@ export type {
 export {
   deterministicJobName,
   isExactFinalizerOutput,
+  isExactPublishedObject,
+  normalizeSha256Checksum,
   outputMediaType,
   TerminalFinalizationError,
   validateFinalizePlan,
@@ -37,7 +41,7 @@ export {
 export type FinalizerDb = Database;
 export interface FinalizerObject {
   body: ReadableStream<Uint8Array> | null;
-  checksums?: { sha256?: ArrayBuffer };
+  checksums?: { sha256?: ArrayBuffer | string };
   httpMetadata?: { contentType?: string };
   size: number;
 }
@@ -47,7 +51,7 @@ export interface FinalizerBucket {
   head: (key: string) => Promise<Omit<FinalizerObject, "body"> | null>;
   put: (
     key: string,
-    value: ReadableStream<Uint8Array>,
+    value: ReadableStream<Uint8Array> | ArrayBuffer | Uint8Array,
     options: Record<string, unknown>
   ) => Promise<Omit<FinalizerObject, "body"> | null>;
 }
@@ -74,32 +78,6 @@ export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
   return getContainer(env.FINALIZER);
 }
 
-function hex(bytes: ArrayBuffer) {
-  return [...new Uint8Array(bytes)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-export async function sha256(stream: ReadableStream<Uint8Array>) {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  let size = 0;
-  for (;;) {
-    // biome-ignore lint/performance/noAwaitInLoops: stream reads are inherently sequential.
-    const n = await reader.read();
-    if (n.done) {
-      break;
-    }
-    chunks.push(n.value);
-    size += n.value.byteLength;
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return hex(await crypto.subtle.digest("SHA-256", bytes));
-}
 class TransientFinalizationError extends Error {
   terminal = false;
 }
@@ -197,7 +175,8 @@ export async function processFinalization(input: {
           !object?.body ||
           object.size !== part.byteSize ||
           !object.checksums?.sha256 ||
-          hex(object.checksums.sha256) !== part.checksum.toLowerCase()
+          normalizeSha256Checksum(object.checksums.sha256) !==
+            part.checksum.toLowerCase()
         ) {
           throw new TerminalFinalizationError("missing or corrupt part");
         }
@@ -252,22 +231,26 @@ export async function processFinalization(input: {
       objectKey: outputKey,
     };
     const exact = (meta: Omit<FinalizerObject, "body"> | null) =>
-      !!meta &&
-      meta.size === size &&
-      hex(meta.checksums?.sha256 ?? new ArrayBuffer(0)) === checksum &&
-      meta.httpMetadata?.contentType === type;
+      isExactPublishedObject(meta, {
+        checksum,
+        mediaType: type,
+        size,
+      });
     let written: Omit<FinalizerObject, "body"> | null = null;
+    let publishError: unknown;
     try {
       written = await input.recordings.put(outputKey, out.body, {
         httpMetadata: { contentType: type },
         onlyIf: { etagDoesNotMatch: "*" },
         sha256: checksum,
       });
-    } catch {
-      /* verify collision or partial publication below */
+    } catch (error) {
+      publishError = error;
     }
     if (written === null && !exact(await input.recordings.head(outputKey))) {
-      throw new TransientFinalizationError("output publication not proven");
+      throw new TransientFinalizationError("output publication not proven", {
+        cause: publishError,
+      });
     }
     if (written !== null && !exact(written)) {
       throw new TransientFinalizationError(

@@ -6,20 +6,14 @@ import {
   getDeliveryPresentation,
 } from "@/recording/candidate-recording-journey";
 import {
-  type RecordingDeliveryPhase,
   type RecordingFinalizationState,
   type RecordingJourneyOutcome,
-  type RecordingManifestLookup,
-  type RecordingManifestView,
   type RecordingPreflightState,
-  type RecordingSaveState,
   type RecordingStopReason,
   type UseLiveRecordingResult,
   useLiveRecording,
 } from "@/recording/live-recording";
 import { useRecordingApi } from "@/recording/recording-api";
-import type { ApiErrors } from "@/utils/orpc";
-import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
 export const Route = createFileRoute("/")({
   component: HomeComponent,
@@ -88,27 +82,11 @@ export function usefulError(error: unknown): CandidateError {
   };
 }
 
-export function recordingManifestLookup(
-  getManifest: (input: { sessionId: string }) => Promise<RecordingManifestView>,
-  input: { sessionId: string }
-): Promise<RecordingManifestLookup> {
-  return getManifest(input).then(
-    (manifest) => ({ kind: "found", manifest }),
-    (error: ApiErrors["recording"]["getManifest"]) => {
-      if (isRecordingNotFoundError(error)) {
-        return { kind: "missing" };
-      }
-      throw error;
-    }
-  );
-}
-
 function mapDeliveryHandoff(input: {
   finalizationState?: RecordingFinalizationState | "idle";
   hasIncompleteRecordingFinalization?: boolean;
   hasUnsentRecordingMedia?: boolean;
   isRecording?: boolean;
-  recordingDeliveryPhase?: RecordingDeliveryPhase;
   recordingPreflightState?: RecordingPreflightState;
   recordingStopReason?: RecordingStopReason;
 }) {
@@ -121,7 +99,6 @@ function mapDeliveryHandoff(input: {
       input.hasIncompleteRecordingFinalization,
     hasUnsentRecordingMedia: input.hasUnsentRecordingMedia,
     isRecording: input.isRecording,
-    recordingDeliveryPhase: input.recordingDeliveryPhase,
     recordingPreflightState: input.recordingPreflightState,
     recordingStopReason: input.recordingStopReason,
   });
@@ -152,11 +129,9 @@ export function candidateJourneyHandoff(input: {
   hasUnsentRecordingMedia?: boolean;
   isRecording?: boolean;
   journeyOutcome?: RecordingJourneyOutcome;
-  recordingDeliveryPhase?: RecordingDeliveryPhase;
   recordingError?: string | null;
   recordingPreflightState?: RecordingPreflightState;
   recordingStopReason?: RecordingStopReason;
-  saveState?: RecordingSaveState;
 }) {
   const recordingError = input.recordingError
     ? usefulError(input.recordingError)
@@ -188,28 +163,15 @@ export function candidateJourneyHandoff(input: {
         (input.finalizationState && input.finalizationState !== "idle")
     ),
     journeyOutcome: input.journeyOutcome ?? "none",
-    savingNotice: resolveSavingNotice(
-      deliveryMessage,
-      input.journeyOutcome,
-      input.saveState
-    ),
+    savingNotice: resolveSavingNotice(deliveryMessage),
   };
 }
 
-function resolveSavingNotice(
-  deliveryMessage: string | null,
-  journeyOutcome?: RecordingJourneyOutcome,
-  saveState?: RecordingSaveState
-) {
+function resolveSavingNotice(deliveryMessage: string | null) {
   if (deliveryMessage) {
     return deliveryMessage;
   }
-  if (journeyOutcome !== "automatic-retry") {
-    return null;
-  }
-  return saveState === "offline"
-    ? "Saving will resume when you reconnect."
-    : "Keep this screen open; we’ll keep trying.";
+  return null;
 }
 
 export function shouldWarnBeforeUnload(input: {
@@ -285,20 +247,7 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
 }
 
 function HomeComponent() {
-  const [manifestSessionId, setManifestSessionId] = useState<string | null>(
-    null
-  );
-  const [statusSessionId, setStatusSessionId] = useState<string | null>(null);
-  const api = useRecordingApi({ manifestSessionId, statusSessionId });
-  const recording = useLiveRecording({
-    appendSegment: api.appendSegment,
-    createSession: api.createSession,
-    finalizeSession: api.finalizeSession,
-    manifestLookup: api.manifestLookup,
-    onRequestManifest: setManifestSessionId,
-    onRequestStatus: setStatusSessionId,
-    status: api.status,
-  });
+  const recording = useLiveRecording(useRecordingApi());
   const controls = useRecordingControls(recording);
   const finalizationState = recording.finalization?.state ?? "idle";
   const handoff = candidateJourneyHandoff({
@@ -311,11 +260,9 @@ function HomeComponent() {
     hasUnsentRecordingMedia: recording.hasUnsentRecordingMedia,
     isRecording: recording.isRecording,
     journeyOutcome: recording.journeyOutcome,
-    recordingDeliveryPhase: recording.recordingDeliveryPhase,
     recordingError: recording.error,
     recordingPreflightState: recording.recordingPreflightState,
     recordingStopReason: recording.recordingStopReason,
-    saveState: recording.saveState,
   });
   const warnBeforeUnload = shouldWarnBeforeUnload({
     hasIncompleteRecordingFinalization:
@@ -361,11 +308,9 @@ function HomeComponent() {
       onStart={controls.handleStart}
       onStop={controls.handleStop}
       pendingAction={controls.pendingAction}
-      recordingDeliveryPhase={recording.recordingDeliveryPhase}
       recordingPreflightState={recording.recordingPreflightState}
       recordingStopReason={recording.recordingStopReason}
       recovered={recording.recovered}
-      saveState={recording.saveState}
       savingNotice={handoff.savingNotice}
       stream={recording.stream}
     />

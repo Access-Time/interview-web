@@ -145,15 +145,20 @@ it("finalize rejects missing parts and normalizes each segment before final conc
   expect((await h.request("GET", "/jobs/job/output")).status).toEqual(200);
 });
 
-it("reconstructs parts within segments but keeps segments separate", async () => {
+it("byte-concatenates timeslice parts within a segment before remux", async () => {
   const inputs = [];
   const h = await harness(async (program, args, options) => {
     if (program === "ffmpeg") {
       const input = args[args.indexOf("-i") + 1];
       inputs.push({
         args,
+        bytes: input.endsWith(".txt")
+          ? null
+          : await fs.readFile(path.join(options.cwd, input)),
         input,
-        list: await fs.readFile(path.join(options.cwd, input), "utf8"),
+        list: input.endsWith(".txt")
+          ? await fs.readFile(path.join(options.cwd, input), "utf8")
+          : null,
       });
       await fs.writeFile(path.join(options.cwd, args.at(-1)), "media");
     }
@@ -179,26 +184,18 @@ it("reconstructs parts within segments but keeps segments separate", async () =>
       )
     ).status
   ).toEqual(200);
-  const segmentLists = inputs.slice(0, 2).map(({ list }) =>
-    list
+  expect(inputs).toHaveLength(3);
+  expect(inputs[0].args.includes("concat")).toBe(false);
+  expect(inputs[1].args.includes("concat")).toBe(false);
+  expect(inputs[0].bytes).toEqual(Buffer.from("ab"));
+  expect(inputs[1].bytes).toEqual(Buffer.from("c"));
+  expect(inputs[2].args[inputs[2].args.indexOf("-f") + 1]).toBe("concat");
+  expect(
+    inputs[2].list
       .trim()
       .split("\n")
       .map((line) => line.replace(FILE_PREFIX, "").replace(FILE_SUFFIX, ""))
-  );
-  expect(
-    await Promise.all(
-      segmentLists.map((list) =>
-        Promise.all(
-          list.map((name) => fs.readFile(path.join(h.root, "job", name)))
-        )
-      )
-    )
-  ).toEqual([[Buffer.from("a"), Buffer.from("b")], [Buffer.from("c")]]);
-  expect(
-    inputs.every(({ args }) => args[args.indexOf("-f") + 1] === "concat")
-  ).toBe(true);
-  expect(inputs.every(({ input }) => input.endsWith(".txt"))).toBe(true);
-  expect(inputs[0].input).not.toBe(inputs[1].input);
+  ).toEqual([inputs[0].args.at(-1), inputs[1].args.at(-1)]);
 });
 
 it("failed ffmpeg never exposes output", async () => {

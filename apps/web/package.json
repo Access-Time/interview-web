@@ -35,8 +35,7 @@
     "react-dom": "catalog:",
     "sonner": "catalog:",
     "tailwindcss": "catalog:",
-    "zod": "catalog:",
-    "zustand": "^5.0.15"
+    "zod": "catalog:"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.44.0",

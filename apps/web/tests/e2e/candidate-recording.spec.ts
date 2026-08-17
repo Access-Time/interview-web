@@ -5,7 +5,6 @@ import {
   installRecordingApi,
   installRecordingFixture,
   installRecordingStorage,
-  reconnectRecordingFixture,
 } from "./recording-fixture";
 
 const CAMERA_OFF_COPY =
@@ -15,10 +14,9 @@ const RECORDING_GUIDANCE =
 const NEW_RECORDING_PATTERN = /start a new recording/i;
 const RETRYABLE_UPLOAD_PATTERN = /upload|saving is delayed|keep trying/i;
 const START_BUTTON_PATTERN = /start/i;
+const START_OR_CONTINUE_PATTERN = /Start recording|Continue recording/;
 const STOP_BUTTON_PATTERN = /stop/i;
 const TRY_AGAIN_PATTERN = /try again/i;
-const RESUME_SAVING_PATTERN =
-  /Connection restored\. Saving your recording\.|Your recording is being saved\./;
 
 async function installCandidateMedia(page: Page) {
   await page.addInitScript(() => {
@@ -53,7 +51,7 @@ async function waitForRecordingApp(page: Page) {
   });
 }
 
-async function startRecording(page: Page) {
+async function prepareReadyRecording(page: Page) {
   await waitForRecordingApp(page);
   const enable = page.getByRole("button", {
     name: "Enable camera and microphone",
@@ -71,7 +69,11 @@ async function startRecording(page: Page) {
     )
   ).toBeVisible();
   await expect(page.getByLabel("Your camera preview")).toBeVisible();
-  await start.click();
+}
+
+async function startRecording(page: Page) {
+  await prepareReadyRecording(page);
+  await page.getByRole("button", { name: "Start recording" }).click();
   await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
 }
 
@@ -164,22 +166,6 @@ test("fatal upload clears capture without retryable upload wording", async ({
   await expect(page.getByText(RETRYABLE_UPLOAD_PATTERN)).toHaveCount(0);
 });
 
-test("offline saving exposes one async status", async ({ page }) => {
-  const fixture = createCandidateBindings();
-  await installCandidateMedia(page);
-  await installRecordingApi(page, fixture);
-  await page.goto("/");
-  await startRecording(page);
-  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
-
-  await page.getByRole("button", { name: "Stop recording" }).click();
-
-  await expect(page.getByRole("status")).toHaveText(
-    "You’re offline. Your recording is still being saved on this device."
-  );
-  await expect(page.getByRole("status")).toHaveCount(1);
-});
-
 test("failed finalization offers a manual retry", async ({ page }) => {
   const fixture = createCandidateBindings();
   let attempts = 0;
@@ -219,7 +205,9 @@ test("mobile recording keeps foreground and browser guidance visible", async ({
   await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
 });
 
-test("typed missing recovery resets to normal setup", async ({ page }) => {
+test("typed missing recovery is cleaned up into normal setup", async ({
+  page,
+}) => {
   const fixture = createCandidateBindings();
   await installCandidateMedia(page);
   await installRecordingApi(page, fixture);
@@ -227,12 +215,6 @@ test("typed missing recovery resets to normal setup", async ({ page }) => {
   await seedMissingRecovery(page);
   await page.reload();
 
-  await expect(
-    page.getByText(
-      "We couldn’t find your unfinished recording. It can’t be continued."
-    )
-  ).toBeVisible();
-  await page.getByRole("button", { name: "Set up a new recording" }).click();
   await expect(
     page.getByRole("button", { name: "Enable camera and microphone" })
   ).toBeVisible();
@@ -302,26 +284,6 @@ test("blocks Start when the device cannot pass the offline recovery check", asyn
   await expect(
     page.getByRole("button", { name: TRY_AGAIN_PATTERN })
   ).toBeVisible();
-});
-
-test("keeps recording offline and resumes saving after reconnect", async ({
-  page,
-}) => {
-  const { upload } = await installRecordingFixture(page, {
-    upload: { mode: "offline" },
-  });
-  await page.goto("/");
-  await startRecording(page);
-  await page.evaluate(() => window.__testMediaRecorder?.emitPart());
-  await page.evaluate(() => window.dispatchEvent(new Event("offline")));
-  await expect(page.getByRole("status")).toHaveText(
-    "You’re offline. Your recording is still being saved on this device."
-  );
-  await expect(
-    page.getByRole("button", { name: STOP_BUTTON_PATTERN })
-  ).toBeVisible();
-  await reconnectRecordingFixture(page, upload);
-  await expect(page.getByRole("status")).toHaveText(RESUME_SAVING_PATTERN);
 });
 
 test("shows finishing copy while durable parts drain after Stop", async ({
@@ -414,4 +376,137 @@ test("keeps a single status region on desktop and mobile", async ({ page }) => {
   await expect(page.getByRole("status")).toHaveCount(1);
   await page.setViewportSize({ height: 844, width: 390 });
   await expect(page.getByRole("status")).toHaveCount(1);
+});
+
+test("rechecks preflight immediately before Start", async ({ page }) => {
+  const { fixture } = await installRecordingFixture(page);
+  await page.goto("/");
+  await prepareReadyRecording(page);
+  await page.evaluate(() => {
+    window.__recordingTestStorage = { quota: 10, usage: 9 };
+  });
+  await page.getByRole("button", { name: "Start recording" }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "This device isn’t ready to safely store a recording offline"
+  );
+  expect(fixture.createCallCount()).toBe(0);
+  await expect(
+    page.getByRole("button", { name: TRY_AGAIN_PATTERN })
+  ).toBeVisible();
+});
+
+test("waits for delayed recovery before creating a session", async ({
+  page,
+}) => {
+  const { fixture } = await installRecordingFixture(page);
+  let appendCalls = 0;
+  const { appendRecordingSegment } = fixture;
+  fixture.appendRecordingSegment = (input) => {
+    appendCalls += 1;
+    return appendRecordingSegment(input);
+  };
+  const manifest = fixture.deferManifest("missing-recording");
+  await page.goto("/");
+  await seedMissingRecovery(page);
+  await page.reload();
+  await waitForRecordingApp(page);
+  await expect.poll(() => fixture.createCallCount()).toBe(0);
+  await expect(
+    page.getByRole("button", { name: START_OR_CONTINUE_PATTERN })
+  ).toHaveCount(0);
+  expect(await fixture.getRecordingStatus("missing-recording")).toBeNull();
+  manifest.resolve({
+    createdAt: Date.now(),
+    segments: [
+      {
+        createdAt: Date.now(),
+        id: "local-segment",
+        index: 0,
+        parts: [],
+        recorderMimeType: "video/webm",
+        requestedMimeType: "video/webm",
+      },
+    ],
+    sessionId: "missing-recording",
+  });
+  await expect(
+    page.getByRole("heading", {
+      name: "We found an unfinished recording. You can continue where you left off.",
+    })
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Enable camera and microphone" })
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Enable camera and microphone" })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Continue recording" })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Continue recording" }).click();
+  await expect.poll(() => appendCalls).toBe(1);
+  expect(fixture.createCallCount() + appendCalls).toBe(1);
+  await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
+});
+
+test("deduplicates rapid Start clicks while creation is pending", async ({
+  page,
+}) => {
+  const { fixture } = await installRecordingFixture(page);
+  const creation = fixture.deferCreate();
+  await page.goto("/");
+  await prepareReadyRecording(page);
+  const start = page.getByRole("button", { name: "Start recording" });
+  const startButton = await start.elementHandle();
+  await start.click();
+  await startButton?.evaluate((button) =>
+    (button as HTMLButtonElement).click()
+  );
+  await expect.poll(() => fixture.createCallCount()).toBe(1);
+  creation.resolve();
+  await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
+});
+
+test("persists and uploads the terminal capacity part before completion", async ({
+  page,
+}) => {
+  const { fixture } = await installRecordingFixture(page);
+  await page.goto("/");
+  await startRecording(page);
+  await page.evaluate(() => {
+    window.__recordingTestStorage = { quota: 64_860_000, usage: 0 };
+    window.__testMediaRecorder?.emitPart();
+  });
+  await expect(page.getByRole("status")).toHaveText(
+    "We stopped recording to protect your saved recording. Finishing it now."
+  );
+  await expect.poll(() => fixture.uploadedPartCount()).toBe(2);
+  await expect(
+    page.getByRole("heading", { name: "Submission complete." })
+  ).toHaveCount(0);
+  fixture.markAllReady();
+  await expect(
+    page.getByRole("heading", { name: "Submission complete." })
+  ).toBeVisible();
+});
+
+test("shows manual retry after polled finalization failure", async ({
+  page,
+}) => {
+  const { fixture } = await installRecordingFixture(page, {
+    finalization: "pending",
+  });
+  await page.goto("/");
+  await startRecording(page);
+  await page.getByRole("button", { name: STOP_BUTTON_PATTERN }).click();
+  await expect(page.getByRole("status")).toHaveText(
+    "Your recording is saved. We’re completing it now."
+  );
+  fixture.markAllFailed();
+  await expect(page.getByRole("alert")).toContainText(
+    "Submission needs attention"
+  );
+  await expect(
+    page.getByRole("button", { name: "Try submitting again" })
+  ).toBeEnabled();
 });

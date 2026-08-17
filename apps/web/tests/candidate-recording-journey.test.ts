@@ -42,11 +42,9 @@ const baseProps: CandidateRecordingJourneyProps = {
   onStart: () => undefined,
   onStop: () => undefined,
   pendingAction: null,
-  recordingDeliveryPhase: "idle",
   recordingPreflightState: "idle",
   recordingStopReason: null,
   recovered: false,
-  saveState: "healthy",
   savingNotice: null,
   stream: null,
 };
@@ -361,25 +359,6 @@ it("labels the controls by the active state heading", () => {
   expect(controls.getAttribute("aria-labelledby")).toBe(heading.id);
 });
 
-it("keeps automatic saving notices non-alerting and uses approved copy", () => {
-  for (const [saveState, message] of [
-    ["offline", "Saving will resume when you reconnect."],
-    ["retrying", "Keep this screen open; we’ll keep trying."],
-    ["error", "Keep this screen open; we’ll keep trying."],
-  ] as const) {
-    const { container, unmount } = render(
-      React.createElement(CandidateRecordingJourney, {
-        ...baseProps,
-        journeyOutcome: "automatic-retry",
-        saveState,
-      })
-    );
-    expect(screen.getByRole("status").textContent).toBe(message);
-    expect(container.querySelector('[role="alert"]')).toBe(null);
-    unmount();
-  }
-});
-
 it("uses one persistent async status without a blocking alert", () => {
   const message = "Keep this screen open; we’ll keep trying.";
   const { container } = render(
@@ -679,17 +658,8 @@ it.each([
     "idle",
     "This device is ready to protect up to 30 minutes of recording if you temporarily lose connection.",
   ],
-  ["ready", "saving", "Your recording is being saved."],
-  [
-    "ready",
-    "offline",
-    "You’re offline. Your recording is still being saved on this device.",
-  ],
-  ["ready", "reconnecting", "Connection restored. Saving your recording."],
-  ["ready", "retrying", "Connection trouble. We’ll keep trying."],
-] as const)("announces %s/%s once", (preflight, delivery, message) => {
+] as const)("announces %s once", (preflight, _delivery, message) => {
   renderJourney({
-    recordingDeliveryPhase: delivery,
     recordingPreflightState: preflight,
   });
   expect(screen.getByRole("status").textContent).toBe(message);
@@ -820,7 +790,6 @@ it("does not keep finishing copy after finalization is ready", () => {
 it("does not expose progress UI or implementation terminology", () => {
   const { container } = renderJourney({
     isReady: true,
-    recordingDeliveryPhase: "saving",
     recordingPreflightState: "ready",
   });
   expect(screen.queryByRole("progressbar")).toBeNull();

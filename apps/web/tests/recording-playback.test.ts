@@ -3,6 +3,7 @@ import { expect, it } from "vitest";
 import {
   isPlaybackReady,
   playbackDetailKind,
+  playbackSegmentForTime,
   playbackStatusLabel,
   playbackSummaryLookup,
   preparePlaybackObjectUrl,
@@ -67,6 +68,17 @@ it("builds an encoded same-origin submission URL", () => {
   expect(recordingSubmissionUrl("session/a?b")).toBe(
     "/api/recordings/session%2Fa%3Fb/submission"
   );
+});
+
+it("maps a combined timeline onto recovered segments", () => {
+  expect(playbackSegmentForTime([10, 5], 3)).toEqual({
+    index: 0,
+    localTime: 3,
+  });
+  expect(playbackSegmentForTime([10, 5], 12)).toEqual({
+    index: 1,
+    localTime: 2,
+  });
 });
 
 it("loads the submission into an object URL", async () => {

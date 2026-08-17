@@ -2,7 +2,10 @@ import type {
   RecordingPlaybackStatus,
   RecordingPlaybackSummary,
 } from "@interview-web/db";
-import { makeWebmSeekable } from "@interview-web/finalizer/webm-seekable";
+import {
+  makeWebmSeekable,
+  splitWebmFiles,
+} from "@interview-web/finalizer/webm-seekable";
 import type { ApiErrors } from "@/utils/orpc";
 import { isRecordingNotFoundError } from "@/utils/recording-errors";
 
@@ -62,25 +65,63 @@ export function recordingSubmissionUrl(sessionId: string): string {
   return `/api/recordings/${encodeURIComponent(sessionId)}/submission`;
 }
 
-export async function preparePlaybackObjectUrl(
+export function playbackSegmentForTime(
+  durations: readonly number[],
+  time: number
+): { index: number; localTime: number } {
+  if (durations.length === 0) {
+    return { index: 0, localTime: 0 };
+  }
+  let remaining = Math.max(0, time);
+  for (const [index, duration] of durations.entries()) {
+    if (remaining < duration || index === durations.length - 1) {
+      return { index, localTime: remaining };
+    }
+    remaining -= duration;
+  }
+  return { index: 0, localTime: 0 };
+}
+
+const objectUrlForBytes = (bytes: Uint8Array, mediaType: string | null) => {
+  const blobBytes = new Uint8Array(bytes.byteLength);
+  blobBytes.set(bytes);
+  return URL.createObjectURL(
+    new Blob([blobBytes], { type: mediaType ?? "video/webm" })
+  );
+};
+
+export async function preparePlaybackObjectUrls(
   sessionId: string,
   mediaType: string | null,
   fetchImpl: typeof fetch = fetch
-): Promise<string> {
+): Promise<string[]> {
   const response = await fetchImpl(recordingSubmissionUrl(sessionId));
   if (!response.ok) {
     throw new Error("Recording playback could not be loaded");
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  const body =
-    (mediaType ?? "video/webm").split(";")[0] === "video/webm"
-      ? makeWebmSeekable(bytes)
-      : bytes;
-  const blobBytes = new Uint8Array(body.byteLength);
-  blobBytes.set(body);
-  return URL.createObjectURL(
-    new Blob([blobBytes], { type: mediaType ?? "video/webm" })
+  if ((mediaType ?? "video/webm").split(";")[0] !== "video/webm") {
+    return [objectUrlForBytes(bytes, mediaType)];
+  }
+  return splitWebmFiles(makeWebmSeekable(bytes)).map((file) =>
+    objectUrlForBytes(file, mediaType)
   );
+}
+
+export async function preparePlaybackObjectUrl(
+  sessionId: string,
+  mediaType: string | null,
+  fetchImpl: typeof fetch = fetch
+): Promise<string> {
+  const [url] = await preparePlaybackObjectUrls(
+    sessionId,
+    mediaType,
+    fetchImpl
+  );
+  if (!url) {
+    throw new Error("Recording playback could not be loaded");
+  }
+  return url;
 }
 
 export function playbackSummaryLookup(

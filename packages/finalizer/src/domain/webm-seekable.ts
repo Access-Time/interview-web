@@ -11,6 +11,9 @@ const CUE_TIME = 0xb3;
 const CUE_TRACK_POSITIONS = 0xb7;
 const CUE_TRACK = 0xf7;
 const CUE_CLUSTER_POSITION = 0xf1;
+const TRACKS = 0x16_54_ae_6b;
+const SIMPLE_BLOCK = 0xa3;
+const BLOCK = 0xa1;
 
 const readByte = (data: Uint8Array, offset: number) =>
   offset >= 0 && offset < data.byteLength ? data[offset] : undefined;
@@ -286,45 +289,192 @@ const patchDuration = (
   return next;
 };
 
+const readInt16 = (data: Uint8Array, offset: number) => {
+  const high = readByte(data, offset);
+  const low = readByte(data, offset + 1);
+  if (high === undefined || low === undefined) {
+    return 0;
+  }
+  const value = high * 256 + low;
+  return value > 32_767 ? value - 65_536 : value;
+};
+
+const blockRelativeTime = (data: Uint8Array, start: number) => {
+  const track = readVint(data, start);
+  if (!track) {
+    return 0;
+  }
+  return readInt16(data, start + track.width);
+};
+
+const clusterEndTime = (
+  data: Uint8Array,
+  cluster: { dataOffset: number; end: number },
+  timecode: number
+) => {
+  let latest = timecode;
+  let offset = cluster.dataOffset;
+  while (offset < cluster.end) {
+    const child = readElement(data, offset, cluster.end);
+    if (!child) {
+      break;
+    }
+    if (child.id === SIMPLE_BLOCK || child.id === BLOCK) {
+      latest = Math.max(
+        latest,
+        timecode + blockRelativeTime(data, child.dataOffset)
+      );
+    }
+    offset = child.end;
+  }
+  return latest;
+};
+
+export const splitWebmFiles = (data: Uint8Array) => {
+  const files: Uint8Array[] = [];
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const ebml = readElement(data, offset, data.byteLength);
+    if (ebml?.id !== EBML) {
+      break;
+    }
+    const segment = readElement(data, ebml.end, data.byteLength);
+    if (segment?.id !== SEGMENT) {
+      files.push(data.subarray(offset));
+      break;
+    }
+    if (segment.size !== null) {
+      files.push(data.subarray(offset, segment.end));
+      offset = segment.end;
+      continue;
+    }
+    let childOffset = segment.dataOffset;
+    let nextFile = data.byteLength;
+    while (childOffset < data.byteLength) {
+      const child = readElement(data, childOffset, data.byteLength);
+      if (!child) {
+        break;
+      }
+      if (child.id === EBML) {
+        nextFile = child.start;
+        break;
+      }
+      childOffset = child.end;
+    }
+    files.push(data.subarray(offset, nextFile));
+    offset = nextFile;
+  }
+  return files.length > 0 ? files : [data];
+};
+
+interface ParsedWebm {
+  clusters: Array<{ bytes: Uint8Array; endTime: number; timecode: number }>;
+  duration: number;
+  ebml: Uint8Array;
+  info: Uint8Array | null;
+  tracks: Uint8Array | null;
+}
+
+const parseWebmFile = (data: Uint8Array): ParsedWebm | null => {
+  const ebml = readElement(data, 0, data.byteLength);
+  if (ebml?.id !== EBML) {
+    return null;
+  }
+  const segment = readElement(data, ebml.end, data.byteLength);
+  if (segment?.id !== SEGMENT) {
+    return null;
+  }
+  const clusters: ParsedWebm["clusters"] = [];
+  let info: Uint8Array | null = null;
+  let tracks: Uint8Array | null = null;
+  let offset = segment.dataOffset;
+  while (offset < segment.end) {
+    const child = readElement(data, offset, segment.end);
+    if (!child) {
+      break;
+    }
+    if (child.id === EBML) {
+      break;
+    }
+    if (child.id === INFO) {
+      info = data.subarray(child.start, child.end);
+    } else if (child.id === TRACKS) {
+      tracks = data.subarray(child.start, child.end);
+    } else if (child.id === CLUSTER) {
+      const timecodeElement = findChild(
+        data,
+        child.dataOffset,
+        child.end,
+        TIMECODE
+      );
+      const timecode = timecodeElement
+        ? (readUint(data, timecodeElement.dataOffset, timecodeElement.end) ?? 0)
+        : 0;
+      clusters.push({
+        bytes: data.subarray(child.start, child.end),
+        endTime: clusterEndTime(data, child, timecode),
+        timecode,
+      });
+    }
+    offset = child.end;
+  }
+  const last = clusters.at(-1);
+  return {
+    clusters,
+    duration: last ? Math.max(last.endTime, last.timecode + 1) : 0,
+    ebml: data.subarray(ebml.start, ebml.end),
+    info,
+    tracks,
+  };
+};
+
+const makeSingleWebmSeekable = (input: Uint8Array): Uint8Array => {
+  let offset = 0;
+  while (offset < input.byteLength) {
+    const element = readElement(input, offset, input.byteLength);
+    if (!element) {
+      return input;
+    }
+    if (element.id === SEGMENT) {
+      const collected = collectClusters(input, element.dataOffset, element.end);
+      if (collected.clusters.length === 0) {
+        return input;
+      }
+      const last = collected.clusters.at(-1);
+      const durationValue = last ? last.timecode + 1 : 0;
+      const withDuration =
+        collected.duration && last
+          ? patchDuration(input, collected.duration, durationValue)
+          : input;
+      if (collected.hasCues) {
+        return withDuration;
+      }
+      return concatBytes([withDuration, buildCues(collected.clusters)]);
+    }
+    offset = element.end;
+  }
+  return input;
+};
+
+export const webmClusterTimecodes = (input: Uint8Array): number[] => {
+  const parsed = parseWebmFile(input);
+  return parsed?.clusters.map((cluster) => cluster.timecode) ?? [];
+};
+
 /**
- * MediaRecorder WebM has no Cues and usually no Duration, so browsers treat
- * it as a live stream and disable timeline seeking. Append a Cues index and
- * patch Duration when the Info element already reserved 8 bytes for it.
+ * MediaRecorder WebM has no Cues and usually no Duration. A refresh starts a
+ * second encoder session (another complete WebM). Those cannot be remuxed
+ * into one bitstream without ffmpeg, so each file is indexed on its own.
  */
 export const makeWebmSeekable = (input: Uint8Array): Uint8Array => {
   if (!looksLikeWebm(input)) {
     return input;
   }
   try {
-    let offset = 0;
-    while (offset < input.byteLength) {
-      const element = readElement(input, offset, input.byteLength);
-      if (!element) {
-        return input;
-      }
-      if (element.id === SEGMENT) {
-        const collected = collectClusters(
-          input,
-          element.dataOffset,
-          element.end
-        );
-        if (collected.clusters.length === 0) {
-          return input;
-        }
-        const last = collected.clusters.at(-1);
-        const durationValue = last ? last.timecode + 1 : 0;
-        const withDuration =
-          collected.duration && last
-            ? patchDuration(input, collected.duration, durationValue)
-            : input;
-        if (collected.hasCues) {
-          return withDuration;
-        }
-        return concatBytes([withDuration, buildCues(collected.clusters)]);
-      }
-      offset = element.end;
-    }
-    return input;
+    const files = splitWebmFiles(input).map((file) =>
+      makeSingleWebmSeekable(file)
+    );
+    return files.length === 1 ? (files[0] ?? input) : concatBytes(files);
   } catch {
     return input;
   }

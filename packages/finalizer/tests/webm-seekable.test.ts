@@ -1,6 +1,10 @@
 /** biome-ignore-all lint/suspicious/noBitwiseOperators: EBML fixture encoding is bitwise. */
 import { expect, it } from "vitest";
-import { makeWebmSeekable } from "../src/domain/webm-seekable.ts";
+import {
+  makeWebmSeekable,
+  splitWebmFiles,
+  webmClusterTimecodes,
+} from "../src/domain/webm-seekable.ts";
 
 const encodeVint = (value: number) => {
   let width = 1;
@@ -95,4 +99,12 @@ it("appends Cues and patches Duration for MediaRecorder-style WebM", () => {
   );
   expect(found).toBeGreaterThan(-1);
   expect(makeWebmSeekable(output).byteLength).toBe(output.byteLength);
+});
+
+it("keeps a refreshed second segment as its own webm", () => {
+  const output = makeWebmSeekable(concatBytes([buildWebm(), buildWebm()]));
+  const files = splitWebmFiles(output);
+  expect(files).toHaveLength(2);
+  expect(webmClusterTimecodes(files[0] ?? output)).toEqual([0, 1000]);
+  expect(webmClusterTimecodes(files[1] ?? output)).toEqual([0, 1000]);
 });

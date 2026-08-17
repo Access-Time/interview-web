@@ -9,7 +9,7 @@ import {
   isPlaybackReady,
   playbackDetailKind,
   playbackStatusLabel,
-  preparePlaybackObjectUrl,
+  preparePlaybackObjectUrls,
 } from "./playback";
 
 export type PlaybackListErrorKind = "initial" | "load-more" | null;
@@ -202,25 +202,43 @@ function PlayableRecording({
   summary: RecordingPlaybackSummary;
 }) {
   const [failedForNonce, setFailedForNonce] = useState<number | null>(null);
-  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [objectUrls, setObjectUrls] = useState<string[]>([]);
+  const [partIndex, setPartIndex] = useState(0);
   const handleMediaError = useCallback(() => {
     setFailedForNonce(retryNonce);
   }, [retryNonce]);
+  const handlePartEnded = useCallback(() => {
+    setPartIndex((current) =>
+      current + 1 < objectUrls.length ? current + 1 : current
+    );
+  }, [objectUrls.length]);
+  const handlePreviousPart = useCallback(() => {
+    setPartIndex((current) => Math.max(0, current - 1));
+  }, []);
+  const handleNextPart = useCallback(() => {
+    setPartIndex((current) =>
+      current + 1 < objectUrls.length ? current + 1 : current
+    );
+  }, [objectUrls.length]);
   const playbackFailed = mediaFailed || failedForNonce === retryNonce;
+  const activeUrl = objectUrls[partIndex] ?? objectUrls[0] ?? null;
 
   useEffect(() => {
     let cancelled = false;
-    let createdUrl: string | null = null;
-    setObjectUrl(null);
+    let createdUrls: string[] = [];
+    setObjectUrls([]);
+    setPartIndex(0);
     setFailedForNonce(null);
-    preparePlaybackObjectUrl(summary.id, summary.outputMediaType)
-      .then((url) => {
+    preparePlaybackObjectUrls(summary.id, summary.outputMediaType)
+      .then((urls) => {
         if (cancelled) {
-          URL.revokeObjectURL(url);
+          for (const url of urls) {
+            URL.revokeObjectURL(url);
+          }
           return;
         }
-        createdUrl = url;
-        setObjectUrl(url);
+        createdUrls = urls;
+        setObjectUrls(urls);
       })
       .catch(() => {
         if (!cancelled) {
@@ -229,8 +247,8 @@ function PlayableRecording({
       });
     return () => {
       cancelled = true;
-      if (createdUrl) {
-        URL.revokeObjectURL(createdUrl);
+      for (const url of createdUrls) {
+        URL.revokeObjectURL(url);
       }
     };
   }, [retryNonce, summary.id, summary.outputMediaType]);
@@ -249,18 +267,44 @@ function PlayableRecording({
         </Button>
       </div>
     );
-  } else if (objectUrl) {
+  } else if (activeUrl) {
     media = (
-      // biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source.
-      <video
-        aria-label="Recording playback"
-        className="aspect-video w-full rounded-xl bg-black"
-        controls
-        key={retryNonce}
-        onError={handleMediaError}
-        preload="auto"
-        src={objectUrl}
-      />
+      <div className="grid gap-3">
+        {/* biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source. */}
+        <video
+          aria-label="Recording playback"
+          className="aspect-video w-full rounded-xl bg-black"
+          controls
+          key={`${retryNonce}-${partIndex}`}
+          onEnded={handlePartEnded}
+          onError={handleMediaError}
+          preload="auto"
+          src={activeUrl}
+        />
+        {objectUrls.length > 1 ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="text-sm text-white/70">
+              Part {partIndex + 1} of {objectUrls.length}
+            </p>
+            <Button
+              className={`${actionClassName} w-fit`}
+              disabled={partIndex === 0}
+              onClick={handlePreviousPart}
+              type="button"
+            >
+              Previous part
+            </Button>
+            <Button
+              className={`${actionClassName} w-fit`}
+              disabled={partIndex + 1 >= objectUrls.length}
+              onClick={handleNextPart}
+              type="button"
+            >
+              Next part
+            </Button>
+          </div>
+        ) : null}
+      </div>
     );
   } else {
     media = <p className="text-sm text-white/70">Preparing playback.</p>;

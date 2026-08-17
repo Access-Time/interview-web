@@ -18,6 +18,13 @@ export interface PublishedMeta {
   size: number;
 }
 
+interface PutBodyOptions {
+  httpMetadata: { contentType: string };
+  onlyIf: { etagDoesNotMatch: "*" };
+  sha256: string;
+  size: number;
+}
+
 export class Recordings extends Context.Tag("Recordings")<
   Recordings,
   {
@@ -30,11 +37,7 @@ export class Recordings extends Context.Tag("Recordings")<
     readonly put: (
       key: string,
       body: ReadableStream<Uint8Array> | Uint8Array,
-      options: {
-        httpMetadata: { contentType: string };
-        onlyIf: { etagDoesNotMatch: "*" };
-        sha256: string;
-      }
+      options: PutBodyOptions
     ) => Effect.Effect<
       Option.Option<PublishedMeta>,
       OutputPublicationNotProven | RecordingsUnavailable
@@ -60,6 +63,28 @@ const digest = async (bytes: Uint8Array) => {
 };
 const unavailable = (error: unknown) =>
   new RecordingsUnavailable({ message: String(error) });
+
+const putKnownLength = async (
+  bucket: Bucket,
+  key: string,
+  body: ReadableStream<Uint8Array> | Uint8Array,
+  options: PutBodyOptions
+) => {
+  const putOptions = {
+    httpMetadata: options.httpMetadata,
+    onlyIf: options.onlyIf,
+    sha256: options.sha256,
+  };
+  if (body instanceof Uint8Array) {
+    return bucket.put(key, body, putOptions);
+  }
+  const { readable, writable } = new FixedLengthStream(options.size);
+  const [object] = await Promise.all([
+    bucket.put(key, readable, putOptions),
+    body.pipeTo(writable),
+  ]);
+  return object;
+};
 
 export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
   Layer.succeed(Recordings, {
@@ -115,14 +140,8 @@ export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
     put: (key, body, options) =>
       Effect.tryPromise({
         catch: unavailable,
-        try: async () => {
-          // ponytail: buffer stream; FixedLengthStream if worker memory becomes the limit
-          const bytes =
-            body instanceof Uint8Array
-              ? body
-              : new Uint8Array(await new Response(body).arrayBuffer());
-          return Option.fromNullable(await bucket.put(key, bytes, options));
-        },
+        try: async () =>
+          Option.fromNullable(await putKnownLength(bucket, key, body, options)),
       }),
   });
 
@@ -184,7 +203,7 @@ export const makeRecordingsTest = (store: Store): Layer.Layer<Recordings> =>
         const meta = {
           checksums: { sha256: options.sha256 },
           httpMetadata: options.httpMetadata,
-          size: body instanceof Uint8Array ? body.byteLength : 0,
+          size: body instanceof Uint8Array ? body.byteLength : options.size,
         };
         write(store, key, meta);
         return Option.some(meta);

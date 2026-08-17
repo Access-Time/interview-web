@@ -6,6 +6,20 @@ import {
   Recordings,
 } from "../src/worker/recordings.ts";
 
+if (!("FixedLengthStream" in globalThis)) {
+  Object.defineProperty(globalThis, "FixedLengthStream", {
+    configurable: true,
+    value: class FixedLengthStream extends TransformStream<
+      Uint8Array,
+      Uint8Array
+    > {
+      constructor(_expectedLength: number | bigint) {
+        super();
+      }
+    },
+  });
+}
+
 it.effect(
   "Recordings.get fails MissingOrCorruptPart on checksum mismatch",
   () =>
@@ -82,6 +96,7 @@ it.effect(
           httpMetadata: { contentType: "video/webm" },
           onlyIf: { etagDoesNotMatch: "*" },
           sha256: "a".repeat(64),
+          size: 1,
         })
         .pipe(Effect.flip);
       expect(result._tag).toBe("RecordingsUnavailable");
@@ -93,41 +108,39 @@ it.effect(
   () =>
     Effect.gen(function* () {
       let received: unknown;
+      let receivedBytes: Uint8Array | undefined;
       const recordings = yield* Recordings.pipe(
         Effect.provide(
           makeRecordings({
-            put: (_key: string, body: unknown) => {
-              if (body instanceof ReadableStream) {
-                return Promise.reject(
-                  new TypeError(
-                    "Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)"
-                  )
-                );
-              }
+            put: async (_key: string, body: unknown) => {
               received = body;
-              return Promise.resolve({
-                size: (body as Uint8Array).byteLength,
-              });
+              if (!(body instanceof ReadableStream)) {
+                throw new TypeError("expected FixedLengthStream readable");
+              }
+              receivedBytes = new Uint8Array(
+                await new Response(body).arrayBuffer()
+              );
+              return { size: receivedBytes.byteLength };
             },
           } as never)
         )
       );
-      const result = yield* recordings.put(
-        "k",
-        new ReadableStream({
-          start(controller) {
-            controller.enqueue(new Uint8Array([1, 2, 3]));
-            controller.close();
-          },
-        }),
-        {
-          httpMetadata: { contentType: "video/webm" },
-          onlyIf: { etagDoesNotMatch: "*" },
-          sha256: "a".repeat(64),
-        }
-      );
+      const source = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.close();
+        },
+      });
+      const result = yield* recordings.put("k", source, {
+        httpMetadata: { contentType: "video/webm" },
+        onlyIf: { etagDoesNotMatch: "*" },
+        sha256: "a".repeat(64),
+        size: 3,
+      });
       expect(Option.isSome(result)).toBe(true);
-      expect(received).toEqual(new Uint8Array([1, 2, 3]));
+      expect(received).toBeInstanceOf(ReadableStream);
+      expect(received).not.toBe(source);
+      expect(receivedBytes).toEqual(new Uint8Array([1, 2, 3]));
     })
 );
 

@@ -446,10 +446,19 @@ export async function installMediaRecorder(page: Page) {
     window.__recordingTestState = { stoppedTracks: 0 };
 
     class TestTrack {
+      constructor(kind = "video") {
+        this.kind = kind;
+        this.id = crypto.randomUUID();
+      }
+      addEventListener() {
+        // Playwright fixture tracks do not emit ended events.
+      }
+      id: string;
+      kind: string;
+      removeEventListener() {
+        // Playwright fixture tracks do not emit ended events.
+      }
       private stops = 0;
-      readonly kind = "video";
-      readonly id = crypto.randomUUID();
-
       stop() {
         this.stops += 1;
         if (this.stops === 1) {
@@ -458,9 +467,34 @@ export async function installMediaRecorder(page: Page) {
       }
     }
 
-    const tracks = [new TestTrack(), new TestTrack()];
-    navigator.mediaDevices.getUserMedia = async () =>
-      ({ getTracks: () => tracks }) as unknown as MediaStream;
+    const fakeStream = (kinds: string[]) => {
+      const tracks = kinds.map((kind) => new TestTrack(kind));
+      return {
+        addTrack(track: { kind: string }) {
+          tracks.push(track as TestTrack);
+        },
+        getAudioTracks: () => tracks.filter((track) => track.kind === "audio"),
+        getTracks: () => tracks,
+        getVideoTracks: () => tracks.filter((track) => track.kind === "video"),
+      };
+    };
+
+    navigator.mediaDevices.getUserMedia = (constraints = {}) => {
+      const kinds: string[] = [];
+      if (constraints.video) {
+        kinds.push("video");
+      }
+      if (constraints.audio) {
+        kinds.push("audio");
+      }
+      return Promise.resolve(
+        fakeStream(
+          kinds.length > 0 ? kinds : ["video", "audio"]
+        ) as unknown as MediaStream
+      );
+    };
+    navigator.mediaDevices.getDisplayMedia = () =>
+      Promise.resolve(fakeStream(["video"]) as unknown as MediaStream);
 
     class TestMediaRecorder extends EventTarget {
       static isTypeSupported() {

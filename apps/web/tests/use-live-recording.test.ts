@@ -26,6 +26,7 @@ let storageEstimateOverride:
   | null = null;
 let cleanupPromise: Promise<void> | null = null;
 let mediaOverride: (() => Promise<MediaStream>) | null = null;
+let screenOverride: (() => Promise<MediaStream>) | null = null;
 let lastCommands: RecordingCommands | null = null;
 let unmountHook: (() => void) | null = null;
 let finalizeCalls = 0;
@@ -188,6 +189,28 @@ class FakeMediaRecorder extends EventTarget {
   }
 }
 
+function stubStream(): MediaStream {
+  const tracks = [
+    {
+      addEventListener: vi.fn(),
+      kind: "video" as const,
+      removeEventListener: vi.fn(),
+      stop: vi.fn(),
+    },
+    {
+      addEventListener: vi.fn(),
+      kind: "audio" as const,
+      removeEventListener: vi.fn(),
+      stop: vi.fn(),
+    },
+  ];
+  return {
+    getAudioTracks: () => tracks.filter((track) => track.kind === "audio"),
+    getTracks: () => tracks,
+    getVideoTracks: () => tracks.filter((track) => track.kind === "video"),
+  } as unknown as MediaStream;
+}
+
 function mount(
   writeFailsAfterPart = Number.POSITIVE_INFINITY,
   statusResults: Array<RecordingFinalizationState | null> = [],
@@ -221,12 +244,11 @@ function mount(
   Object.defineProperty(navigator, "mediaDevices", {
     configurable: true,
     value: {
+      getDisplayMedia: vi.fn(
+        () => screenOverride?.() ?? Promise.resolve(stubStream())
+      ),
       getUserMedia: vi.fn(
-        () =>
-          mediaOverride?.() ??
-          Promise.resolve({
-            getTracks: () => [{ stop: vi.fn() }],
-          } as unknown as MediaStream)
+        () => mediaOverride?.() ?? Promise.resolve(stubStream())
       ),
     },
   });
@@ -258,6 +280,12 @@ function mount(
   return records;
 }
 
+async function enableCapture() {
+  await act(async () => {
+    await latest?.initialize();
+  });
+}
+
 afterEach(() => {
   cleanup();
   latest = null;
@@ -272,6 +300,7 @@ afterEach(() => {
   storageEstimateOverride = null;
   cleanupPromise = null;
   mediaOverride = null;
+  screenOverride = null;
   lastCommands = null;
   unmountHook = null;
 });
@@ -298,10 +327,7 @@ it("reports a preflight access error without delivery state", async () => {
 
 it("completes a normal rendered recording", async () => {
   mount();
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   act(() => {
     latest?.start();
@@ -311,6 +337,40 @@ it("completes a normal rendered recording", async () => {
   await act(() => latest?.stop());
   await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
   expect(finalizeCalls).toBe(1);
+});
+
+it("completes a screen-only recording without enabling the camera", async () => {
+  mount();
+  await act(async () => {
+    await latest?.shareScreen();
+  });
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  expect(latest?.captureSource).toBe("screen");
+  expect(latest?.isReady).toBe(true);
+  act(() => {
+    latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("screen");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
+});
+
+it("completes a screen-only recording without enabling the camera", async () => {
+  mount();
+  await act(async () => {
+    await latest?.shareScreen();
+  });
+  await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
+  expect(latest?.captureSource).toBe("screen");
+  expect(latest?.isReady).toBe(true);
+  act(() => {
+    latest?.start();
+  });
+  await waitFor(() => expect(latest?.isRecording).toBe(true));
+  FakeMediaRecorder.last?.emitPart("screen");
+  await act(() => latest?.stop());
+  await waitFor(() => expect(latest?.finalization?.state).toBe("ready"));
 });
 
 const storedRecording = (
@@ -357,7 +417,7 @@ it("automatically clears typed-missing recovery and returns to normal setup", as
   const records = mount(Number.POSITIVE_INFINITY, [], "ready", [
     storedRecording("missing"),
   ]);
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.canResetRecoveredRecording).toBe(false));
   expect(latest?.recovered).toBe(false);
   expect(records.sessions.has("missing")).toBe(false);
@@ -369,7 +429,7 @@ it("automatically clears typed-missing recovery and returns to normal setup", as
 it("keeps a non-missing recovery failure blocking through initialization and Start", async () => {
   manifestOverride = () => Promise.reject(new Error("manifest unavailable"));
   mount(Number.POSITIVE_INFINITY, [], "ready", [storedRecording("blocked")]);
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.error).toContain("manifest unavailable"));
   await expect(latest?.start()).rejects.toThrow("manifest unavailable");
   expect(lastCommands?.createSession).not.toHaveBeenCalled();
@@ -412,7 +472,7 @@ it("restores recovery failure after an early device error and later media succes
     Promise.resolve({
       getTracks: () => [{ stop: vi.fn() }],
     } as unknown as MediaStream);
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.error).toContain("recovery unavailable"));
   await act(async () => {
     await expect(latest?.start()).rejects.toThrow("recovery unavailable");
@@ -424,7 +484,7 @@ it("restores recovery failure after an early device error and later media succes
 it("blocks a fresh preflight without remote creation or recorder start", async () => {
   storageEstimateOverride = () => Promise.resolve({ quota: 1, usage: 1 });
   mount();
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("blocked"));
   await act(async () => latest?.start());
   expect(lastCommands?.createSession).not.toHaveBeenCalled();
@@ -442,7 +502,7 @@ it("fails closed when unmount interrupts a fresh Start preflight", async () => {
       : pendingEstimate.promise;
   };
   const records = mount();
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   let start: Promise<void> | undefined;
   act(() => {
@@ -462,7 +522,7 @@ it("fails closed when unmount interrupts a fresh Start preflight", async () => {
 
 it("safety-stops after a fresh invalid capacity estimate", async () => {
   mount();
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => latest?.start());
   await waitFor(() => expect(latest?.isRecording).toBe(true));
@@ -475,7 +535,7 @@ it("safety-stops after a fresh invalid capacity estimate", async () => {
 
 it("safety-stops after a fresh valid low-capacity estimate", async () => {
   mount();
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => latest?.start());
   await waitFor(() => expect(latest?.isRecording).toBe(true));
@@ -489,10 +549,7 @@ it("shares an in-flight rendered start", async () => {
   const create = deferred<void>();
   createSessionOverride = () => create.promise;
   mount();
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   let first: Promise<void> | undefined;
   let second: Promise<void> | undefined;
@@ -516,7 +573,7 @@ it("keeps ready state when local cleanup fails", async () => {
   const cleanupDeferred = deferred<void>();
   cleanupPromise = cleanupDeferred.promise;
   mount();
-  await act(async () => latest?.initialize());
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => latest?.start());
   await waitFor(() => expect(latest?.isRecording).toBe(true));
@@ -548,10 +605,7 @@ it("submits every recovered sealed plan when each finalizes immediately", async 
 it("keeps remote failed finalization retryable", async () => {
   finalizeStatuses = ["failed", "ready"];
   mount(Number.POSITIVE_INFINITY, [], "failed");
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => latest?.start());
   await waitFor(() => expect(latest?.isRecording).toBe(true));
@@ -567,10 +621,7 @@ it("keeps remote failed finalization retryable", async () => {
 it("offers manual retry after rendered finalization failure", async () => {
   finalizeFailure = true;
   mount();
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   act(() => {
     latest?.start();
@@ -588,10 +639,7 @@ it("offers manual retry after rendered finalization failure", async () => {
 
 it("keeps polling through a missing status until finalization is ready", async () => {
   mount(Number.POSITIVE_INFINITY, [null, "queued", "ready"], "queued");
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   await act(async () => {
     await latest?.start();
@@ -607,10 +655,7 @@ it("keeps polling through a missing status until finalization is ready", async (
 
 it("reports a rendered local write failure", async () => {
   mount(0);
-  await act(async () => {
-    latest?.initialize();
-    await Promise.resolve();
-  });
+  await enableCapture();
   await waitFor(() => expect(latest?.recordingPreflightState).toBe("ready"));
   act(() => {
     latest?.start();

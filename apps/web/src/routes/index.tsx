@@ -6,6 +6,7 @@ import {
   getDeliveryPresentation,
 } from "@/recording/candidate-recording-journey";
 import {
+  type RecordingCaptureSource,
   type RecordingFinalizationState,
   type RecordingJourneyOutcome,
   type RecordingPreflightState,
@@ -24,10 +25,12 @@ type PendingAction =
   | "initialize"
   | "retry"
   | "retry-preflight"
+  | "share-screen"
   | "start"
   | "stop";
 
 const PERMISSION_ERROR = /permission|notallowed|denied|security/;
+const SCREEN_ERROR = /screen|display/;
 const DEVICE_ERROR = /notfound|device|camera|microphone|media/;
 const STORAGE_ERROR = /storage|quota|indexeddb|store/;
 const INTEGRITY_ERROR = /conflicting parts|missing ordered parts/;
@@ -43,11 +46,27 @@ export function usefulError(error: unknown): CandidateError {
   const normalized = detail.toLowerCase();
 
   if (PERMISSION_ERROR.test(normalized)) {
+    if (SCREEN_ERROR.test(normalized)) {
+      return {
+        captureBlocked: false,
+        message:
+          "Screen sharing was blocked. Allow it in your browser, then share the window or display you want to record.",
+        title: "Screen sharing blocked",
+      };
+    }
     return {
       captureBlocked: false,
       message:
         "Camera and microphone access was blocked. Allow both in your browser settings, then try again.",
       title: "Camera and microphone access blocked",
+    };
+  }
+  if (SCREEN_ERROR.test(normalized)) {
+    return {
+      captureBlocked: false,
+      message:
+        "We couldn’t start screen sharing. Check that this browser supports it, then try again.",
+      title: "Screen sharing unavailable",
     };
   }
   if (DEVICE_ERROR.test(normalized)) {
@@ -83,6 +102,7 @@ export function usefulError(error: unknown): CandidateError {
 }
 
 function mapDeliveryHandoff(input: {
+  captureSource?: RecordingCaptureSource | null;
   finalizationState?: RecordingFinalizationState | "idle";
   hasIncompleteRecordingFinalization?: boolean;
   hasUnsentRecordingMedia?: boolean;
@@ -91,6 +111,7 @@ function mapDeliveryHandoff(input: {
   recordingStopReason?: RecordingStopReason;
 }) {
   const presentation = getDeliveryPresentation({
+    captureSource: input.captureSource,
     finalization:
       input.finalizationState && input.finalizationState !== "idle"
         ? { state: input.finalizationState }
@@ -123,6 +144,7 @@ function mapDeliveryHandoff(input: {
 export function candidateJourneyHandoff(input: {
   actionError?: CandidateError | null;
   captureEnded?: boolean;
+  captureSource?: RecordingCaptureSource | null;
   controlsHasStopped?: boolean;
   finalizationState?: RecordingFinalizationState | "idle";
   hasIncompleteRecordingFinalization?: boolean;
@@ -195,6 +217,11 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
     onError: (error) => setActionError(usefulError(error)),
     onMutate: () => setActionError(null),
   });
+  const shareScreen = useMutation({
+    mutationFn: recording.shareScreen,
+    onError: (error) => setActionError(usefulError(error)),
+    onMutate: () => setActionError(null),
+  });
   const start = useMutation({
     mutationFn: recording.start,
     onError: (error) => setActionError(usefulError(error)),
@@ -223,6 +250,8 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
   let pendingAction: PendingAction | null = null;
   if (initialize.isPending) {
     pendingAction = "initialize";
+  } else if (shareScreen.isPending) {
+    pendingAction = "share-screen";
   } else if (start.isPending) {
     pendingAction = "start";
   } else if (stop.isPending) {
@@ -238,6 +267,7 @@ function useRecordingControls(recording: UseLiveRecordingResult) {
     handleInitialize: initialize.mutate,
     handleRetryFinalization: retry.mutate,
     handleRetryPreflight: retryPreflight.mutate,
+    handleShareScreen: shareScreen.mutate,
     handleStart: start.mutate,
     handleStop: stop.mutate,
     hasStopped,
@@ -253,6 +283,7 @@ function HomeComponent() {
   const handoff = candidateJourneyHandoff({
     actionError: controls.actionError,
     captureEnded: recording.captureEnded,
+    captureSource: recording.captureSource,
     controlsHasStopped: controls.hasStopped,
     finalizationState,
     hasIncompleteRecordingFinalization:
@@ -288,6 +319,7 @@ function HomeComponent() {
       blockingError={handoff.blockingError}
       blockingErrorTitle={handoff.blockingErrorTitle}
       captureBlocked={handoff.captureBlocked}
+      captureSource={recording.captureSource}
       finalization={recording.finalization}
       hasIncompleteRecordingFinalization={
         recording.hasIncompleteRecordingFinalization
@@ -305,6 +337,7 @@ function HomeComponent() {
       }
       onRetry={controls.handleRetryFinalization}
       onRetryPreflight={controls.handleRetryPreflight}
+      onShareScreen={controls.handleShareScreen}
       onStart={controls.handleStart}
       onStop={controls.handleStop}
       pendingAction={controls.pendingAction}

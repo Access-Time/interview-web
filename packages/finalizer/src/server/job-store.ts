@@ -1,0 +1,274 @@
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream, promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Effect, Layer, Option } from "effect";
+import {
+  InputTooLarge,
+  JobNotOpen,
+  PartAlreadyDiffers,
+} from "../domain/errors.ts";
+
+const maxJobBytes = 2 * 1024 * 1024 * 1024;
+type AsyncTask<A> = () => Promise<A>;
+
+export interface StoredOutput {
+  readonly checksum: string;
+  readonly mediaType: "video/webm" | "video/mp4";
+  readonly path: string;
+  readonly size: number;
+}
+interface PartInput {
+  bytes: Uint8Array;
+  checksum: string;
+  job: string;
+  segment: number;
+  sequence: number;
+}
+export type PutPartOutcome = "created" | "idempotent";
+export type JobStatus = "open" | "sealing" | "done" | "failed";
+interface Store {
+  assembleSegment: (input: {
+    job: string;
+    segment: number;
+    partIndexes: readonly number[];
+  }) => Effect.Effect<{ path: string }, Error | JobNotOpen>;
+  beginSeal: (job: string) => Effect.Effect<void, Error | JobNotOpen>;
+  deleteJob: (job: string) => Effect.Effect<void>;
+  getOutput: (job: string) => Effect.Effect<Option.Option<StoredOutput>, Error>;
+  getStatus: (job: string) => Effect.Effect<JobStatus, Error>;
+  listParts: (job: string) => Effect.Effect<readonly string[], Error>;
+  putPart: (input: PartInput) => Effect.Effect<PutPartOutcome, Error>;
+  reopen: (job: string) => Effect.Effect<void, Error>;
+  setFailed: (job: string) => Effect.Effect<void, Error>;
+  setOutput: (input: {
+    job: string;
+    output: StoredOutput;
+  }) => Effect.Effect<void, Error | JobNotOpen>;
+}
+
+const makeStore = (root: string): Store => {
+  const locks = new Map<string, Promise<void>>();
+  const withJobLock = async <A>(
+    job: string,
+    task: AsyncTask<A>
+  ): Promise<A> => {
+    const previous = locks.get(job) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    locks.set(job, current);
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (locks.get(job) === current) {
+        locks.delete(job);
+      }
+    }
+  };
+  const dir = (job: string) => path.join(root, job);
+  const state = (job: string) => path.join(dir(job), "state.json");
+  const readState = (job: string) =>
+    fs.readFile(state(job), "utf8").then(JSON.parse) as Promise<{
+      status: string;
+      output?: StoredOutput;
+    }>;
+  const ensureState = async (job: string) => {
+    await fs.mkdir(dir(job), { recursive: true });
+    try {
+      return await readState(job);
+    } catch {
+      await fs.writeFile(state(job), JSON.stringify({ status: "open" }), {
+        flag: "wx",
+      });
+      return { status: "open" };
+    }
+  };
+  const isWritable = (status: string) =>
+    status === "open" || status === "sealing";
+  const putPart = (input: PartInput) =>
+    Effect.tryPromise({
+      catch: (error) =>
+        error instanceof PartAlreadyDiffers ||
+        error instanceof JobNotOpen ||
+        error instanceof InputTooLarge
+          ? error
+          : new Error(String(error)),
+      try: () =>
+        withJobLock(
+          input.job,
+          // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered filesystem validation.
+          async () => {
+            const current = await ensureState(input.job);
+            if (current.status !== "open") {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            const file = path.join(
+              dir(input.job),
+              `part-${input.segment}-${input.sequence}.bin`
+            );
+            try {
+              const existing = await fs.readFile(file);
+              if (
+                existing.byteLength !== input.bytes.byteLength ||
+                createHash("sha256").update(existing).digest("hex") !==
+                  input.checksum
+              ) {
+                throw new PartAlreadyDiffers({
+                  message: "part already differs",
+                });
+              }
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                throw error;
+              }
+              const names = await fs.readdir(dir(input.job));
+              const partNames = names.filter(
+                (name) => name.startsWith("part-") && name.endsWith(".bin")
+              );
+              let total = 0;
+              for (const name of partNames) {
+                // biome-ignore lint/performance/noAwaitInLoops: accounting is serialized per job.
+                total += (await fs.stat(path.join(dir(input.job), name))).size;
+                if (total + input.bytes.byteLength > maxJobBytes) {
+                  // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
+                  throw new InputTooLarge({ message: "job too large" });
+                }
+              }
+              await fs.writeFile(file, input.bytes, { flag: "wx" });
+              return "created";
+            }
+            return "idempotent";
+          }
+        ),
+    });
+  return {
+    assembleSegment: (input) =>
+      Effect.tryPromise({
+        catch: (error) =>
+          error instanceof JobNotOpen ? error : new Error(String(error)),
+        try: () =>
+          withJobLock(input.job, async () => {
+            const current = await ensureState(input.job);
+            if (!isWritable(current.status)) {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            const files = input.partIndexes.map((n) =>
+              path.join(dir(input.job), `part-${input.segment}-${n}.bin`)
+            );
+            if (files.length === 1) {
+              return { path: files[0] as string };
+            }
+            const output = path.join(
+              dir(input.job),
+              `assembled-${input.segment}.bin`
+            );
+            await fs.writeFile(output, Buffer.alloc(0));
+            for (const file of files) {
+              // biome-ignore lint/performance/noAwaitInLoops: parts must be appended in manifest order.
+              await pipeline(
+                createReadStream(file),
+                createWriteStream(output, { flags: "a" })
+              );
+            }
+            return { path: output };
+          }),
+      }),
+    beginSeal: (job) =>
+      Effect.tryPromise({
+        catch: (error) =>
+          error instanceof JobNotOpen ? error : new Error(String(error)),
+        try: () =>
+          withJobLock(job, async () => {
+            const current = await ensureState(job);
+            if (current.status !== "open") {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            await fs.writeFile(
+              state(job),
+              JSON.stringify({ status: "sealing" })
+            );
+          }),
+      }),
+    deleteJob: (job) =>
+      Effect.promise(() => fs.rm(dir(job), { force: true, recursive: true })),
+    getOutput: (job) =>
+      Effect.tryPromise(async () => {
+        try {
+          const value = JSON.parse(await fs.readFile(state(job), "utf8"));
+          return value.output ? Option.some(value.output) : Option.none();
+        } catch {
+          return Option.none();
+        }
+      }),
+    getStatus: (job) =>
+      Effect.tryPromise(() =>
+        withJobLock(
+          job,
+          async () => (await ensureState(job)).status as JobStatus
+        )
+      ),
+    listParts: (job) =>
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          if (!isWritable(current.status)) {
+            throw new JobNotOpen({ message: "job is not open" });
+          }
+          return (await fs.readdir(dir(job))).filter(
+            (file) => file.startsWith("part-") && file.endsWith(".bin")
+          );
+        })
+      ),
+    putPart,
+    reopen: (job) =>
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          if (current.status === "sealing") {
+            await fs.writeFile(state(job), JSON.stringify({ status: "open" }));
+          }
+        })
+      ),
+    setFailed: (job) =>
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          await fs.writeFile(
+            state(job),
+            JSON.stringify({ output: current.output ?? null, status: "failed" })
+          );
+        })
+      ),
+    setOutput: (input) =>
+      Effect.tryPromise({
+        catch: (error) =>
+          error instanceof JobNotOpen ? error : new Error(String(error)),
+        try: () =>
+          withJobLock(input.job, async () => {
+            const current = await ensureState(input.job);
+            if (!isWritable(current.status)) {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            await fs.writeFile(
+              state(input.job),
+              JSON.stringify({ output: input.output, status: "done" })
+            );
+          }),
+      }),
+  };
+};
+
+export class JobStore extends Effect.Service<JobStore>()("JobStore", {
+  accessors: true,
+  effect: Effect.succeed(
+    makeStore(path.join(os.tmpdir(), "recording-finalizer"))
+  ),
+}) {}
+
+export const makeJobStoreTest = (root: string): Layer.Layer<JobStore> =>
+  Layer.succeed(JobStore, makeStore(root) as unknown as JobStore);

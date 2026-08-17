@@ -79,6 +79,14 @@ export class QueueSendFailed extends Schema.TaggedError<QueueSendFailed>()(
   "QueueSendFailed",
   { message: Schema.String }
 ) {}
+export class RecordingsUnavailable extends Schema.TaggedError<RecordingsUnavailable>()(
+  "RecordingsUnavailable",
+  { message: Schema.String }
+) {}
+export class FinalizerDbUnavailable extends Schema.TaggedError<FinalizerDbUnavailable>()(
+  "FinalizerDbUnavailable",
+  { message: Schema.String }
+) {}
 
 const terminalTags = new Set([
   "InvalidManifest",

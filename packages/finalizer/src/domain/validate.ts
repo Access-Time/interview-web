@@ -97,22 +97,3 @@ export function decodeFinalizePlan(
     return plan;
   });
 }
-
-export function validateManifest(manifest: unknown): number {
-  const decoded = Effect.runSync(decodeManifest(manifest));
-  return decoded.segments.reduce(
-    (total, segment) =>
-      total + segment.parts.reduce((sum, part) => sum + part.byteSize, 0),
-    0
-  );
-}
-
-export function validateFinalizePlan(
-  manifest: unknown,
-  planJson: unknown
-): FinalizePlan {
-  const decodedManifest = Effect.runSync(decodeManifest(manifest));
-  return Effect.runSync(decodeFinalizePlan(decodedManifest, planJson));
-}
-
-export const TerminalFinalizationError = InvalidManifest;

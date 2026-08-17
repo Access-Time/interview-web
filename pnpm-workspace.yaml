@@ -5,6 +5,8 @@ allowBuilds:
   esbuild: true
   sharp: true
   workerd: true
+  "@parcel/watcher": true
+  msgpackr-extract: true
 catalog:
   dotenv: ^17.4.2
   zod: ^4.4.3

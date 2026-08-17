@@ -26,6 +26,7 @@
     "destroy": "turbo run destroy -F @interview-web/infra",
     "check": "ultracite check",
     "test": "turbo run test",
+    "test:e2e": "pnpm --filter web test:e2e",
     "fix": "ultracite fix",
     "prepare": "husky"
   },

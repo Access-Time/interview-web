@@ -10,9 +10,14 @@
   },
   "dependencies": {
     "@cloudflare/containers": "0.3.7",
-    "@interview-web/db": "workspace:*"
+    "@effect/platform": "^0.97.1",
+    "@effect/platform-node": "^0.108.1",
+    "@interview-web/db": "workspace:*",
+    "effect": "^3.22.1"
   },
   "devDependencies": {
+    "@effect/language-service": "^0.87.2",
+    "@effect/vitest": "^0.30.0",
     "@interview-web/config": "workspace:*",
     "typescript": "catalog:",
     "vitest": "^3.2.4"

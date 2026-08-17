@@ -204,8 +204,11 @@ it("media type defaults safely and exact output matching is strict", () => {
     ],
     sessionId: "s",
   };
-  const [segment] = base.segments;
-  const [part] = segment.parts;
+  const segment = base.segments.find(() => true);
+  const part = segment?.parts.find(() => true);
+  if (!(segment && part)) {
+    throw new Error("expected segment part");
+  }
   expect(outputMediaType(base)).toBe("video/webm");
   expect(
     outputMediaType({
@@ -319,29 +322,31 @@ describe("processFinalization publication", () => {
     const release = vi.fn().mockResolvedValue(true);
     await processFinalization({
       containerForAttempt: () => ({
-        fetch: (input, init) => {
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => {
           const path = (input instanceof URL ? input : new URL(String(input)))
             .pathname;
           const method = init?.method ?? "GET";
           if (method === "PUT" && path.includes("/parts/")) {
-            return new Response(null, { status: 201 });
+            return Promise.resolve(new Response(null, { status: 201 }));
           }
           if (method === "POST" && path.endsWith("/finalize")) {
-            return Response.json({ finalized: true });
+            return Promise.resolve(Response.json({ finalized: true }));
           }
           if (method === "GET" && path.endsWith("/output")) {
-            return new Response(outputBytes, {
-              headers: {
-                "content-length": String(outputBytes.byteLength),
-                "content-type": "video/webm",
-                "x-content-sha256": outputChecksum,
-              },
-            });
+            return Promise.resolve(
+              new Response(outputBytes, {
+                headers: {
+                  "content-length": String(outputBytes.byteLength),
+                  "content-type": "video/webm",
+                  "x-content-sha256": outputChecksum,
+                },
+              })
+            );
           }
           if (method === "DELETE") {
-            return new Response(null, { status: 204 });
+            return Promise.resolve(new Response(null, { status: 204 }));
           }
-          return new Response(null, { status: 404 });
+          return Promise.resolve(new Response(null, { status: 404 }));
         },
       }),
       db: {} as never,
@@ -349,20 +354,28 @@ describe("processFinalization publication", () => {
         claim: async () => ({
           attempt: 1,
           finalizePlan: JSON.stringify([{ partCount: 1, segmentId: "seg" }]),
+          leaseExpiresAt: Date.now() + 300_000,
           manifest: {
+            createdAt: 1,
             segments: [
               {
+                createdAt: 1,
                 id: "seg",
                 index: 0,
                 parts: [
                   {
                     byteSize: partBytes.byteLength,
                     checksum: partChecksum,
+                    createdAt: 1,
+                    etag: "etag",
+                    id: "part-0",
                     mediaType: "video/webm",
                     objectKey: "part-0",
                     sequence: 0,
                   },
                 ],
+                recorderMimeType: "video/webm",
+                requestedMimeType: null,
               },
             ],
             sessionId: "s1",

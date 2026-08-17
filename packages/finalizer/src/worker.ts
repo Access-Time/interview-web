@@ -78,32 +78,6 @@ export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
   return getContainer(env.FINALIZER);
 }
 
-function hex(bytes: ArrayBuffer) {
-  return [...new Uint8Array(bytes)]
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-}
-export async function sha256(stream: ReadableStream<Uint8Array>) {
-  const chunks: Uint8Array[] = [];
-  const reader = stream.getReader();
-  let size = 0;
-  for (;;) {
-    // biome-ignore lint/performance/noAwaitInLoops: stream reads are inherently sequential.
-    const n = await reader.read();
-    if (n.done) {
-      break;
-    }
-    chunks.push(n.value);
-    size += n.value.byteLength;
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return hex(await crypto.subtle.digest("SHA-256", bytes));
-}
 class TransientFinalizationError extends Error {
   terminal = false;
 }
@@ -256,13 +230,6 @@ export async function processFinalization(input: {
       mediaType: type,
       objectKey: outputKey,
     };
-    const payload = new Uint8Array(await out.arrayBuffer());
-    if (payload.byteLength !== size) {
-      throw new TransientFinalizationError("output size mismatch");
-    }
-    if (hex(await crypto.subtle.digest("SHA-256", payload)) !== checksum) {
-      throw new TransientFinalizationError("output checksum mismatch");
-    }
     const exact = (meta: Omit<FinalizerObject, "body"> | null) =>
       isExactPublishedObject(meta, {
         checksum,
@@ -272,7 +239,7 @@ export async function processFinalization(input: {
     let written: Omit<FinalizerObject, "body"> | null = null;
     let publishError: unknown;
     try {
-      written = await input.recordings.put(outputKey, payload, {
+      written = await input.recordings.put(outputKey, out.body, {
         httpMetadata: { contentType: type },
         onlyIf: { etagDoesNotMatch: "*" },
         sha256: checksum,

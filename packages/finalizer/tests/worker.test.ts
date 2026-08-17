@@ -392,14 +392,11 @@ describe("processFinalization publication", () => {
     return { complete, outputChecksum, release };
   };
 
-  it("buffers container output so R2 put does not need the live stream", async () => {
+  it("streams container output to R2 with the container checksum", async () => {
     const puts: unknown[] = [];
     const { complete, outputChecksum } = await setup({
       put: async (_key, value) => {
         puts.push(value);
-        if (value instanceof ReadableStream) {
-          throw new Error("ReadableStream cannot be piped to local R2");
-        }
         return {
           checksums: {
             sha256: await crypto.subtle.digest("SHA-256", outputBytes),
@@ -409,7 +406,7 @@ describe("processFinalization publication", () => {
         };
       },
     });
-    expect(puts[0] instanceof Uint8Array).toBe(true);
+    expect(puts[0] instanceof ReadableStream).toBe(true);
     expect(complete).toHaveBeenCalledExactlyOnceWith(
       {},
       expect.objectContaining({

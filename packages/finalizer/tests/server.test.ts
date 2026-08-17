@@ -11,6 +11,7 @@ import {
   request as httpRequest,
   type IncomingMessage,
 } from "node:http";
+import { connect as tcpConnect } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { NodeHttpServer } from "@effect/platform-node";
@@ -28,6 +29,7 @@ interface Response {
 }
 interface Harness {
   close: () => Promise<void>;
+  port: number;
   request: (
     method: string,
     route: string,
@@ -38,6 +40,7 @@ interface Harness {
 }
 const harnesses: Harness[] = [];
 const sha = (body: Buffer) => createHash("sha256").update(body).digest("hex");
+const httpStatusPattern = /^HTTP\/1\.1 (\d+)/;
 
 async function harness(
   failFfmpeg = false,
@@ -102,6 +105,7 @@ async function harness(
     });
   const value = {
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    port: address.port,
     request,
     root,
   };
@@ -202,6 +206,47 @@ it("rejects chunked oversized bodies without accepting parts", async () => {
     { "content-type": "application/json" }
   );
   expect(chunked.status).toBe(413);
+  expect((await finalize(h)).status).toBe(409);
+});
+
+it("rejects a declared oversized part before its body is transmitted", async () => {
+  const h = await harness();
+  const declaredLength = 512 * 1024 * 1024 + 1;
+  const response = await new Promise<number>((resolve, reject) => {
+    const socket = tcpConnect(h.port, "127.0.0.1");
+    let headers = "";
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("timed out waiting for early oversized response"));
+    }, 2000);
+    socket.on("connect", () => {
+      socket.write(
+        [
+          "PUT /jobs/job/parts/0/0 HTTP/1.1",
+          "Host: 127.0.0.1",
+          `Content-Length: ${declaredLength}`,
+          `x-content-sha256: ${"0".repeat(64)}`,
+          "Connection: close",
+          "",
+          "",
+        ].join("\r\n")
+      );
+    });
+    socket.on("data", (chunk) => {
+      headers += chunk.toString();
+      const firstLine = headers.match(httpStatusPattern);
+      if (firstLine) {
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(Number(firstLine[1]));
+      }
+    });
+    socket.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+  expect(response).toBe(413);
   expect((await finalize(h)).status).toBe(409);
 });
 

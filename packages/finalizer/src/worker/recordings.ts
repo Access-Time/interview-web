@@ -115,8 +115,14 @@ export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
     put: (key, body, options) =>
       Effect.tryPromise({
         catch: unavailable,
-        try: async () =>
-          Option.fromNullable(await bucket.put(key, body, options)),
+        try: async () => {
+          // ponytail: buffer stream; FixedLengthStream if worker memory becomes the limit
+          const bytes =
+            body instanceof Uint8Array
+              ? body
+              : new Uint8Array(await new Response(body).arrayBuffer());
+          return Option.fromNullable(await bucket.put(key, bytes, options));
+        },
       }),
   });
 

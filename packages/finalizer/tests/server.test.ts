@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdtemp,
@@ -14,6 +15,7 @@ import {
 import { connect as tcpConnect } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { NodeHttpServer } from "@effect/platform-node";
 import { Effect } from "effect";
 import { afterEach, expect, it } from "vitest";
@@ -402,4 +404,85 @@ it("rejects an overlapping finalize without a startup sleep", async () => {
   expect((await upload(h, 0, 1, Buffer.from("later"))).status).toBe(409);
   release();
   expect((await first).status).toBe(200);
+});
+
+it("boots the CJS bundle without a dynamic require crash", async () => {
+  const root = path.dirname(fileURLToPath(import.meta.url));
+  const bundle = path.join(root, "../output/server.cjs");
+  await new Promise<void>((resolve, reject) => {
+    const build = spawn("pnpm", ["build:server"], {
+      cwd: path.join(root, ".."),
+      stdio: "inherit",
+    });
+    build.on("exit", (code) =>
+      code === 0 ? resolve() : reject(new Error(`build:server exited ${code}`))
+    );
+  });
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("probe did not bind"));
+        return;
+      }
+      probe.close(() => resolve(address.port));
+    });
+  });
+  const child = spawn("node", [bundle], {
+    env: { ...process.env, PORT: String(port) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stderr: Buffer[] = [];
+  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const fail = (error: Error) => {
+        clearInterval(timer);
+        reject(error);
+      };
+      child.once("exit", (code) =>
+        fail(
+          new Error(
+            `bundle exited ${code}: ${Buffer.concat(stderr).toString()}`
+          )
+        )
+      );
+      const timer = setInterval(() => {
+        const socket = tcpConnect({ host: "127.0.0.1", port }, () => {
+          socket.end();
+          clearInterval(timer);
+          resolve();
+        });
+        socket.on("error", () => undefined);
+      }, 50);
+      setTimeout(
+        () =>
+          fail(new Error(Buffer.concat(stderr).toString() || "boot timeout")),
+        5000
+      );
+    });
+    const health = await new Promise<Response>((resolve, reject) => {
+      const req = httpRequest(
+        { host: "127.0.0.1", method: "GET", path: "/health", port },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer) => chunks.push(chunk));
+          response.on("end", () =>
+            resolve({
+              body: Buffer.concat(chunks),
+              headers: response.headers,
+              status: response.statusCode ?? 0,
+            })
+          );
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+    expect(health.status).toBe(204);
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
 });

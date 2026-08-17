@@ -89,6 +89,49 @@ it.effect(
 );
 
 it.effect(
+  "makeRecordings.put gives R2 a known-length body for fetch streams",
+  () =>
+    Effect.gen(function* () {
+      let received: unknown;
+      const recordings = yield* Recordings.pipe(
+        Effect.provide(
+          makeRecordings({
+            put: (_key: string, body: unknown) => {
+              if (body instanceof ReadableStream) {
+                return Promise.reject(
+                  new TypeError(
+                    "Provided readable stream must have a known length (request/response body or readable half of FixedLengthStream)"
+                  )
+                );
+              }
+              received = body;
+              return Promise.resolve({
+                size: (body as Uint8Array).byteLength,
+              });
+            },
+          } as never)
+        )
+      );
+      const result = yield* recordings.put(
+        "k",
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            controller.close();
+          },
+        }),
+        {
+          httpMetadata: { contentType: "video/webm" },
+          onlyIf: { etagDoesNotMatch: "*" },
+          sha256: "a".repeat(64),
+        }
+      );
+      expect(Option.isSome(result)).toBe(true);
+      expect(received).toEqual(new Uint8Array([1, 2, 3]));
+    })
+);
+
+it.effect(
   "makeRecordings maps bucket.delete rejection to RecordingsUnavailable",
   () =>
     Effect.gen(function* () {

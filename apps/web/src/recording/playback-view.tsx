@@ -4,12 +4,12 @@ import type {
   RecordingPlaybackSummary,
 } from "@interview-web/db";
 import { Link } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   isPlaybackReady,
   playbackDetailKind,
   playbackStatusLabel,
-  recordingSubmissionUrl,
+  preparePlaybackObjectUrl,
 } from "./playback";
 
 export type PlaybackListErrorKind = "initial" | "load-more" | null;
@@ -202,40 +202,73 @@ function PlayableRecording({
   summary: RecordingPlaybackSummary;
 }) {
   const [failedForNonce, setFailedForNonce] = useState<number | null>(null);
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const handleMediaError = useCallback(() => {
     setFailedForNonce(retryNonce);
   }, [retryNonce]);
   const playbackFailed = mediaFailed || failedForNonce === retryNonce;
 
+  useEffect(() => {
+    let cancelled = false;
+    let createdUrl: string | null = null;
+    setObjectUrl(null);
+    setFailedForNonce(null);
+    preparePlaybackObjectUrl(summary.id, summary.outputMediaType)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        createdUrl = url;
+        setObjectUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailedForNonce(retryNonce);
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (createdUrl) {
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
+  }, [retryNonce, summary.id, summary.outputMediaType]);
+
+  let media: React.JSX.Element;
+  if (playbackFailed) {
+    media = (
+      <div className="grid gap-4">
+        <p className="text-sm text-white/80">{UNAVAILABLE_MESSAGE}</p>
+        <Button
+          className={`${actionClassName} w-fit`}
+          onClick={onRetryPlayback}
+          type="button"
+        >
+          Try playback again
+        </Button>
+      </div>
+    );
+  } else if (objectUrl) {
+    media = (
+      // biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source.
+      <video
+        aria-label="Recording playback"
+        className="aspect-video w-full rounded-xl bg-black"
+        controls
+        key={retryNonce}
+        onError={handleMediaError}
+        preload="auto"
+        src={objectUrl}
+      />
+    );
+  } else {
+    media = <p className="text-sm text-white/70">Preparing playback.</p>;
+  }
+
   return (
     <div className="grid gap-6">
-      {playbackFailed ? (
-        <div className="grid gap-4">
-          <p className="text-sm text-white/80">{UNAVAILABLE_MESSAGE}</p>
-          <Button
-            className={`${actionClassName} w-fit`}
-            onClick={onRetryPlayback}
-            type="button"
-          >
-            Try playback again
-          </Button>
-        </div>
-      ) : (
-        // biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source.
-        <video
-          aria-label="Recording playback"
-          className="aspect-video w-full rounded-xl bg-black"
-          controls
-          key={retryNonce}
-          onError={handleMediaError}
-          preload="metadata"
-        >
-          <source
-            src={recordingSubmissionUrl(summary.id)}
-            type={summary.outputMediaType ?? undefined}
-          />
-        </video>
-      )}
+      {media}
       <div className="grid gap-1.5">
         <time
           className="text-sm text-white/80"

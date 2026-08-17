@@ -2,6 +2,7 @@ import { Effect, Layer } from "effect";
 import type { Sha256Hex } from "../domain/brands.ts";
 import { ContainerRejected, InvalidContainerOutput } from "../domain/errors.ts";
 import { normalizeSha256Checksum } from "../domain/media.ts";
+import { makeWebmSeekable } from "../domain/webm-seekable.ts";
 import { ContainerClient, type ContainerOutput } from "./container.ts";
 
 interface JobState {
@@ -83,7 +84,11 @@ export const makePassthroughContainerClient =
               rejected("uploaded parts do not exactly match finalize plan")
             );
           }
-          const bytes = concat(assembled);
+          const assembledBytes = concat(assembled);
+          const bytes =
+            input.outputMediaType === "video/webm"
+              ? makeWebmSeekable(assembledBytes)
+              : assembledBytes;
           const checksum = yield* Effect.tryPromise({
             catch: () => rejected("output checksum unavailable"),
             try: () => digest(bytes),

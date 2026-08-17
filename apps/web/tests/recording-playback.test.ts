@@ -5,6 +5,7 @@ import {
   playbackDetailKind,
   playbackStatusLabel,
   playbackSummaryLookup,
+  preparePlaybackObjectUrl,
   recordingSubmissionUrl,
 } from "../src/recording/playback";
 
@@ -66,6 +67,21 @@ it("builds an encoded same-origin submission URL", () => {
   expect(recordingSubmissionUrl("session/a?b")).toBe(
     "/api/recordings/session%2Fa%3Fb/submission"
   );
+});
+
+it("loads the submission into an object URL", async () => {
+  const fetchImpl = (async () =>
+    ({
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      ok: true,
+    }) as Response) as typeof fetch;
+  const url = await preparePlaybackObjectUrl(
+    "session-1",
+    "video/webm",
+    fetchImpl
+  );
+  expect(url.startsWith("blob:")).toBe(true);
+  URL.revokeObjectURL(url);
 });
 
 it("maps a missing summary lookup to a typed missing result", async () => {

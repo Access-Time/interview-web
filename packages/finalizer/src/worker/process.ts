@@ -106,6 +106,7 @@ const runAttempt = (
             httpMetadata: { contentType: output.mediaType },
             onlyIf: { etagDoesNotMatch: "*" },
             sha256: output.checksum,
+            size: output.size,
           });
           if (Option.isNone(written)) {
             const head = yield* recordings.head(outputKey);

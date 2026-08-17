@@ -3,8 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "build:server": "esbuild src/server/main.ts --bundle --platform=node --format=esm --outfile=server.js --packages=bundle",
+    "start": "node output/server.cjs",
+    "build:server": "esbuild src/server/main.ts --bundle --platform=node --format=cjs --outfile=output/server.cjs --packages=bundle",
     "test": "vitest run",
     "check-types": "tsc --noEmit -p tsconfig.json",
     "docker:build": "docker build --platform linux/amd64 -t recording-finalizer ."

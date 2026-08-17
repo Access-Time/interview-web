@@ -170,10 +170,13 @@ export const processFinalization = Effect.fn("processFinalization")(function* (
     return;
   }
   const job = claimed.value;
-  const manifest = yield* decodeManifest(job.manifest);
-  yield* decodeFinalizePlan(manifest, job.finalizePlan);
-  return yield* runAttempt(sessionId, job.attempt, manifest as never).pipe(
-    Effect.scoped,
+  return yield* Effect.gen(function* () {
+    const manifest = yield* decodeManifest(job.manifest);
+    yield* decodeFinalizePlan(manifest, job.finalizePlan);
+    return yield* runAttempt(sessionId, job.attempt, manifest as never).pipe(
+      Effect.scoped
+    );
+  }).pipe(
     Effect.catchIf(isTerminalFinalization, (error) =>
       db
         .fail({ attempt: job.attempt, failureCode: error._tag, sessionId })

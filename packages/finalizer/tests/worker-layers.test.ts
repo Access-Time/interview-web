@@ -1,6 +1,10 @@
 import { expect, it } from "@effect/vitest";
 import { Effect, Option } from "effect";
-import { makeRecordingsTest, Recordings } from "../src/worker/recordings.ts";
+import {
+  makeRecordings,
+  makeRecordingsTest,
+  Recordings,
+} from "../src/worker/recordings.ts";
 
 it.effect(
   "Recordings.get fails MissingOrCorruptPart on checksum mismatch",
@@ -28,4 +32,74 @@ it.effect("Recordings.head returns none for a missing key", () =>
     );
     expect(Option.isNone(result)).toBe(true);
   })
+);
+
+it.effect(
+  "makeRecordings maps bucket.get rejection to RecordingsUnavailable",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* Recordings.get("k").pipe(
+        Effect.provide(
+          makeRecordings({
+            get: () => Promise.reject(new Error("r2 down")),
+          } as never)
+        ),
+        Effect.flip
+      );
+      expect(result._tag).toBe("RecordingsUnavailable");
+    })
+);
+
+it.effect(
+  "makeRecordings maps bucket.head rejection to RecordingsUnavailable",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* Recordings.head("k").pipe(
+        Effect.provide(
+          makeRecordings({
+            head: () => Promise.reject(new Error("r2 down")),
+          } as never)
+        ),
+        Effect.flip
+      );
+      expect(result._tag).toBe("RecordingsUnavailable");
+    })
+);
+
+it.effect(
+  "makeRecordings maps bucket.put rejection to RecordingsUnavailable",
+  () =>
+    Effect.gen(function* () {
+      const recordings = yield* Recordings.pipe(
+        Effect.provide(
+          makeRecordings({
+            put: () => Promise.reject(new Error("r2 down")),
+          } as never)
+        )
+      );
+      const result = yield* recordings
+        .put("k", new Uint8Array([1]), {
+          httpMetadata: { contentType: "video/webm" },
+          onlyIf: { etagDoesNotMatch: "*" },
+          sha256: "a".repeat(64),
+        })
+        .pipe(Effect.flip);
+      expect(result._tag).toBe("RecordingsUnavailable");
+    })
+);
+
+it.effect(
+  "makeRecordings maps bucket.delete rejection to RecordingsUnavailable",
+  () =>
+    Effect.gen(function* () {
+      const recordings = yield* Recordings.pipe(
+        Effect.provide(
+          makeRecordings({
+            delete: () => Promise.reject(new Error("r2 down")),
+          } as never)
+        )
+      );
+      const result = yield* recordings.delete("k").pipe(Effect.flip);
+      expect(result._tag).toBe("RecordingsUnavailable");
+    })
 );

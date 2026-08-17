@@ -96,6 +96,7 @@ Every distinct failure has its own `Schema.TaggedError`. No `Effect.Effect<A, Er
 | `IncompleteManifest` | missing parts or index gaps |
 | `InvalidPart` | size/checksum/key |
 | `InvalidFinalizePlan` | plan ≠ manifest |
+| `InputTooLarge` | aggregate input bytes exceed the declared limit |
 | `MissingOrCorruptPart` | absent R2 body, size mismatch, or checksum mismatch after a successful get |
 | `InvalidContainerOutput` | output headers/body |
 | `ContainerRejected` | container 400/413/415/422 |

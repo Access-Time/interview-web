@@ -444,3 +444,78 @@ it.effect("streams container output to R2 with the container checksum", () => {
     )
   );
 });
+
+it.effect(
+  "unpublished output delete transport releases and does not fail",
+  () => {
+    const calls: string[] = [];
+    const checksum = "a".repeat(64);
+    const layer = Layer.mergeAll(
+      makeFinalizerDbTest({
+        claim: () => Effect.succeed(Option.some(validJob as never)),
+        complete: () => Effect.succeed(false),
+        fail: () =>
+          Effect.sync(() => {
+            calls.push("fail");
+            return true;
+          }),
+        ready: () => Effect.succeed(Option.none()),
+        release: () =>
+          Effect.sync(() => {
+            calls.push("release");
+            return true;
+          }),
+        renew: () => Effect.succeed(true),
+      }),
+      Layer.succeed(Recordings, {
+        delete: () =>
+          Effect.fail(new RecordingsUnavailable({ message: "r2 delete" })),
+        get: () =>
+          Effect.succeed({
+            body: new Uint8Array([1]),
+            checksum: checksum as never,
+            size: 1,
+          }),
+        head: () => Effect.succeed(Option.none()),
+        put: () =>
+          Effect.succeed(
+            Option.some({
+              checksums: { sha256: checksum },
+              httpMetadata: { contentType: "video/webm" },
+              size: 3,
+            })
+          ),
+      }),
+      Layer.succeed(ContainerClient, {
+        deleteJob: () => Effect.void,
+        finalize: () => Effect.void,
+        getOutput: () =>
+          Effect.succeed({
+            body: new ReadableStream({
+              start(controller) {
+                controller.enqueue(new Uint8Array([1, 2, 3]));
+                controller.close();
+              },
+            }),
+            checksum: checksum as never,
+            mediaType: "video/webm",
+            size: 3,
+          }),
+        putPart: () => Effect.void,
+      })
+    );
+    return processFinalization("session" as never).pipe(
+      Effect.provide(layer),
+      Effect.either,
+      Effect.tap((result) =>
+        Effect.sync(() => {
+          expect(result._tag).toBe("Left");
+          if (result._tag === "Left") {
+            expect(result.left._tag).toBe("RecordingsUnavailable");
+          }
+          expect(calls).toEqual(["release"]);
+        })
+      )
+    );
+  }
+);

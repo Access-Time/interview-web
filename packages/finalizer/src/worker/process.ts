@@ -1,4 +1,4 @@
-import { Effect, Option, Schedule } from "effect";
+import { Effect, Exit, Option, Schedule } from "effect";
 import type { SessionId } from "../domain/brands.ts";
 import {
   isTerminalFinalization,
@@ -100,63 +100,71 @@ const runAttempt = (
         mediaType: output.mediaType,
         size: output.size,
       };
-      yield* Effect.addFinalizer(() =>
-        Effect.gen(function* () {
-          const ready = yield* db.ready(sessionId);
-          const exactReady =
-            Option.isSome(ready) &&
-            ready.value.objectKey === outputKey &&
-            ready.value.mediaType === expected.mediaType &&
-            ready.value.byteSize === expected.size &&
-            ready.value.checksum.toLowerCase() ===
-              expected.checksum.toLowerCase();
-          if (!exactReady) {
-            yield* recordings.delete(outputKey);
+      const publishAndComplete = Effect.gen(function* () {
+        const published = yield* Effect.gen(function* () {
+          const written = yield* recordings.put(outputKey, output.body, {
+            httpMetadata: { contentType: output.mediaType },
+            onlyIf: { etagDoesNotMatch: "*" },
+            sha256: output.checksum,
+          });
+          if (Option.isNone(written)) {
+            const head = yield* recordings.head(outputKey);
+            if (!exact(Option.getOrUndefined(head), expected)) {
+              return yield* Effect.fail(
+                new OutputPublicationNotProven({
+                  message: "output publication not proven",
+                })
+              );
+            }
+            return false;
           }
-        }).pipe(Effect.ignore)
-      );
-      const published = yield* Effect.gen(function* () {
-        const written = yield* recordings.put(outputKey, output.body, {
-          httpMetadata: { contentType: output.mediaType },
-          onlyIf: { etagDoesNotMatch: "*" },
-          sha256: output.checksum,
-        });
-        if (Option.isNone(written)) {
-          const head = yield* recordings.head(outputKey);
-          if (!exact(Option.getOrUndefined(head), expected)) {
+          if (!exact(written.value, expected)) {
             return yield* Effect.fail(
-              new OutputPublicationNotProven({
-                message: "output publication not proven",
+              new OutputPublicationMetadataMismatch({
+                message: "output publication metadata mismatch",
               })
             );
           }
-          return false;
-        }
-        if (!exact(written.value, expected)) {
+          return true;
+        }).pipe(Effect.retry(retrySchedule));
+        const completed = yield* db.complete({
+          attempt,
+          output: {
+            byteSize: expected.size,
+            checksum: expected.checksum as never,
+            mediaType: expected.mediaType,
+            objectKey: outputKey,
+          },
+          sessionId,
+        });
+        if (!completed) {
           return yield* Effect.fail(
-            new OutputPublicationMetadataMismatch({
-              message: "output publication metadata mismatch",
-            })
+            new LeaseLost({ message: "finalization lease lost" })
           );
         }
-        return true;
-      }).pipe(Effect.retry(retrySchedule));
-      const completed = yield* db.complete({
-        attempt,
-        output: {
-          byteSize: expected.size,
-          checksum: expected.checksum as never,
-          mediaType: expected.mediaType,
-          objectKey: outputKey,
-        },
-        sessionId,
+        return { outputKey, published };
       });
-      if (!completed) {
-        return yield* Effect.fail(
-          new LeaseLost({ message: "finalization lease lost" })
-        );
-      }
-      return { outputKey, published };
+      return yield* Effect.exit(publishAndComplete).pipe(
+        Effect.flatMap((exit) =>
+          Effect.gen(function* () {
+            const ready = yield* db.ready(sessionId);
+            const exactReady =
+              Option.isSome(ready) &&
+              ready.value.objectKey === outputKey &&
+              ready.value.mediaType === expected.mediaType &&
+              ready.value.byteSize === expected.size &&
+              ready.value.checksum.toLowerCase() ===
+                expected.checksum.toLowerCase();
+            if (!exactReady) {
+              yield* recordings.delete(outputKey);
+            }
+            return yield* Exit.matchEffect(exit, {
+              onFailure: (cause) => Effect.failCause(cause),
+              onSuccess: (value) => Effect.succeed(value),
+            });
+          })
+        )
+      );
     });
     return yield* Effect.raceFirst(work, heartbeat);
   });

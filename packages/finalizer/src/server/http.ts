@@ -45,17 +45,26 @@ const message = (error: unknown) =>
 const body = (request: HttpServerRequest.HttpServerRequest, limit: number) =>
   Stream.runFoldEffect(
     request.stream,
-    { chunks: [] as Uint8Array[], size: 0 },
+    { chunks: [] as Uint8Array[], size: 0, tooLarge: false },
     (state, chunk) => {
       const size = state.size + chunk.byteLength;
       if (size > limit) {
-        return Effect.fail(new Error("request too large"));
+        return Effect.succeed({ ...state, size, tooLarge: true });
+      }
+      if (state.tooLarge) {
+        return Effect.succeed({ ...state, size });
       }
       state.chunks.push(chunk);
       state.size = size;
       return Effect.succeed(state);
     }
-  ).pipe(Effect.map(({ chunks }) => Buffer.concat(chunks)));
+  ).pipe(
+    Effect.flatMap(({ chunks, tooLarge }) =>
+      tooLarge
+        ? Effect.fail(new Error("request too large"))
+        : Effect.succeed(Buffer.concat(chunks))
+    )
+  );
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this is the protocol dispatcher.
 const route = Effect.gen(function* () {
@@ -107,9 +116,7 @@ const route = Effect.gen(function* () {
     if (actual !== checksum.toLowerCase()) {
       return json(400, { error: "checksum mismatch" });
     }
-    const partName = `part-${Number(match[2])}-${Number(match[3])}.bin`;
-    const existed = (yield* store.listParts(job)).includes(partName);
-    yield* store.putPart({
+    const outcome = yield* store.putPart({
       bytes,
       checksum: actual,
       job,
@@ -117,8 +124,8 @@ const route = Effect.gen(function* () {
       sequence: Number(match[3]),
     });
     return json(
-      existed ? 200 : 201,
-      existed ? { idempotent: true } : { accepted: true }
+      outcome === "idempotent" ? 200 : 201,
+      outcome === "idempotent" ? { idempotent: true } : { accepted: true }
     );
   }
   if (request.method === "POST" && match[4] === "finalize") {

@@ -72960,7 +72960,9 @@ var makeStore = (root) => {
       return await task();
     } finally {
       release();
-      if (locks.get(job) === current2) locks.delete(job);
+      if (locks.get(job) === current2) {
+        locks.delete(job);
+      }
     }
   };
   const dir = (job) => path.join(root, job);
@@ -72979,38 +72981,46 @@ var makeStore = (root) => {
   };
   const putPart = (input) => Effect_exports.tryPromise({
     catch: (error) => error instanceof PartAlreadyDiffers || error instanceof JobNotOpen || error instanceof InputTooLarge ? error : new Error(String(error)),
-    try: () => withJobLock(input.job, async () => {
-      const current2 = await ensureState(input.job);
-      if (current2.status !== "open") {
-        throw new JobNotOpen({ message: "job is not open" });
-      }
-      const file4 = path.join(
-        dir(input.job),
-        `part-${input.segment}-${input.sequence}.bin`
-      );
-      try {
-        const existing = await fs.readFile(file4);
-        if (existing.byteLength !== input.bytes.byteLength || createHash("sha256").update(existing).digest("hex") !== input.checksum) {
-          throw new PartAlreadyDiffers({ message: "part already differs" });
+    try: () => withJobLock(
+      input.job,
+      // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered filesystem validation.
+      async () => {
+        const current2 = await ensureState(input.job);
+        if (current2.status !== "open") {
+          throw new JobNotOpen({ message: "job is not open" });
         }
-      } catch (error) {
-        if (error.code !== "ENOENT") {
-          throw error;
-        }
-        const names = await fs.readdir(dir(input.job));
-        const partNames = names.filter(
-          (name) => name.startsWith("part-") && name.endsWith(".bin")
+        const file4 = path.join(
+          dir(input.job),
+          `part-${input.segment}-${input.sequence}.bin`
         );
-        const sizes = await Promise.all(
-          partNames.map((name) => fs.stat(path.join(dir(input.job), name)))
-        );
-        const total = sizes.reduce((sum3, entry) => sum3 + entry.size, 0);
-        if (total + input.bytes.byteLength > maxJobBytes) {
-          throw new InputTooLarge({ message: "job too large" });
+        try {
+          const existing = await fs.readFile(file4);
+          if (existing.byteLength !== input.bytes.byteLength || createHash("sha256").update(existing).digest("hex") !== input.checksum) {
+            throw new PartAlreadyDiffers({
+              message: "part already differs"
+            });
+          }
+        } catch (error) {
+          if (error.code !== "ENOENT") {
+            throw error;
+          }
+          const names = await fs.readdir(dir(input.job));
+          const partNames = names.filter(
+            (name) => name.startsWith("part-") && name.endsWith(".bin")
+          );
+          let total = 0;
+          for (const name of partNames) {
+            total += (await fs.stat(path.join(dir(input.job), name))).size;
+            if (total + input.bytes.byteLength > maxJobBytes) {
+              throw new InputTooLarge({ message: "job too large" });
+            }
+          }
+          await fs.writeFile(file4, input.bytes, { flag: "wx" });
+          return "created";
         }
-        await fs.writeFile(file4, input.bytes, { flag: "wx" });
+        return "idempotent";
       }
-    })
+    )
   });
   return {
     assembleSegment: (input) => Effect_exports.tryPromise({
@@ -73199,17 +73209,22 @@ var errorStatus = (error) => {
 var message = (error) => typeof error === "object" && error !== null && "message" in error ? String(error.message) : "internal error";
 var body = (request4, limit) => Stream_exports.runFoldEffect(
   request4.stream,
-  { chunks: [], size: 0 },
+  { chunks: [], size: 0, tooLarge: false },
   (state, chunk4) => {
     const size16 = state.size + chunk4.byteLength;
     if (size16 > limit) {
-      return Effect_exports.fail(new Error("request too large"));
+      return Effect_exports.succeed({ ...state, size: size16, tooLarge: true });
     }
+    if (state.tooLarge) return Effect_exports.succeed({ ...state, size: size16 });
     state.chunks.push(chunk4);
     state.size = size16;
     return Effect_exports.succeed(state);
   }
-).pipe(Effect_exports.map(({ chunks: chunks3 }) => Buffer.concat(chunks3)));
+).pipe(
+  Effect_exports.flatMap(
+    ({ chunks: chunks3, tooLarge }) => tooLarge ? Effect_exports.fail(new Error("request too large")) : Effect_exports.succeed(Buffer.concat(chunks3))
+  )
+);
 var route = Effect_exports.gen(function* () {
   const request4 = yield* HttpServerRequest_exports.HttpServerRequest;
   const store = yield* JobStore;
@@ -73248,9 +73263,7 @@ var route = Effect_exports.gen(function* () {
     if (actual !== checksum.toLowerCase()) {
       return json5(400, { error: "checksum mismatch" });
     }
-    const partName = `part-${Number(match19[2])}-${Number(match19[3])}.bin`;
-    const existed = (yield* store.listParts(job)).includes(partName);
-    yield* store.putPart({
+    const outcome = yield* store.putPart({
       bytes,
       checksum: actual,
       job,
@@ -73258,8 +73271,8 @@ var route = Effect_exports.gen(function* () {
       sequence: Number(match19[3])
     });
     return json5(
-      existed ? 200 : 201,
-      existed ? { idempotent: true } : { accepted: true }
+      outcome === "idempotent" ? 200 : 201,
+      outcome === "idempotent" ? { idempotent: true } : { accepted: true }
     );
   }
   if (request4.method === "POST" && match19[4] === "finalize") {

@@ -26,6 +26,7 @@ interface PartInput {
   segment: number;
   sequence: number;
 }
+export type PutPartOutcome = "created" | "idempotent";
 interface Store {
   assembleSegment: (input: {
     job: string;
@@ -36,7 +37,7 @@ interface Store {
   getOutput: (job: string) => Effect.Effect<Option.Option<StoredOutput>, Error>;
   getStatus: (job: string) => Effect.Effect<string, Error>;
   listParts: (job: string) => Effect.Effect<readonly string[], Error>;
-  putPart: (input: PartInput) => Effect.Effect<void, Error>;
+  putPart: (input: PartInput) => Effect.Effect<PutPartOutcome, Error>;
   setFailed: (job: string) => Effect.Effect<void, Error>;
   setOutput: (input: {
     job: string;
@@ -124,18 +125,19 @@ const makeStore = (root: string): Store => {
               const partNames = names.filter(
                 (name) => name.startsWith("part-") && name.endsWith(".bin")
               );
-              const sizes = await Promise.all(
-                partNames.map((name) =>
-                  fs.stat(path.join(dir(input.job), name))
-                )
-              );
-              const total = sizes.reduce((sum, entry) => sum + entry.size, 0);
-              if (total + input.bytes.byteLength > maxJobBytes) {
-                // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
-                throw new InputTooLarge({ message: "job too large" });
+              let total = 0;
+              for (const name of partNames) {
+                // biome-ignore lint/performance/noAwaitInLoops: accounting is serialized per job.
+                total += (await fs.stat(path.join(dir(input.job), name))).size;
+                if (total + input.bytes.byteLength > maxJobBytes) {
+                  // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
+                  throw new InputTooLarge({ message: "job too large" });
+                }
               }
               await fs.writeFile(file, input.bytes, { flag: "wx" });
+              return "created";
             }
+            return "idempotent";
           }
         ),
     });

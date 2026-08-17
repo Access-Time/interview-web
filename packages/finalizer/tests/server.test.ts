@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readdir,
+  readFile,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import {
   createServer,
   request as httpRequest,
@@ -28,11 +34,15 @@ interface Harness {
     body?: Buffer | string,
     headers?: Record<string, string>
   ) => Promise<Response>;
+  root: string;
 }
 const harnesses: Harness[] = [];
 const sha = (body: Buffer) => createHash("sha256").update(body).digest("hex");
 
-async function harness(failFfmpeg = false): Promise<Harness> {
+async function harness(
+  failFfmpeg = false,
+  deferredFfmpeg?: Promise<void>
+): Promise<Harness> {
   const root = await mkdtemp(path.join(tmpdir(), "finalizer-test-"));
   const ffmpeg = {
     concat: (input: { listPath: string; outputPath: string; cwd: string }) =>
@@ -44,6 +54,7 @@ async function harness(failFfmpeg = false): Promise<Harness> {
       failFfmpeg
         ? Effect.fail(new FfmpegFailed({ message: "ffmpeg failed" }))
         : Effect.tryPromise(async () => {
+            await deferredFfmpeg;
             await writeFile(input.outputPath, await readFile(input.inputPath));
           }),
   } as unknown as Parameters<typeof makeFfmpegTest>[0];
@@ -92,6 +103,7 @@ async function harness(failFfmpeg = false): Promise<Harness> {
   const value = {
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
     request,
+    root,
   };
   harnesses.push(value);
   return value;
@@ -100,6 +112,22 @@ async function harness(failFfmpeg = false): Promise<Harness> {
 afterEach(async () => {
   await Promise.all(harnesses.splice(0).map((value) => value.close()));
 });
+
+const upload = (h: Harness, segment: number, sequence: number, bytes: Buffer) =>
+  h.request("PUT", `/jobs/job/parts/${segment}/${sequence}`, bytes, {
+    "x-content-sha256": sha(bytes),
+  });
+
+const finalize = (h: Harness) =>
+  h.request(
+    "POST",
+    "/jobs/job/finalize",
+    JSON.stringify({
+      outputMediaType: "video/webm",
+      segments: [{ partIndexes: [0], segmentIndex: 0 }],
+    }),
+    { "content-type": "application/json" }
+  );
 
 it("preserves health, method, checksum, and idempotent part protocol", async () => {
   const h = await harness();
@@ -130,6 +158,51 @@ it("preserves health, method, checksum, and idempotent part protocol", async () 
       })
     ).status
   ).toBe(409);
+});
+
+it("serializes identical and conflicting concurrent uploads", async () => {
+  const h = await harness();
+  const [sameA, sameB] = await Promise.all([
+    upload(h, 0, 0, Buffer.from("same")),
+    upload(h, 0, 0, Buffer.from("same")),
+  ]);
+  expect([sameA.status, sameB.status].sort()).toEqual([200, 201]);
+  const [differentA, differentB] = await Promise.all([
+    upload(h, 0, 1, Buffer.from("a")),
+    upload(h, 0, 1, Buffer.from("b")),
+  ]);
+  expect([differentA.status, differentB.status].sort()).toEqual([201, 409]);
+});
+
+it("enforces the aggregate cap for concurrent uploads", async () => {
+  const h = await harness();
+  await upload(h, 0, 0, Buffer.from("seed"));
+  await truncate(
+    path.join(h.root, "job", "part-0-0.bin"),
+    2 * 1024 * 1024 * 1024 - 1
+  );
+  const [first, second] = await Promise.all([
+    upload(h, 0, 1, Buffer.from("a")),
+    upload(h, 0, 2, Buffer.from("b")),
+  ]);
+  expect([first.status, second.status].sort()).toEqual([201, 413]);
+  expect(
+    (await readdir(path.join(h.root, "job"))).filter((name) =>
+      name.endsWith(".bin")
+    )
+  ).toHaveLength(2);
+});
+
+it("rejects chunked oversized bodies without accepting parts", async () => {
+  const h = await harness();
+  const chunked = await h.request(
+    "POST",
+    "/jobs/job/finalize",
+    Buffer.alloc(2 * 1024 * 1024 + 1, 32),
+    { "content-type": "application/json" }
+  );
+  expect(chunked.status).toBe(413);
+  expect((await finalize(h)).status).toBe(409);
 });
 
 it("rejects missing parts and byte-concatenates timeslices before remux", async () => {
@@ -247,4 +320,20 @@ it("keeps failed finalization output unavailable with 409", async () => {
   );
   expect(result.status).toBe(422);
   expect((await h.request("GET", "/jobs/job/output")).status).toBe(409);
+});
+
+it("seals a job during deferred finalization", async () => {
+  let release!: () => void;
+  const deferred = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(false, deferred);
+  const part = Buffer.from("media");
+  expect((await upload(h, 0, 0, part)).status).toBe(201);
+  const first = finalize(h);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  expect((await finalize(h)).status).toBe(409);
+  expect((await upload(h, 0, 1, Buffer.from("later"))).status).toBe(409);
+  release();
+  expect((await first).status).toBe(200);
 });

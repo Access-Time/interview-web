@@ -382,3 +382,24 @@ it("seals a job during deferred finalization", async () => {
   release();
   expect((await first).status).toBe(200);
 });
+
+it("rejects an overlapping finalize without a startup sleep", async () => {
+  let release!: () => void;
+  const deferred = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const h = await harness(false, deferred);
+  const part = Buffer.from("media");
+  expect((await upload(h, 0, 0, part)).status).toBe(201);
+  const first = finalize(h);
+  const secondStatus = await Promise.race([
+    finalize(h).then((result) => result.status),
+    first.then((result) => {
+      throw new Error(`first finalize finished first: ${result.status}`);
+    }),
+  ]);
+  expect(secondStatus).toBe(409);
+  expect((await upload(h, 0, 1, Buffer.from("later"))).status).toBe(409);
+  release();
+  expect((await first).status).toBe(200);
+});

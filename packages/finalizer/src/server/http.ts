@@ -12,7 +12,6 @@ const checksumPattern = /^[a-f\d]{64}$/i;
 const mediaTypes = new Set(["video/webm", "video/mp4"]);
 const maxPartBytes = 512 * 1024 * 1024;
 const maxJsonBytes = 2 * 1024 * 1024;
-const sealing = new Set<string>();
 
 const json = (status: number, value: unknown) =>
   HttpServerResponse.unsafeJson(value, { status });
@@ -82,13 +81,9 @@ const route = Effect.gen(function* () {
   const job = decodeURIComponent(match[1] as string);
   if (request.method === "DELETE" && !match[2] && !match[4]) {
     yield* store.deleteJob(job);
-    sealing.delete(job);
     return HttpServerResponse.empty({ status: 204 });
   }
   if (request.method === "PUT" && match[2] !== undefined) {
-    if (sealing.has(job)) {
-      return json(409, { error: "job is sealing" });
-    }
     const checksum = request.headers["x-content-sha256"];
     if (!(checksum && checksumPattern.test(checksum))) {
       return json(400, { error: "invalid checksum" });
@@ -129,9 +124,6 @@ const route = Effect.gen(function* () {
     );
   }
   if (request.method === "POST" && match[4] === "finalize") {
-    if (sealing.has(job)) {
-      return json(409, { error: "job is not open" });
-    }
     const jsonBytes = yield* body(request, maxJsonBytes);
     let data: unknown;
     try {
@@ -177,7 +169,7 @@ const route = Effect.gen(function* () {
         seen.add(part);
       }
     }
-    sealing.add(job);
+    yield* store.beginSeal(job);
     return yield* finalizeJob({ ...finalizeData, job }).pipe(
       Effect.as(json(200, { finalized: true })),
       Effect.tapError((error) =>
@@ -186,13 +178,12 @@ const route = Effect.gen(function* () {
         "_tag" in error &&
         (error._tag === "FfmpegFailed" || error._tag === "NoMediaStream")
           ? store.setFailed(job)
-          : Effect.void
-      ),
-      Effect.ensuring(Effect.sync(() => sealing.delete(job)))
+          : store.reopen(job)
+      )
     );
   }
   if (request.method === "GET" && match[4] === "output") {
-    if (sealing.has(job)) {
+    if ((yield* store.getStatus(job)) === "sealing") {
       return json(409, { error: "finalization in progress" });
     }
     const output = yield* store.getOutput(job);

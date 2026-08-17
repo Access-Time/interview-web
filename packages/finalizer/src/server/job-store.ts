@@ -27,17 +27,20 @@ interface PartInput {
   sequence: number;
 }
 export type PutPartOutcome = "created" | "idempotent";
+export type JobStatus = "open" | "sealing" | "done" | "failed";
 interface Store {
   assembleSegment: (input: {
     job: string;
     segment: number;
     partIndexes: readonly number[];
   }) => Effect.Effect<{ path: string }, Error | JobNotOpen>;
+  beginSeal: (job: string) => Effect.Effect<void, Error | JobNotOpen>;
   deleteJob: (job: string) => Effect.Effect<void>;
   getOutput: (job: string) => Effect.Effect<Option.Option<StoredOutput>, Error>;
-  getStatus: (job: string) => Effect.Effect<string, Error>;
+  getStatus: (job: string) => Effect.Effect<JobStatus, Error>;
   listParts: (job: string) => Effect.Effect<readonly string[], Error>;
   putPart: (input: PartInput) => Effect.Effect<PutPartOutcome, Error>;
+  reopen: (job: string) => Effect.Effect<void, Error>;
   setFailed: (job: string) => Effect.Effect<void, Error>;
   setOutput: (input: {
     job: string;
@@ -85,6 +88,8 @@ const makeStore = (root: string): Store => {
       return { status: "open" };
     }
   };
+  const isWritable = (status: string) =>
+    status === "open" || status === "sealing";
   const putPart = (input: PartInput) =>
     Effect.tryPromise({
       catch: (error) =>
@@ -146,31 +151,48 @@ const makeStore = (root: string): Store => {
       Effect.tryPromise({
         catch: (error) =>
           error instanceof JobNotOpen ? error : new Error(String(error)),
-        try: async () => {
-          const current = await ensureState(input.job);
-          if (current.status !== "open") {
-            throw new JobNotOpen({ message: "job is not open" });
-          }
-          const files = input.partIndexes.map((n) =>
-            path.join(dir(input.job), `part-${input.segment}-${n}.bin`)
-          );
-          if (files.length === 1) {
-            return { path: files[0] as string };
-          }
-          const output = path.join(
-            dir(input.job),
-            `assembled-${input.segment}.bin`
-          );
-          await fs.writeFile(output, Buffer.alloc(0));
-          for (const file of files) {
-            // biome-ignore lint/performance/noAwaitInLoops: parts must be appended in manifest order.
-            await pipeline(
-              createReadStream(file),
-              createWriteStream(output, { flags: "a" })
+        try: () =>
+          withJobLock(input.job, async () => {
+            const current = await ensureState(input.job);
+            if (!isWritable(current.status)) {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            const files = input.partIndexes.map((n) =>
+              path.join(dir(input.job), `part-${input.segment}-${n}.bin`)
             );
-          }
-          return { path: output };
-        },
+            if (files.length === 1) {
+              return { path: files[0] as string };
+            }
+            const output = path.join(
+              dir(input.job),
+              `assembled-${input.segment}.bin`
+            );
+            await fs.writeFile(output, Buffer.alloc(0));
+            for (const file of files) {
+              // biome-ignore lint/performance/noAwaitInLoops: parts must be appended in manifest order.
+              await pipeline(
+                createReadStream(file),
+                createWriteStream(output, { flags: "a" })
+              );
+            }
+            return { path: output };
+          }),
+      }),
+    beginSeal: (job) =>
+      Effect.tryPromise({
+        catch: (error) =>
+          error instanceof JobNotOpen ? error : new Error(String(error)),
+        try: () =>
+          withJobLock(job, async () => {
+            const current = await ensureState(job);
+            if (current.status !== "open") {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            await fs.writeFile(
+              state(job),
+              JSON.stringify({ status: "sealing" })
+            );
+          }),
       }),
     deleteJob: (job) =>
       Effect.promise(() => fs.rm(dir(job), { force: true, recursive: true })),
@@ -184,40 +206,59 @@ const makeStore = (root: string): Store => {
         }
       }),
     getStatus: (job) =>
-      Effect.tryPromise(async () => (await ensureState(job)).status),
+      Effect.tryPromise(() =>
+        withJobLock(
+          job,
+          async () => (await ensureState(job)).status as JobStatus
+        )
+      ),
     listParts: (job) =>
-      Effect.tryPromise(async () => {
-        const current = await ensureState(job);
-        if (current.status !== "open") {
-          throw new JobNotOpen({ message: "job is not open" });
-        }
-        return (await fs.readdir(dir(job))).filter(
-          (file) => file.startsWith("part-") && file.endsWith(".bin")
-        );
-      }),
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          if (!isWritable(current.status)) {
+            throw new JobNotOpen({ message: "job is not open" });
+          }
+          return (await fs.readdir(dir(job))).filter(
+            (file) => file.startsWith("part-") && file.endsWith(".bin")
+          );
+        })
+      ),
     putPart,
+    reopen: (job) =>
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          if (current.status === "sealing") {
+            await fs.writeFile(state(job), JSON.stringify({ status: "open" }));
+          }
+        })
+      ),
     setFailed: (job) =>
-      Effect.tryPromise(async () => {
-        const current = await ensureState(job);
-        await fs.writeFile(
-          state(job),
-          JSON.stringify({ output: current.output ?? null, status: "failed" })
-        );
-      }),
+      Effect.tryPromise(() =>
+        withJobLock(job, async () => {
+          const current = await ensureState(job);
+          await fs.writeFile(
+            state(job),
+            JSON.stringify({ output: current.output ?? null, status: "failed" })
+          );
+        })
+      ),
     setOutput: (input) =>
       Effect.tryPromise({
         catch: (error) =>
           error instanceof JobNotOpen ? error : new Error(String(error)),
-        try: async () => {
-          const current = await ensureState(input.job);
-          if (current.status !== "open") {
-            throw new JobNotOpen({ message: "job is not open" });
-          }
-          await fs.writeFile(
-            state(input.job),
-            JSON.stringify({ output: input.output, status: "done" })
-          );
-        },
+        try: () =>
+          withJobLock(input.job, async () => {
+            const current = await ensureState(input.job);
+            if (!isWritable(current.status)) {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            await fs.writeFile(
+              state(input.job),
+              JSON.stringify({ output: input.output, status: "done" })
+            );
+          }),
       }),
   };
 };

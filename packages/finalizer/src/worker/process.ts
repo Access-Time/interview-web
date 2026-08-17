@@ -3,7 +3,6 @@ import type { SessionId } from "../domain/brands.ts";
 import {
   isTerminalFinalization,
   MissingOrCorruptPart,
-  OutputChecksumMismatch,
   OutputPublicationMetadataMismatch,
   OutputPublicationNotProven,
 } from "../domain/errors.ts";
@@ -28,7 +27,6 @@ const retrySchedule = Schedule.recurs(3).pipe(
         "ContainerUnavailable",
         "OutputPublicationNotProven",
         "OutputSizeMismatch",
-        "OutputChecksumMismatch",
       ].includes(String(error._tag))
   )
 );
@@ -100,21 +98,10 @@ const runAttempt = (
     const expected = {
       checksum: output.checksum,
       mediaType: output.mediaType,
-      size: output.bytes.byteLength,
+      size: output.size,
     };
-    const digest = yield* Effect.promise(() =>
-      crypto.subtle.digest("SHA-256", output.bytes)
-    );
-    const actualChecksum = [...new Uint8Array(digest)]
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
-    if (actualChecksum !== output.checksum) {
-      return yield* Effect.fail(
-        new OutputChecksumMismatch({ message: "output checksum mismatch" })
-      );
-    }
     const published = yield* Effect.gen(function* () {
-      const written = yield* recordings.put(outputKey, output.bytes, {
+      const written = yield* recordings.put(outputKey, output.body, {
         httpMetadata: { contentType: output.mediaType },
         onlyIf: { etagDoesNotMatch: "*" },
         sha256: output.checksum,

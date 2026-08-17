@@ -25,7 +25,7 @@ export class Recordings extends Context.Tag("Recordings")<
     ) => Effect.Effect<PartObject, MissingOrCorruptPart>;
     readonly put: (
       key: string,
-      bytes: Uint8Array,
+      body: ReadableStream<Uint8Array> | Uint8Array,
       options: {
         httpMetadata: { contentType: string };
         onlyIf: { etagDoesNotMatch: "*" };
@@ -89,7 +89,7 @@ export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
       }),
     head: (key) =>
       promise(async () => Option.fromNullable(await bucket.head(key))),
-    put: (key, bytes, options) =>
+    put: (key, body, options) =>
       Effect.tryPromise({
         catch: (error) =>
           new OutputPublicationNotProven({
@@ -97,7 +97,7 @@ export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
             message: "output publication not proven",
           }),
         try: async () =>
-          Option.fromNullable(await bucket.put(key, bytes, options)),
+          Option.fromNullable(await bucket.put(key, body, options)),
       }),
   });
 
@@ -154,12 +154,12 @@ export const makeRecordingsTest = (store: Store): Layer.Layer<Recordings> =>
           entry && !("body" in entry) ? entry : undefined
         );
       }),
-    put: (key, bytes, options) =>
+    put: (key, body, options) =>
       Effect.sync(() => {
         const meta = {
           checksums: { sha256: options.sha256 },
           httpMetadata: options.httpMetadata,
-          size: bytes.byteLength,
+          size: body instanceof Uint8Array ? body.byteLength : 0,
         };
         write(store, key, meta);
         return Option.some(meta);

@@ -9,9 +9,10 @@ import {
 import { normalizeSha256Checksum } from "../domain/media.ts";
 
 export interface ContainerOutput {
-  bytes: Uint8Array;
+  body: ReadableStream<Uint8Array>;
   checksum: Sha256Hex;
   mediaType: "video/webm" | "video/mp4";
+  size: number;
 }
 export class ContainerClient extends Context.Tag("ContainerClient")<
   ContainerClient,
@@ -38,7 +39,6 @@ export class ContainerClient extends Context.Tag("ContainerClient")<
   }
 >() {}
 
-const hex = (bytes: ArrayBuffer) => normalizeSha256Checksum(bytes) as string;
 const statusError = (status: number, what: string) =>
   [400, 413, 415, 422].includes(status)
     ? new ContainerRejected({ message: `${what}: ${status}`, status })
@@ -83,21 +83,26 @@ export const makeContainerClient = (
           if (!response.ok) {
             throw statusError(response.status, "output");
           }
-          const bytes = new Uint8Array(await response.arrayBuffer());
           const mediaType = response.headers.get("content-type");
-          const checksum = response.headers
-            .get("x-content-sha256")
-            ?.toLowerCase();
+          const checksum = normalizeSha256Checksum(
+            response.headers.get("x-content-sha256") ?? undefined
+          );
+          const size = Number(response.headers.get("content-length"));
           if (
             (mediaType !== "video/webm" && mediaType !== "video/mp4") ||
-            bytes.byteLength !==
-              Number(response.headers.get("content-length")) ||
-            !checksum ||
-            checksum !== hex(await crypto.subtle.digest("SHA-256", bytes))
+            !response.body ||
+            !Number.isInteger(size) ||
+            size < 0 ||
+            !checksum
           ) {
             throw new InvalidContainerOutput({ message: "invalid output" });
           }
-          return { bytes, checksum: checksum as Sha256Hex, mediaType };
+          return {
+            body: response.body,
+            checksum: checksum as Sha256Hex,
+            mediaType,
+            size,
+          };
         },
       }),
     putPart: (input) =>

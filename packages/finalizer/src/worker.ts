@@ -113,20 +113,23 @@ export async function processFinalization(input: {
         const response = await container.fetch(
           new URL(`/jobs/${job}/output`, "http://container")
         );
-        const bytes = new Uint8Array(await response.arrayBuffer());
         const mediaType = response.headers.get("content-type");
         const checksum = response.headers.get("x-content-sha256");
+        const size = Number(response.headers.get("content-length"));
         if (
-          !response.ok ||
+          !(response.ok && response.body) ||
           (mediaType !== "video/webm" && mediaType !== "video/mp4") ||
-          !checksum
+          !checksum ||
+          !Number.isInteger(size) ||
+          size < 0
         ) {
           throw new Error("invalid container output");
         }
         return {
-          bytes,
+          body: response.body,
           checksum: checksum as never,
           mediaType: mediaType as "video/webm" | "video/mp4",
+          size,
         };
       }).pipe(Effect.orDie),
     putPart: (part: {

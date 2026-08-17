@@ -83,6 +83,29 @@ it.effect("rejects a finalize plan that does not match uploaded parts", () =>
   }).pipe(Effect.provide(makePassthroughContainerClient()))
 );
 
+it.effect("rejects mp4 instead of publishing concatenated bytes", () =>
+  Effect.gen(function* () {
+    const client = yield* ContainerClient;
+    yield* client.putPart({
+      body: new Uint8Array([1]),
+      checksum: "a".repeat(64),
+      job: "job",
+      segment: 0,
+      sequence: 0,
+    });
+    const result = yield* client
+      .finalize({
+        job: "job",
+        outputMediaType: "video/mp4",
+        segments: [{ partIndexes: [0], segmentIndex: 0 }],
+      })
+      .pipe(Effect.flip);
+    expect(result._tag).toBe("ContainerRejected");
+    const output = yield* client.getOutput("job").pipe(Effect.flip);
+    expect(output._tag).toBe("InvalidContainerOutput");
+  }).pipe(Effect.provide(makePassthroughContainerClient()))
+);
+
 it.effect("getOutput fails before finalize and after deleteJob", () =>
   Effect.gen(function* () {
     const client = yield* ContainerClient;
@@ -97,7 +120,7 @@ it.effect("getOutput fails before finalize and after deleteJob", () =>
     });
     yield* client.finalize({
       job: "job",
-      outputMediaType: "video/mp4",
+      outputMediaType: "video/webm",
       segments: [{ partIndexes: [0], segmentIndex: 0 }],
     });
     yield* client.deleteJob("job");

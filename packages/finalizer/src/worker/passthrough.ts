@@ -40,10 +40,10 @@ const rejected = (message: string) =>
   new ContainerRejected({ message, status: 422 });
 
 /**
- * Free-plan stand-in for the ffmpeg container: assemble uploaded parts in
- * order and publish the concatenated bitstream. Single-segment WebM timeslices
- * are one bitstream, so this is the full take. Multi-segment / MP4 remux is
- * not equivalent to ffmpeg.
+ * Free-plan stand-in for the ffmpeg container. WebM parts are assembled and
+ * each recovered encoder session stays its own seekable file. MP4 needs
+ * ffmpeg, so those plans are rejected instead of publishing concatenated
+ * bytes as ready.
  */
 export const makePassthroughContainerClient =
   (): Layer.Layer<ContainerClient> => {
@@ -84,11 +84,12 @@ export const makePassthroughContainerClient =
               rejected("uploaded parts do not exactly match finalize plan")
             );
           }
-          const assembledBytes = concat(assembled);
-          const bytes =
-            input.outputMediaType === "video/webm"
-              ? makeWebmSeekable(assembledBytes)
-              : assembledBytes;
+          if (input.outputMediaType !== "video/webm") {
+            return yield* Effect.fail(
+              rejected("passthrough finalizer only supports video/webm")
+            );
+          }
+          const bytes = makeWebmSeekable(concat(assembled));
           const checksum = yield* Effect.tryPromise({
             catch: () => rejected("output checksum unavailable"),
             try: () => digest(bytes),

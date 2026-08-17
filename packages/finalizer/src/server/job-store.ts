@@ -11,6 +11,7 @@ import {
 } from "../domain/errors.ts";
 
 const maxJobBytes = 2 * 1024 * 1024 * 1024;
+type AsyncTask<A> = () => Promise<A>;
 
 export interface StoredOutput {
   readonly checksum: string;
@@ -44,6 +45,27 @@ interface Store {
 }
 
 const makeStore = (root: string): Store => {
+  const locks = new Map<string, Promise<void>>();
+  const withJobLock = async <A>(
+    job: string,
+    task: AsyncTask<A>
+  ): Promise<A> => {
+    const previous = locks.get(job) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    locks.set(job, current);
+    await previous;
+    try {
+      return await task();
+    } finally {
+      release();
+      if (locks.get(job) === current) {
+        locks.delete(job);
+      }
+    }
+  };
   const dir = (job: string) => path.join(root, job);
   const state = (job: string) => path.join(dir(job), "state.json");
   const readState = (job: string) =>
@@ -70,43 +92,52 @@ const makeStore = (root: string): Store => {
         error instanceof InputTooLarge
           ? error
           : new Error(String(error)),
-      try: async () => {
-        const current = await ensureState(input.job);
-        if (current.status !== "open") {
-          throw new JobNotOpen({ message: "job is not open" });
-        }
-        const file = path.join(
-          dir(input.job),
-          `part-${input.segment}-${input.sequence}.bin`
-        );
-        try {
-          const existing = await fs.readFile(file);
-          if (
-            existing.byteLength !== input.bytes.byteLength ||
-            createHash("sha256").update(existing).digest("hex") !==
-              input.checksum
-          ) {
-            throw new PartAlreadyDiffers({ message: "part already differs" });
+      try: () =>
+        withJobLock(
+          input.job,
+          // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: ordered filesystem validation.
+          async () => {
+            const current = await ensureState(input.job);
+            if (current.status !== "open") {
+              throw new JobNotOpen({ message: "job is not open" });
+            }
+            const file = path.join(
+              dir(input.job),
+              `part-${input.segment}-${input.sequence}.bin`
+            );
+            try {
+              const existing = await fs.readFile(file);
+              if (
+                existing.byteLength !== input.bytes.byteLength ||
+                createHash("sha256").update(existing).digest("hex") !==
+                  input.checksum
+              ) {
+                throw new PartAlreadyDiffers({
+                  message: "part already differs",
+                });
+              }
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                throw error;
+              }
+              const names = await fs.readdir(dir(input.job));
+              const partNames = names.filter(
+                (name) => name.startsWith("part-") && name.endsWith(".bin")
+              );
+              const sizes = await Promise.all(
+                partNames.map((name) =>
+                  fs.stat(path.join(dir(input.job), name))
+                )
+              );
+              const total = sizes.reduce((sum, entry) => sum + entry.size, 0);
+              if (total + input.bytes.byteLength > maxJobBytes) {
+                // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
+                throw new InputTooLarge({ message: "job too large" });
+              }
+              await fs.writeFile(file, input.bytes, { flag: "wx" });
+            }
           }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-            throw error;
-          }
-          const names = await fs.readdir(dir(input.job));
-          const partNames = names.filter(
-            (name) => name.startsWith("part-") && name.endsWith(".bin")
-          );
-          const sizes = await Promise.all(
-            partNames.map((name) => fs.stat(path.join(dir(input.job), name)))
-          );
-          const total = sizes.reduce((sum, entry) => sum + entry.size, 0);
-          if (total + input.bytes.byteLength > maxJobBytes) {
-            // biome-ignore lint/style/useErrorCause: tagged domain errors have no underlying cause.
-            throw new InputTooLarge({ message: "job too large" });
-          }
-          await fs.writeFile(file, input.bytes, { flag: "wx" });
-        }
-      },
+        ),
     });
   return {
     assembleSegment: (input) =>

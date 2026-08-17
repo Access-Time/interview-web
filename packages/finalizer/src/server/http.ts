@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
-import { Effect, Option } from "effect";
+import { Effect, Option, Stream } from "effect";
 import { Ffmpeg } from "./ffmpeg.ts";
 import { finalizeJob } from "./finalize.ts";
 import { JobStore } from "./job-store.ts";
@@ -43,11 +43,19 @@ const message = (error: unknown) =>
     : "internal error";
 
 const body = (request: HttpServerRequest.HttpServerRequest, limit: number) =>
-  Effect.flatMap(request.arrayBuffer, (value) =>
-    value.byteLength > limit
-      ? Effect.fail(new Error("request too large"))
-      : Effect.succeed(new Uint8Array(value))
-  );
+  Stream.runFoldEffect(
+    request.stream,
+    { chunks: [] as Uint8Array[], size: 0 },
+    (state, chunk) => {
+      const size = state.size + chunk.byteLength;
+      if (size > limit) {
+        return Effect.fail(new Error("request too large"));
+      }
+      state.chunks.push(chunk);
+      state.size = size;
+      return Effect.succeed(state);
+    }
+  ).pipe(Effect.map(({ chunks }) => Buffer.concat(chunks)));
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this is the protocol dispatcher.
 const route = Effect.gen(function* () {

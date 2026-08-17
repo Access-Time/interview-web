@@ -61,7 +61,9 @@ export class RecordingFinalizerContainer extends Container {
   }
 }
 
-export function getFinalizerContainer(env: Pick<FinalizerEnv, "FINALIZER">) {
+export function getFinalizerContainer(env: {
+  FINALIZER: DurableObjectNamespace<RecordingFinalizerContainer>;
+}) {
   // One instance: jobs stay isolated under /jobs/:id, and Alchemy caps this
   // class at maxInstances: 1. A name per attempt starts a new Durable Object
   // and a new local Docker container that workerd leaves stopped.
@@ -74,7 +76,7 @@ export interface FinalizationQueue {
 export interface FinalizerEnv {
   DB: D1Database;
   FINALIZATION_QUEUE: FinalizationQueue;
-  FINALIZER: DurableObjectNamespace<RecordingFinalizerContainer>;
+  FINALIZER?: DurableObjectNamespace<RecordingFinalizerContainer>;
   RECORDINGS: FinalizerBucket;
 }
 

@@ -24,6 +24,7 @@ import {
 } from "../src/domain/errors.ts";
 import { ContainerClient } from "../src/worker/container.ts";
 import { makeFinalizerDbTest } from "../src/worker/db.ts";
+import { makePassthroughContainerClient } from "../src/worker/passthrough.ts";
 import { processFinalization } from "../src/worker/process.ts";
 import { makeRecordingsTest, Recordings } from "../src/worker/recordings.ts";
 
@@ -353,6 +354,63 @@ it.effect("missing part fails before container finalize", () => {
       Effect.sync(() => {
         expect(finalized).toBe(false);
         expect(failed).toBe("MissingOrCorruptPart");
+      })
+    )
+  );
+});
+
+it.effect("passthrough concat publishes the assembled parts", () => {
+  const part = new Uint8Array([1]);
+  let published: { checksum?: string; size?: number } = {};
+  let completed = false;
+  const layer = Layer.mergeAll(
+    makeFinalizerDbTest({
+      claim: () => Effect.succeed(Option.some(validJob as never)),
+      complete: () =>
+        Effect.sync(() => {
+          completed = true;
+          return true;
+        }),
+      ready: () => Effect.succeed(Option.none()),
+      renew: () => Effect.succeed(true),
+    }),
+    Layer.succeed(Recordings, {
+      delete: () => Effect.void,
+      get: () =>
+        Effect.succeed({
+          body: part,
+          checksum: "a".repeat(64) as never,
+          size: part.byteLength,
+        }),
+      head: () => Effect.succeed(Option.none()),
+      put: (_key, _body, options) =>
+        Effect.sync(() => {
+          published = { checksum: options.sha256, size: options.size };
+          return Option.some({
+            checksums: { sha256: options.sha256 },
+            httpMetadata: options.httpMetadata,
+            size: options.size,
+          });
+        }),
+    }),
+    makePassthroughContainerClient()
+  );
+  return processFinalization("session" as never).pipe(
+    Effect.provide(layer),
+    Effect.asVoid,
+    Effect.flatMap(() =>
+      Effect.promise(async () => {
+        const hash = await crypto.subtle.digest("SHA-256", part);
+        return Array.from(new Uint8Array(hash), (byte) =>
+          byte.toString(16).padStart(2, "0")
+        ).join("");
+      })
+    ),
+    Effect.tap((checksum) =>
+      Effect.sync(() => {
+        expect(completed).toBe(true);
+        expect(published.size).toBe(1);
+        expect(published.checksum).toBe(checksum);
       })
     )
   );

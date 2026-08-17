@@ -205,9 +205,26 @@ it("recording.finalize forwards every status result", async () => {
   }
 });
 
-it("recording.finalize does not enqueue non-queued results", async () => {
+it("recording.finalize re-enqueues stuck finalizing results", async () => {
   const client = createClient();
-  for (const status of ["finalizing", "ready", "failed"] as const) {
+  vi.mocked(finalizeRecording).mockResolvedValueOnce({
+    status: "finalizing",
+  });
+
+  await client.recording.finalize({
+    segments: [{ partCount: 1, segmentId: input.segmentId }],
+    sessionId: input.sessionId,
+  });
+
+  expect(finalizerFetch).toHaveBeenCalledTimes(1);
+  expect(await finalizerFetch.mock.calls[0]?.[0].json()).toEqual({
+    sessionId: input.sessionId,
+  });
+});
+
+it("recording.finalize does not enqueue terminal results", async () => {
+  const client = createClient();
+  for (const status of ["ready", "failed"] as const) {
     vi.mocked(finalizeRecording).mockResolvedValueOnce({ status });
     // biome-ignore lint/performance/noAwaitInLoops: statuses are asserted in order.
     await client.recording.finalize({

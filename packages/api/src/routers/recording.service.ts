@@ -118,7 +118,7 @@ export const finalizeSession = async (
     }
     throw error;
   }
-  if (result.status === "queued") {
+  if (result.status === "queued" || result.status === "finalizing") {
     try {
       await dispatchFinalization(context.finalizer, input.sessionId);
     } catch (error) {

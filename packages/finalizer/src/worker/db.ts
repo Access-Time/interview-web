@@ -10,7 +10,7 @@ import {
 } from "@interview-web/db";
 import { Context, Effect, Layer, Option } from "effect";
 import type { SessionId } from "../domain/brands.ts";
-import { LeaseLost } from "../domain/errors.ts";
+import { FinalizerDbUnavailable, LeaseLost } from "../domain/errors.ts";
 import type { FinalizerManifest, PublishedObject } from "../domain/schema.ts";
 
 export interface ClaimedJob {
@@ -24,37 +24,40 @@ export class FinalizerDb extends Context.Tag("FinalizerDb")<
   {
     readonly claim: (
       sessionId: SessionId
-    ) => Effect.Effect<Option.Option<ClaimedJob>>;
+    ) => Effect.Effect<Option.Option<ClaimedJob>, FinalizerDbUnavailable>;
     readonly complete: (input: {
       sessionId: SessionId;
       attempt: number;
       output: PublishedObject;
-    }) => Effect.Effect<boolean>;
+    }) => Effect.Effect<boolean, FinalizerDbUnavailable>;
     readonly fail: (input: {
       sessionId: SessionId;
       attempt: number;
       failureCode: string;
-    }) => Effect.Effect<boolean>;
+    }) => Effect.Effect<boolean, FinalizerDbUnavailable>;
     readonly release: (input: {
       sessionId: SessionId;
       attempt: number;
-    }) => Effect.Effect<boolean>;
+    }) => Effect.Effect<boolean, FinalizerDbUnavailable>;
     readonly renew: (input: {
       sessionId: SessionId;
       attempt: number;
-    }) => Effect.Effect<boolean, LeaseLost>;
+    }) => Effect.Effect<boolean, LeaseLost | FinalizerDbUnavailable>;
     readonly ready: (
       sessionId: SessionId
-    ) => Effect.Effect<Option.Option<PublishedObject>>;
+    ) => Effect.Effect<Option.Option<PublishedObject>, FinalizerDbUnavailable>;
     readonly listDue: (
       now: number,
       limit: number
-    ) => Effect.Effect<readonly SessionId[]>;
+    ) => Effect.Effect<readonly SessionId[], FinalizerDbUnavailable>;
   }
 >() {}
 
+const unavailable = (error: unknown) =>
+  new FinalizerDbUnavailable({ message: String(error) });
+
 const promise = <A>(thunk: () => Promise<A>) =>
-  Effect.tryPromise(thunk).pipe(Effect.orDie);
+  Effect.tryPromise({ catch: unavailable, try: thunk });
 
 export const makeFinalizerDb = (db: Database): Layer.Layer<FinalizerDb> =>
   Layer.succeed(FinalizerDb, {

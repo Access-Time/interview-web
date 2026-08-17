@@ -17,10 +17,75 @@ vi.mock("@interview-web/db", () => ({
 }));
 
 import { Effect, Layer, Option } from "effect";
+import {
+  MissingOrCorruptPart,
+  RecordingsUnavailable,
+} from "../src/domain/errors.ts";
 import { ContainerClient } from "../src/worker/container.ts";
 import { makeFinalizerDbTest } from "../src/worker/db.ts";
 import { processFinalization } from "../src/worker/process.ts";
 import { makeRecordingsTest, Recordings } from "../src/worker/recordings.ts";
+
+it.effect("recordings get transport stays RecordingsUnavailable", () => {
+  const layer = Layer.mergeAll(
+    makeFinalizerDbTest({
+      claim: () =>
+        Effect.succeed(
+          Option.some({
+            attempt: 1,
+            finalizePlan: JSON.stringify([{ partCount: 1, segmentId: "seg" }]),
+            manifest: {
+              segments: [
+                {
+                  id: "seg",
+                  index: 0,
+                  parts: [
+                    {
+                      byteSize: 1,
+                      checksum: "a".repeat(64),
+                      objectKey: "part",
+                      sequence: 0,
+                    },
+                  ],
+                },
+              ],
+              sessionId: "session",
+            },
+          } as never)
+        ),
+      fail: () => Effect.sync(() => true),
+      ready: () => Effect.succeed(Option.none()),
+      release: () => Effect.sync(() => true),
+      renew: () => Effect.succeed(true),
+    }),
+    Layer.succeed(Recordings, {
+      delete: () => Effect.void,
+      get: () =>
+        Effect.fail(new RecordingsUnavailable({ message: "r2 unavailable" })),
+      head: () => Effect.succeed(Option.none()),
+      put: () => Effect.succeed(Option.none()),
+    }),
+    Layer.succeed(ContainerClient, {
+      deleteJob: () => Effect.void,
+      finalize: () => Effect.void,
+      getOutput: () => Effect.die("unused"),
+      putPart: () => Effect.void,
+    })
+  );
+  return processFinalization("session" as never).pipe(
+    Effect.provide(layer),
+    Effect.either,
+    Effect.tap((result) =>
+      Effect.sync(() => {
+        expect(result._tag).toBe("Left");
+        if (result._tag === "Left") {
+          expect(result.left._tag).toBe("RecordingsUnavailable");
+          expect(result.left).not.toBeInstanceOf(MissingOrCorruptPart);
+        }
+      })
+    )
+  );
+});
 
 it.effect("claim none does not complete", () => {
   let completed = false;

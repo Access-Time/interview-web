@@ -2,7 +2,8 @@ import { Context, Effect, Layer, Option } from "effect";
 import type { Sha256Hex } from "../domain/brands.ts";
 import {
   MissingOrCorruptPart,
-  OutputPublicationNotProven,
+  type OutputPublicationNotProven,
+  RecordingsUnavailable,
 } from "../domain/errors.ts";
 import { normalizeSha256Checksum } from "../domain/media.ts";
 
@@ -22,7 +23,10 @@ export class Recordings extends Context.Tag("Recordings")<
   {
     readonly get: (
       key: string
-    ) => Effect.Effect<PartObject, MissingOrCorruptPart>;
+    ) => Effect.Effect<
+      PartObject,
+      MissingOrCorruptPart | RecordingsUnavailable
+    >;
     readonly put: (
       key: string,
       body: ReadableStream<Uint8Array> | Uint8Array,
@@ -33,10 +37,14 @@ export class Recordings extends Context.Tag("Recordings")<
       }
     ) => Effect.Effect<
       Option.Option<PublishedMeta>,
-      OutputPublicationNotProven
+      OutputPublicationNotProven | RecordingsUnavailable
     >;
-    readonly head: (key: string) => Effect.Effect<Option.Option<PublishedMeta>>;
-    readonly delete: (key: string) => Effect.Effect<void>;
+    readonly head: (
+      key: string
+    ) => Effect.Effect<Option.Option<PublishedMeta>, RecordingsUnavailable>;
+    readonly delete: (
+      key: string
+    ) => Effect.Effect<void, RecordingsUnavailable>;
   }
 >() {
   static get = (key: string) =>
@@ -50,52 +58,63 @@ const digest = async (bytes: Uint8Array) => {
   const hash = await crypto.subtle.digest("SHA-256", bytes);
   return normalizeSha256Checksum(hash) as string;
 };
-const promise = <A>(thunk: () => Promise<A>) =>
-  Effect.tryPromise(thunk).pipe(Effect.orDie);
+const unavailable = (error: unknown) =>
+  new RecordingsUnavailable({ message: String(error) });
 
 export const makeRecordings = (bucket: Bucket): Layer.Layer<Recordings> =>
   Layer.succeed(Recordings, {
-    delete: (key) => promise(() => bucket.delete(key)),
-    get: (key) =>
+    delete: (key) =>
       Effect.tryPromise({
-        catch: (error) =>
-          error instanceof MissingOrCorruptPart
-            ? error
-            : new MissingOrCorruptPart({ message: "missing or corrupt part" }),
-        try: async () => {
-          const object = await bucket.get(key);
-          if (!object?.body) {
-            throw new MissingOrCorruptPart({
+        catch: unavailable,
+        try: () => bucket.delete(key),
+      }),
+    get: (key) =>
+      Effect.gen(function* () {
+        const object = yield* Effect.tryPromise({
+          catch: unavailable,
+          try: () => bucket.get(key),
+        });
+        if (!object?.body) {
+          return yield* Effect.fail(
+            new MissingOrCorruptPart({
               message: "missing or corrupt part",
-            });
-          }
-          const body = new Uint8Array(await object.arrayBuffer());
-          const checksum = normalizeSha256Checksum(object.checksums?.sha256);
-          if (
-            body.byteLength !== object.size ||
-            !checksum ||
-            checksum !== (await digest(body))
-          ) {
-            throw new MissingOrCorruptPart({
+            })
+          );
+        }
+        const body = yield* Effect.tryPromise({
+          catch: unavailable,
+          try: async () => new Uint8Array(await object.arrayBuffer()),
+        });
+        const checksum = normalizeSha256Checksum(object.checksums?.sha256);
+        if (
+          body.byteLength !== object.size ||
+          !checksum ||
+          checksum !==
+            (yield* Effect.tryPromise({
+              catch: unavailable,
+              try: () => digest(body),
+            }))
+        ) {
+          return yield* Effect.fail(
+            new MissingOrCorruptPart({
               message: "missing or corrupt part",
-            });
-          }
-          return {
-            body,
-            checksum: checksum as Sha256Hex,
-            size: body.byteLength,
-          };
-        },
+            })
+          );
+        }
+        return {
+          body,
+          checksum: checksum as Sha256Hex,
+          size: body.byteLength,
+        };
       }),
     head: (key) =>
-      promise(async () => Option.fromNullable(await bucket.head(key))),
+      Effect.tryPromise({
+        catch: unavailable,
+        try: async () => Option.fromNullable(await bucket.head(key)),
+      }),
     put: (key, body, options) =>
       Effect.tryPromise({
-        catch: (error) =>
-          new OutputPublicationNotProven({
-            cause: String(error),
-            message: "output publication not proven",
-          }),
+        catch: unavailable,
         try: async () =>
           Option.fromNullable(await bucket.put(key, body, options)),
       }),

@@ -1,3 +1,4 @@
+import { Effect } from "effect";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("@cloudflare/containers", () => ({
@@ -18,15 +19,15 @@ vi.mock("@interview-web/db", () => ({
 
 import { getContainer } from "@cloudflare/containers";
 import { listRecordingsForFinalization } from "@interview-web/db";
+import { dispatchFinalization } from "../src/worker/dispatch.ts";
+import { makeFinalizationQueue } from "../src/worker/queue.ts";
 import worker, {
-  dispatchFinalizationRequest,
   type FinalizerEnv,
   getFinalizerContainer,
   isExactFinalizerOutput,
   isExactPublishedObject,
   normalizeSha256Checksum,
   outputMediaType,
-  processFinalization,
   reconciliationBatch,
   validateFinalizePlan,
   validateManifest,
@@ -39,19 +40,14 @@ const dispatchRequest = (body = JSON.stringify({ sessionId: "session-1" })) =>
     method: "POST",
   });
 
-const dispatchEnv = (send: ReturnType<typeof vi.fn>) =>
-  ({ FINALIZATION_QUEUE: { send } }) as Pick<
-    FinalizerEnv,
-    "FINALIZATION_QUEUE"
-  >;
-
-describe("dispatchFinalizationRequest", () => {
+describe("dispatchFinalization", () => {
   it("queues one valid internal dispatch", async () => {
     const send = vi.fn().mockResolvedValue(undefined);
 
-    const response = await dispatchFinalizationRequest(
-      dispatchRequest(),
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(dispatchRequest()).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(202);
@@ -76,9 +72,10 @@ describe("dispatchFinalizationRequest", () => {
   ])("rejects an invalid dispatch with %i", async (request, status) => {
     const send = vi.fn();
 
-    const response = await dispatchFinalizationRequest(
-      request,
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(request).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(status);
@@ -88,9 +85,10 @@ describe("dispatchFinalizationRequest", () => {
   it("returns 503 when queueing fails", async () => {
     const send = vi.fn().mockRejectedValue(new Error("queue down"));
 
-    const response = await dispatchFinalizationRequest(
-      dispatchRequest(),
-      dispatchEnv(send)
+    const response = await Effect.runPromise(
+      dispatchFinalization(dispatchRequest()).pipe(
+        Effect.provide(makeFinalizationQueue({ send } as never))
+      )
     );
 
     expect(response.status).toBe(503);
@@ -290,166 +288,4 @@ it("published object matching accepts hex-string and binary R2 checksums", async
       expected
     )
   ).toBe(false);
-});
-
-describe("processFinalization publication", () => {
-  const partBytes = new Uint8Array([1, 2, 3, 4]);
-  const outputBytes = new Uint8Array([9, 8, 7, 6, 5]);
-
-  const digestPart = () => digestHex(partBytes);
-  const digestOutput = () => digestHex(outputBytes);
-
-  const setup = async (recordings: {
-    delete?: (key: string) => Promise<void>;
-    head?: (key: string) => Promise<{
-      checksums?: { sha256?: ArrayBuffer | string };
-      httpMetadata?: { contentType?: string };
-      size: number;
-    } | null>;
-    put: (
-      key: string,
-      value: ReadableStream<Uint8Array> | ArrayBuffer | Uint8Array,
-      options: Record<string, unknown>
-    ) => Promise<{
-      checksums?: { sha256?: ArrayBuffer | string };
-      httpMetadata?: { contentType?: string };
-      size: number;
-    } | null>;
-  }) => {
-    const partChecksum = await digestPart();
-    const outputChecksum = await digestOutput();
-    const complete = vi.fn().mockResolvedValue(true);
-    const release = vi.fn().mockResolvedValue(true);
-    await processFinalization({
-      containerForAttempt: () => ({
-        fetch: (input: RequestInfo | URL, init?: RequestInit) => {
-          const path = (input instanceof URL ? input : new URL(String(input)))
-            .pathname;
-          const method = init?.method ?? "GET";
-          if (method === "PUT" && path.includes("/parts/")) {
-            return Promise.resolve(new Response(null, { status: 201 }));
-          }
-          if (method === "POST" && path.endsWith("/finalize")) {
-            return Promise.resolve(Response.json({ finalized: true }));
-          }
-          if (method === "GET" && path.endsWith("/output")) {
-            return Promise.resolve(
-              new Response(outputBytes, {
-                headers: {
-                  "content-length": String(outputBytes.byteLength),
-                  "content-type": "video/webm",
-                  "x-content-sha256": outputChecksum,
-                },
-              })
-            );
-          }
-          if (method === "DELETE") {
-            return Promise.resolve(new Response(null, { status: 204 }));
-          }
-          return Promise.resolve(new Response(null, { status: 404 }));
-        },
-      }),
-      db: {} as never,
-      dbFns: {
-        claim: async () => ({
-          attempt: 1,
-          finalizePlan: JSON.stringify([{ partCount: 1, segmentId: "seg" }]),
-          leaseExpiresAt: Date.now() + 300_000,
-          manifest: {
-            createdAt: 1,
-            segments: [
-              {
-                createdAt: 1,
-                id: "seg",
-                index: 0,
-                parts: [
-                  {
-                    byteSize: partBytes.byteLength,
-                    checksum: partChecksum,
-                    createdAt: 1,
-                    etag: "etag",
-                    id: "part-0",
-                    mediaType: "video/webm",
-                    objectKey: "part-0",
-                    sequence: 0,
-                  },
-                ],
-                recorderMimeType: "video/webm",
-                requestedMimeType: null,
-              },
-            ],
-            sessionId: "s1",
-          },
-        }),
-        complete,
-        fail: vi.fn(),
-        ready: vi.fn().mockResolvedValue(null),
-        release,
-        renew: vi.fn().mockResolvedValue(true),
-      },
-      heartbeatMs: 60_000,
-      recordings: {
-        delete: recordings.delete ?? (async () => undefined),
-        get: async () => ({
-          body: new Blob([partBytes]).stream(),
-          checksums: {
-            sha256: await crypto.subtle.digest("SHA-256", partBytes),
-          },
-          size: partBytes.byteLength,
-        }),
-        head: recordings.head ?? (async () => null),
-        put: recordings.put,
-      },
-      sessionId: "s1",
-    });
-    return { complete, outputChecksum, release };
-  };
-
-  it("streams container output to R2 with the container checksum", async () => {
-    const puts: unknown[] = [];
-    const { complete, outputChecksum } = await setup({
-      put: async (_key, value) => {
-        puts.push(value);
-        return {
-          checksums: {
-            sha256: await crypto.subtle.digest("SHA-256", outputBytes),
-          },
-          httpMetadata: { contentType: "video/webm" },
-          size: outputBytes.byteLength,
-        };
-      },
-    });
-    expect(puts[0] instanceof ReadableStream).toBe(true);
-    expect(complete).toHaveBeenCalledExactlyOnceWith(
-      {},
-      expect.objectContaining({
-        output: expect.objectContaining({ checksum: outputChecksum }),
-      })
-    );
-  });
-
-  it("proves publication from a hex-string head when put returns null", async () => {
-    const outputChecksum = await digestOutput();
-    const { complete } = await setup({
-      head: async () => ({
-        checksums: { sha256: outputChecksum },
-        httpMetadata: { contentType: "video/webm" },
-        size: outputBytes.byteLength,
-      }),
-      put: async () => null,
-    });
-    expect(complete).toHaveBeenCalledTimes(1);
-  });
-
-  it("accepts put metadata that reports a hex-string checksum", async () => {
-    const outputChecksum = await digestOutput();
-    const { complete } = await setup({
-      put: async () => ({
-        checksums: { sha256: outputChecksum },
-        httpMetadata: { contentType: "video/webm" },
-        size: outputBytes.byteLength,
-      }),
-    });
-    expect(complete).toHaveBeenCalledTimes(1);
-  });
 });

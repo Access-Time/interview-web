@@ -55,7 +55,7 @@ it("requests a display stream and attaches microphone audio", async () => {
   });
   await expect(acquireScreenStream()).resolves.toBe(screen);
   expect(getDisplayMedia).toHaveBeenCalledWith({
-    audio: true,
+    audio: false,
     video: true,
   });
   expect(getUserMedia).toHaveBeenCalledWith({ audio: true });
@@ -82,11 +82,17 @@ it("stops every track on a capture stream", () => {
   expect(audio.stop).toHaveBeenCalledOnce();
 });
 
-it("notifies when a screen track ends", () => {
-  const track = fakeTrack("video");
+it("notifies when a screen video track ends", () => {
+  const video = fakeTrack("video");
+  const audio = fakeTrack("audio");
   const onEnded = vi.fn();
-  const stopListening = listenForTrackEnded(fakeStream([track]), onEnded);
-  expect(track.addEventListener).toHaveBeenCalledWith("ended", onEnded);
+  const stopListening = listenForTrackEnded(
+    fakeStream([video, audio]),
+    onEnded
+  );
+  expect(video.addEventListener).toHaveBeenCalledWith("ended", onEnded);
+  expect(audio.addEventListener).not.toHaveBeenCalled();
   stopListening();
-  expect(track.removeEventListener).toHaveBeenCalledWith("ended", onEnded);
+  expect(video.removeEventListener).toHaveBeenCalledWith("ended", onEnded);
+  expect(audio.removeEventListener).not.toHaveBeenCalled();
 });

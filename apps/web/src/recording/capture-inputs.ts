@@ -30,7 +30,8 @@ function attachMicrophone(screen: MediaStream, microphone: MediaStream): void {
 
 export async function acquireScreenStream(): Promise<MediaStream> {
   const screen = await navigator.mediaDevices.getDisplayMedia({
-    audio: true,
+    // ponytail: display audio omitted so MediaRecorder gets one mic track; mix if tab audio is needed
+    audio: false,
     video: true,
   });
   try {
@@ -48,7 +49,7 @@ export function listenForTrackEnded(
   stream: MediaStream,
   onEnded: () => void
 ): () => void {
-  const tracks = stream.getTracks?.() ?? [];
+  const tracks = stream.getVideoTracks?.() ?? [];
   for (const track of tracks) {
     track.addEventListener?.("ended", onEnded);
   }

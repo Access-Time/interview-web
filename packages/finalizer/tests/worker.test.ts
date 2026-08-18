@@ -119,7 +119,7 @@ it("scheduled reconciliation enqueues every mapped session in order", async () =
 it("reuses one finalizer container instead of naming one per attempt", () => {
   const namespace = {
     idFromName: vi.fn(),
-  } as unknown as FinalizerEnv["FINALIZER"];
+  } as unknown as NonNullable<FinalizerEnv["FINALIZER"]>;
   const stub = { fetch: vi.fn() };
   vi.mocked(getContainer).mockReturnValue(stub as never);
 

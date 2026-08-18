@@ -125,6 +125,9 @@ importers:
       '@interview-web/env':
         specifier: workspace:*
         version: link:../../packages/env
+      '@interview-web/finalizer':
+        specifier: workspace:*
+        version: link:../../packages/finalizer
       '@interview-web/ui':
         specifier: workspace:*
         version: link:../../packages/ui

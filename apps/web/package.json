@@ -15,6 +15,7 @@
     "@interview-web/api": "workspace:*",
     "@interview-web/db": "workspace:*",
     "@interview-web/env": "workspace:*",
+    "@interview-web/finalizer": "workspace:*",
     "@interview-web/ui": "workspace:*",
     "@libsql/client": "catalog:",
     "@orpc/client": "catalog:",

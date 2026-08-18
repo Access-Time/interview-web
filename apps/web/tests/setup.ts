@@ -33,3 +33,12 @@ Object.assign(globalThis, {
   IS_REACT_ACT_ENVIRONMENT: true,
   ResizeObserver: TestResizeObserver,
 });
+
+Object.defineProperty(URL, "createObjectURL", {
+  configurable: true,
+  value: () => "blob:playback",
+});
+Object.defineProperty(URL, "revokeObjectURL", {
+  configurable: true,
+  value: () => undefined,
+});

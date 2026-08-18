@@ -510,3 +510,63 @@ test("shows manual retry after polled finalization failure", async ({
     page.getByRole("button", { name: "Try submitting again" })
   ).toBeEnabled();
 });
+
+test("recovered second segment stays playable after finalize", async ({
+  page,
+}) => {
+  const { fixture } = await installRecordingFixture(page, {
+    finalization: "ready",
+  });
+  await page.goto("/");
+  await startRecording(page);
+  await page.evaluate(() => window.__testMediaRecorder?.emitPart("before"));
+  await page.reload();
+  await waitForRecordingApp(page);
+  await expect(
+    page.getByRole("heading", {
+      name: "We found an unfinished recording. You can continue where you left off.",
+    })
+  ).toBeVisible();
+  const enable = page.getByRole("button", {
+    name: "Enable camera and microphone",
+  });
+  const continueRecording = page.getByRole("button", {
+    name: "Continue recording",
+  });
+  await expect(async () => {
+    if (await enable.isVisible()) {
+      await enable.click();
+    }
+    await expect(continueRecording).toBeVisible({ timeout: 500 });
+  }).toPass({ timeout: 8000 });
+  await continueRecording.click();
+  await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
+  await page.evaluate(() => window.__testMediaRecorder?.emitPart("after"));
+  await page.getByRole("button", { name: STOP_BUTTON_PATTERN }).click();
+  await expect(
+    page.getByRole("heading", { name: "Submission complete." })
+  ).toBeVisible();
+  expect(fixture.lastFinalizeInput()?.segments).toHaveLength(2);
+
+  const sessionId = fixture.lastSessionId();
+  expect(sessionId).toBeTruthy();
+  await page.goto(`/operator/recordings/${sessionId}`);
+  const video = page.getByLabel("Recording playback");
+  await expect(video).toBeVisible();
+  await expect(page.getByText("Part 1 of 2")).toBeVisible();
+  await expect(page.getByText("Recording unavailable")).toHaveCount(0);
+  await expect
+    .poll(() => video.evaluate((node) => (node as HTMLVideoElement).readyState))
+    .toBeGreaterThan(0);
+  await page.getByRole("button", { name: "Next part" }).click();
+  await expect(page.getByText("Part 2 of 2")).toBeVisible();
+  await expect(page.getByLabel("Recording playback")).toBeVisible();
+  await expect(page.getByText("Recording unavailable")).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page
+        .getByLabel("Recording playback")
+        .evaluate((node) => (node as HTMLVideoElement).readyState)
+    )
+    .toBeGreaterThan(0);
+});

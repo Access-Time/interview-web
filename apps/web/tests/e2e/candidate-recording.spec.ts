@@ -511,6 +511,33 @@ test("shows manual retry after polled finalization failure", async ({
   ).toBeEnabled();
 });
 
+test("screen sharing records without a camera preview", async ({ page }) => {
+  const fixture = createCandidateBindings();
+  await installCandidateMedia(page);
+  await installRecordingApi(page, fixture);
+  await page.goto("/");
+  await waitForRecordingApp(page);
+  const shareScreen = page.getByRole("button", { name: "Share your screen" });
+  const start = page.getByRole("button", { name: "Start recording" });
+  await expect(async () => {
+    if (await shareScreen.isVisible()) {
+      await shareScreen.click();
+    }
+    await expect(start).toBeVisible({ timeout: 500 });
+  }).toPass({ timeout: 5000 });
+  await expect(page.getByLabel("Your screen preview")).toBeVisible();
+  await expect(page.getByLabel("Your camera preview")).toHaveCount(0);
+  await start.click();
+  await expect(page.getByText(RECORDING_GUIDANCE)).toBeVisible();
+  await page.getByRole("button", { name: "Stop recording" }).click();
+  await expect(page.getByText(CAMERA_OFF_COPY)).toHaveCount(0);
+  await expect(
+    page.getByText(
+      "Your screen is off. Keep this screen open until submission is complete."
+    )
+  ).toBeVisible();
+});
+
 test("recovered second segment stays playable after finalize", async ({
   page,
 }) => {

@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  acquireCameraStream,
+  acquireScreenStream,
+  listenForTrackEnded,
+  type RecordingCaptureSource,
+  stopMediaStream,
+} from "./capture-inputs";
+import {
   getRecordingStoragePolicy,
   type RecordingStoragePolicy,
   runRecordingPreflight,
@@ -32,9 +39,12 @@ export function normalizeFinalizationStatus(
     : null;
 }
 
+export type { RecordingCaptureSource } from "./capture-inputs";
+
 export interface UseLiveRecordingResult {
   canResetRecoveredRecording: boolean;
   captureEnded: boolean;
+  captureSource: RecordingCaptureSource | null;
   error: string | null;
   finalization: RecordingFinalizationResult | null;
   hasIncompleteRecordingFinalization: boolean;
@@ -50,6 +60,7 @@ export interface UseLiveRecordingResult {
   retryFinalization: () => Promise<void>;
   retryRecordingPreflight: () => Promise<void>;
   saveState: RecordingSaveState;
+  shareScreen: () => Promise<void>;
   start: () => Promise<void>;
   stop: () => Promise<void>;
   stream: MediaStream | null;
@@ -120,6 +131,7 @@ export type RecordingStopReason =
 interface RecordingJourneyState {
   canResetRecoveredRecording: boolean;
   captureEnded: boolean;
+  captureSource: RecordingCaptureSource | null;
   error: string | null;
   finalization: RecordingFinalizationResult | null;
   hasIncompleteRecordingFinalization: boolean;
@@ -579,6 +591,7 @@ export function useLiveRecording(
   const ids = useRef<{ sessionId: string; segmentId: string } | null>(null);
   const session = useRef<RecordingSession | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const stopListeningForScreenEnd = useRef<(() => void) | null>(null);
   const persistingTerminalPart = useRef(false);
   const shouldSafetyStop = useRef(false);
   const terminalDataRef = useRef<{
@@ -590,6 +603,7 @@ export function useLiveRecording(
   const [journey, setJourney] = useState<RecordingJourneyState>({
     canResetRecoveredRecording: false,
     captureEnded: false,
+    captureSource: null,
     error: null,
     finalization: null,
     hasIncompleteRecordingFinalization: false,
@@ -607,6 +621,7 @@ export function useLiveRecording(
     setJourney((current) => ({ ...current, ...patch }));
   const {
     stream,
+    captureSource,
     isReady,
     isRecording,
     captureEnded,
@@ -623,6 +638,8 @@ export function useLiveRecording(
   } = journey;
   const setStream = (next: MediaStream | null) =>
     patchJourney({ stream: next });
+  const setCaptureSource = (next: RecordingCaptureSource | null) =>
+    patchJourney({ captureSource: next });
   const setReady = (next: boolean) => patchJourney({ isReady: next });
   const setRecording = (next: boolean) => patchJourney({ isRecording: next });
   const setCaptureEnded = (next: boolean) =>
@@ -954,9 +971,9 @@ export function useLiveRecording(
       if (recorder.current?.state !== "inactive") {
         recorder.current?.stop();
       }
-      for (const track of streamRef.current?.getTracks() ?? []) {
-        track.stop();
-      }
+      stopListeningForScreenEnd.current?.();
+      stopListeningForScreenEnd.current = null;
+      stopMediaStream(streamRef.current);
       streamRef.current = null;
     };
   }, []);
@@ -967,6 +984,47 @@ export function useLiveRecording(
     return requested
       ? new MediaRecorder(media, { mimeType: requested })
       : new MediaRecorder(media);
+  };
+
+  const releaseCaptureStreams = () => {
+    stopListeningForScreenEnd.current?.();
+    stopListeningForScreenEnd.current = null;
+    stopMediaStream(streamRef.current);
+    streamRef.current = null;
+    setStream(null);
+    setReady(false);
+  };
+
+  const applyCaptureStream = (
+    acquired: MediaStream,
+    source: RecordingCaptureSource
+  ) => {
+    stopListeningForScreenEnd.current?.();
+    stopListeningForScreenEnd.current = null;
+    if (streamRef.current !== acquired) {
+      stopMediaStream(streamRef.current);
+    }
+    streamRef.current = acquired;
+    setStream(acquired);
+    setCaptureSource(source);
+    setReady(true);
+    if (source !== "screen") {
+      return;
+    }
+    stopListeningForScreenEnd.current = listenForTrackEnded(acquired, () => {
+      if (lifecycle.current === true) {
+        return;
+      }
+      if (recorder.current?.state === "recording") {
+        setError("Screen sharing ended. Finishing your recording.");
+        ignorePromise(endCapture(undefined, "candidate"));
+        return;
+      }
+      releaseCaptureStreams();
+      setError(
+        "Screen sharing ended. Choose camera or screen sharing to continue."
+      );
+    });
   };
 
   const prepareRecording = async () => {
@@ -1010,19 +1068,12 @@ export function useLiveRecording(
   const initialize = async () => {
     deviceAccessFailed.current = false;
     try {
-      const acquired = await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: { facingMode: "user" },
-      });
+      const acquired = await acquireCameraStream();
       if (lifecycle.current === true) {
-        for (const track of acquired.getTracks()) {
-          track.stop();
-        }
+        stopMediaStream(acquired);
         return;
       }
-      streamRef.current = acquired;
-      setStream(acquired);
-      setReady(true);
+      applyCaptureStream(acquired, "camera");
       // biome-ignore lint/suspicious/noUnnecessaryConditions: recovery can fail before or after media acquisition.
       setError(recoveryBlocked.current ? recoveryError.current : null);
       try {
@@ -1039,6 +1090,32 @@ export function useLiveRecording(
       deviceAccessFailed.current = true;
       setError(
         `Unable to access camera and microphone: ${cause instanceof Error ? cause.message : String(cause)}`
+      );
+    }
+  };
+
+  const shareScreen = async () => {
+    try {
+      const acquired = await acquireScreenStream();
+      if (lifecycle.current === true) {
+        stopMediaStream(acquired);
+        return;
+      }
+      applyCaptureStream(acquired, "screen");
+      // biome-ignore lint/suspicious/noUnnecessaryConditions: recovery can fail before or after media acquisition.
+      setError(recoveryBlocked.current ? recoveryError.current : null);
+      try {
+        await recoveryPromise.current;
+      } catch {
+        return;
+      }
+      await prepareRecording();
+    } catch (cause) {
+      if (lifecycle.current === true) {
+        return;
+      }
+      setError(
+        `Unable to share your screen: ${cause instanceof Error ? cause.message : String(cause)}`
       );
     }
   };
@@ -1274,12 +1351,7 @@ export function useLiveRecording(
     setJourneyOutcome("terminal-restart");
     setCaptureEnded(true);
     setRecording(false);
-    for (const track of streamRef.current?.getTracks() ?? []) {
-      track.stop();
-    }
-    streamRef.current = null;
-    setStream(null);
-    setReady(false);
+    releaseCaptureStreams();
     const instance = recorder.current;
     // biome-ignore lint/suspicious/noUnnecessaryConditions: save failure can race recorder shutdown.
     if (instance && instance.state !== "inactive") {
@@ -1297,12 +1369,7 @@ export function useLiveRecording(
       setCaptureEnded(true);
       setRecording(false);
 
-      for (const track of streamRef.current?.getTracks() ?? []) {
-        track.stop();
-      }
-      streamRef.current = null;
-      setStream(null);
-      setReady(false);
+      releaseCaptureStreams();
 
       try {
         const instance = recorder.current;
@@ -1511,6 +1578,7 @@ export function useLiveRecording(
   return {
     canResetRecoveredRecording,
     captureEnded,
+    captureSource,
     error,
     finalization,
     hasIncompleteRecordingFinalization,
@@ -1526,6 +1594,7 @@ export function useLiveRecording(
     retryFinalization,
     retryRecordingPreflight,
     saveState,
+    shareScreen,
     start,
     stop,
     stream,

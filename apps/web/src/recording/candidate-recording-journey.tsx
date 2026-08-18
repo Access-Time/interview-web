@@ -2,6 +2,7 @@ import { Banner } from "@cloudflare/kumo/components/banner";
 import { Button } from "@cloudflare/kumo/components/button";
 import { useEffect, useRef } from "react";
 import type {
+  RecordingCaptureSource,
   RecordingFinalizationResult,
   RecordingJourneyOutcome,
   RecordingPreflightState,
@@ -13,6 +14,7 @@ export type CandidateRecordingJourneyProps = {
   blockingError: string | null;
   blockingErrorTitle: string | null;
   captureBlocked: boolean;
+  captureSource: RecordingCaptureSource | null;
   finalization: RecordingFinalizationResult | null;
   hasIncompleteRecordingFinalization: boolean;
   hasStopped: boolean;
@@ -24,12 +26,14 @@ export type CandidateRecordingJourneyProps = {
   onRetry: () => void;
   onRetryPreflight: () => void;
   onResetRecoveredRecording?: () => void;
+  onShareScreen: () => void;
   onStart: () => void;
   onStop: () => void;
   pendingAction:
     | "initialize"
     | "retry"
     | "retry-preflight"
+    | "share-screen"
     | "start"
     | "stop"
     | null;
@@ -87,7 +91,15 @@ function journeyState(props: CandidateRecordingJourneyProps): JourneyState {
   return "permission";
 }
 
-function CameraStage({ stream }: { stream: MediaStream | null }) {
+function PreviewVideo({
+  label,
+  mirrored,
+  stream,
+}: {
+  label: string;
+  mirrored?: boolean;
+  stream: MediaStream;
+}) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   useEffect(() => {
@@ -104,15 +116,39 @@ function CameraStage({ stream }: { stream: MediaStream | null }) {
   }, [stream]);
 
   return (
-    <div className="mt-8 aspect-video overflow-hidden rounded-xl border border-white/15 bg-black sm:mt-10">
+    <video
+      aria-label={label}
+      autoPlay
+      className={
+        mirrored
+          ? "h-full w-full object-cover [transform:scaleX(-1)]"
+          : "h-full w-full object-contain"
+      }
+      muted
+      playsInline
+      ref={videoRef}
+    />
+  );
+}
+
+function CaptureStage({
+  captureSource,
+  stream,
+}: {
+  captureSource: RecordingCaptureSource | null;
+  stream: MediaStream | null;
+}) {
+  return (
+    <div className="relative mt-8 aspect-video overflow-hidden rounded-xl border border-white/15 bg-black sm:mt-10">
       {stream ? (
-        <video
-          aria-label="Your camera preview"
-          autoPlay
-          className="h-full w-full object-cover [transform:scaleX(-1)]"
-          muted
-          playsInline
-          ref={videoRef}
+        <PreviewVideo
+          label={
+            captureSource === "screen"
+              ? "Your screen preview"
+              : "Your camera preview"
+          }
+          mirrored={captureSource !== "screen"}
+          stream={stream}
         />
       ) : (
         <div className="flex h-full items-center justify-center px-6 text-center text-sm text-white/60">
@@ -139,9 +175,13 @@ export const RECORDING_DELIVERY_COPY = {
     "This device is ready to protect up to 30 minutes of recording if you temporarily lose connection.",
   saveFailure:
     "We couldn’t save this recording safely. Your camera and microphone are off. Contact the hiring team for help.",
+  screenCandidateStop: "Your screen is off. Finishing your recording.",
+  screenSaveFailure:
+    "We couldn’t save this recording safely. Your screen is off. Contact the hiring team for help.",
 } as const;
 
 export interface RecordingDeliveryPresentationInput {
+  captureSource?: RecordingCaptureSource | null;
   finalization?: Pick<
     NonNullable<CandidateRecordingJourneyProps["finalization"]>,
     "state"
@@ -151,6 +191,29 @@ export interface RecordingDeliveryPresentationInput {
   isRecording?: boolean;
   recordingPreflightState?: RecordingPreflightState;
   recordingStopReason?: RecordingStopReason;
+}
+
+function captureStoppedDescription(
+  props: CandidateRecordingJourneyProps
+): string {
+  if (props.captureSource === "screen") {
+    return RECORDING_DELIVERY_COPY.screenSaveFailure;
+  }
+  if (props.recordingStopReason === "save-failure") {
+    return RECORDING_DELIVERY_COPY.saveFailure;
+  }
+  return "Your camera and microphone are off. We couldn’t save this recording safely.";
+}
+
+function switchCaptureLabel(props: CandidateRecordingJourneyProps): string {
+  if (props.captureSource === "screen") {
+    return props.pendingAction === "initialize"
+      ? "Enabling camera and microphone…"
+      : "Use camera instead";
+  }
+  return props.pendingAction === "share-screen"
+    ? "Sharing your screen…"
+    : "Use screen instead";
 }
 
 export function getDeliveryPresentation(
@@ -170,7 +233,10 @@ export function getDeliveryPresentation(
   if (props.recordingStopReason === "save-failure") {
     return {
       kind: "alert",
-      message: RECORDING_DELIVERY_COPY.saveFailure,
+      message:
+        props.captureSource === "screen"
+          ? RECORDING_DELIVERY_COPY.screenSaveFailure
+          : RECORDING_DELIVERY_COPY.saveFailure,
       retryPreflight: false,
     };
   }
@@ -197,7 +263,10 @@ export function getDeliveryPresentation(
   ) {
     return {
       kind: "status",
-      message: RECORDING_DELIVERY_COPY.candidateStop,
+      message:
+        props.captureSource === "screen"
+          ? RECORDING_DELIVERY_COPY.screenCandidateStop
+          : RECORDING_DELIVERY_COPY.candidateStop,
       retryPreflight: false,
     };
   }
@@ -246,7 +315,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
   const actionRef = useRef<HTMLButtonElement | null>(null);
   const submissionHeadingRef = useRef<HTMLHeadingElement | null>(null);
   const failureRef = useRef<HTMLHeadingElement | null>(null);
-  const previous = useRef({ isReady: props.isReady, state });
+  const previous = useRef({
+    isReady: props.isReady,
+    state,
+  });
   const asyncSavingMessage =
     state === "success" ? "" : getAsyncSavingMessage(props);
 
@@ -273,7 +345,10 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
     ) {
       failureRef.current?.focus();
     }
-    previous.current = { isReady: props.isReady, state };
+    previous.current = {
+      isReady: props.isReady,
+      state,
+    };
   }, [props.isReady, state]);
 
   const actionsDisabled = props.pendingAction !== null;
@@ -320,17 +395,18 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
       </>
     );
   } else if (state === "permission") {
-    announcement = "Set up your camera and microphone.";
+    announcement = "Choose camera or screen sharing.";
     content = (
       <>
         <h2
           className="font-semibold text-2xl leading-tight"
           id="journey-state-heading"
         >
-          Set up your camera and microphone.
+          Choose how you want to record.
         </h2>
         <p className="mt-4 text-gray-600 leading-7">
-          Nothing records until you choose Start recording.
+          Use your camera or share your screen. Nothing records until you choose
+          Start recording.
         </p>
         <Button
           className={`${actionClassName} mt-8`}
@@ -344,6 +420,18 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           {props.pendingAction === "initialize"
             ? "Enabling camera and microphone…"
             : "Enable camera and microphone"}
+        </Button>
+        <Button
+          className={`${actionClassName} mt-3`}
+          disabled={actionsDisabled}
+          onClick={props.onShareScreen}
+          size="lg"
+          type="button"
+          variant="outline"
+        >
+          {props.pendingAction === "share-screen"
+            ? "Sharing your screen…"
+            : "Share your screen"}
         </Button>
       </>
     );
@@ -373,17 +461,34 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
             ? "Starting recording…"
             : "Start recording"}
         </Button>
+        <Button
+          className={`${actionClassName} mt-3`}
+          disabled={actionsDisabled}
+          onClick={
+            props.captureSource === "screen"
+              ? props.onInitialize
+              : props.onShareScreen
+          }
+          size="lg"
+          type="button"
+          variant="outline"
+        >
+          {switchCaptureLabel(props)}
+        </Button>
       </>
     );
   } else if (state === "recovered") {
     announcement =
       "We found an unfinished recording. You can continue where you left off.";
-    let actionLabel = props.isReady
-      ? "Continue recording"
-      : "Enable camera and microphone";
+    let actionLabel = "Enable camera and microphone";
+    let onAction = props.onInitialize;
+    if (props.isReady) {
+      actionLabel = "Continue recording";
+      onAction = props.onStart;
+    }
     if (props.pendingAction === "start") {
       actionLabel = "Starting recording…";
-    } else if (props.pendingAction === "initialize") {
+    } else if (props.pendingAction === "initialize" && !props.isReady) {
       actionLabel = "Enabling camera and microphone…";
     }
     content = (
@@ -397,7 +502,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         <Button
           className={`${actionClassName} mt-8`}
           disabled={actionsDisabled || (props.isReady && props.captureBlocked)}
-          onClick={props.isReady ? props.onStart : props.onInitialize}
+          onClick={onAction}
           ref={actionRef}
           size="lg"
           type="button"
@@ -405,6 +510,20 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
         >
           {actionLabel}
         </Button>
+        {props.isReady ? null : (
+          <Button
+            className={`${actionClassName} mt-3`}
+            disabled={actionsDisabled}
+            onClick={props.onShareScreen}
+            size="lg"
+            type="button"
+            variant="outline"
+          >
+            {props.pendingAction === "share-screen"
+              ? "Sharing your screen…"
+              : "Share your screen"}
+          </Button>
+        )}
       </>
     );
   } else if (state === "recording") {
@@ -456,8 +575,9 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
             : "Waiting to submit"}
         </p>
         <p className="mt-2 text-gray-600 leading-7">
-          Your camera and microphone are off. Keep this screen open until
-          submission is complete.
+          {props.captureSource === "screen"
+            ? "Your screen is off. Keep this screen open until submission is complete."
+            : "Your camera and microphone are off. Keep this screen open until submission is complete."}
         </p>
       </>
     );
@@ -551,11 +671,7 @@ function JourneyPanel(props: CandidateRecordingJourneyProps) {
           <div className="mt-6">
             <Banner
               className="rounded-lg border border-neutral-200 bg-neutral-50 text-black"
-              description={
-                props.recordingStopReason === "save-failure"
-                  ? RECORDING_DELIVERY_COPY.saveFailure
-                  : "Your camera and microphone are off. We couldn’t save this recording safely."
-              }
+              description={captureStoppedDescription(props)}
               icon={<span aria-hidden="true">!</span>}
               title="Recording needs attention"
               variant="secondary"
@@ -667,7 +783,10 @@ export function CandidateRecordingJourney(
             Share what you do best, what brought you here, and the kind of work
             you hope to do next.
           </p>
-          <CameraStage stream={props.stream} />
+          <CaptureStage
+            captureSource={props.captureSource}
+            stream={props.stream}
+          />
         </section>
         <JourneyPanel {...props} />
       </div>

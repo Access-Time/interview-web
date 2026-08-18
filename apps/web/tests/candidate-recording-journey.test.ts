@@ -29,6 +29,7 @@ const baseProps: CandidateRecordingJourneyProps = {
   blockingError: null,
   blockingErrorTitle: null,
   captureBlocked: false,
+  captureSource: null,
   finalization: null,
   hasIncompleteRecordingFinalization: false,
   hasStopped: false,
@@ -39,6 +40,7 @@ const baseProps: CandidateRecordingJourneyProps = {
   onInitialize: () => undefined,
   onRetry: () => undefined,
   onRetryPreflight: () => undefined,
+  onShareScreen: () => undefined,
   onStart: () => undefined,
   onStop: () => undefined,
   pendingAction: null,
@@ -59,25 +61,33 @@ it("shows one candidate action for each active primary state", () => {
   );
   expect(
     screen.getByRole("heading", {
-      name: "Set up your camera and microphone.",
+      name: "Choose how you want to record.",
     })
   ).toBeTruthy();
   expect(
     screen.getByRole("button", { name: "Enable camera and microphone" })
   ).toBeTruthy();
-  expect(screen.getAllByRole("button").length).toBe(1);
+  expect(
+    screen.getByRole("button", { name: "Share your screen" })
+  ).toBeTruthy();
+  expect(screen.getAllByRole("button").length).toBe(2);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
+      captureSource: "camera",
       isReady: true,
+      stream: {} as MediaStream,
     })
   );
   expect(
     screen.getByRole("heading", { name: "You’re ready to record." })
   ).toBeTruthy();
   expect(screen.getByRole("button", { name: "Start recording" })).toBeTruthy();
-  expect(screen.getAllByRole("button").length).toBe(1);
+  expect(
+    screen.getByRole("button", { name: "Use screen instead" })
+  ).toBeTruthy();
+  expect(screen.getAllByRole("button").length).toBe(2);
 
   rerender(
     React.createElement(CandidateRecordingJourney, {
@@ -300,10 +310,13 @@ for (const scenario of stateScenarios) {
       expect(
         screen.getByRole("button", { name: scenario.action })
       ).toBeTruthy();
-      expect(screen.getAllByRole("button").length).toBe(1);
+      expect(screen.getAllByRole("button").length).toBe(
+        scenario.name === "recovered recording without media permission" ? 2 : 1
+      );
     } else {
       for (const actionName of [
         "Enable camera and microphone",
+        "Share your screen",
         "Start recording",
         "Continue recording",
         "Stop recording",
@@ -338,10 +351,10 @@ it("labels the controls by the active state heading", () => {
     React.createElement(CandidateRecordingJourney, baseProps)
   );
   let heading = screen.getByRole("heading", {
-    name: "Set up your camera and microphone.",
+    name: "Choose how you want to record.",
   });
   let controls = screen.getByRole("complementary", {
-    name: "Set up your camera and microphone.",
+    name: "Choose how you want to record.",
   });
   expect(heading.id).toBe("journey-state-heading");
   expect(controls.getAttribute("aria-labelledby")).toBe(heading.id);
@@ -518,14 +531,25 @@ it("focuses Continue recording after recovered media becomes ready", async () =>
 
 it("uses finite pending labels and disables each action", () => {
   const pendingScenarios: Array<{
+    buttonCount?: number;
     label: string;
     props: CandidateRecordingJourneyProps;
   }> = [
     {
+      buttonCount: 2,
       label: "Enabling camera and microphone…",
       props: { ...baseProps, pendingAction: "initialize" },
     },
     {
+      buttonCount: 2,
+      label: "Sharing your screen…",
+      props: {
+        ...baseProps,
+        pendingAction: "share-screen",
+      },
+    },
+    {
+      buttonCount: 2,
       label: "Starting recording…",
       props: { ...baseProps, isReady: true, pendingAction: "start" },
     },
@@ -556,7 +580,9 @@ it("uses finite pending labels and disables each action", () => {
     );
     const button = screen.getByRole("button", { name: scenario.label });
     expect(button.hasAttribute("disabled")).toBe(true);
-    expect(screen.getAllByRole("button").length).toBe(1);
+    expect(screen.getAllByRole("button").length).toBe(
+      scenario.buttonCount ?? 1
+    );
     unmount();
   }
 });
@@ -566,6 +592,7 @@ it("connects a stream to an accessible inline camera preview", () => {
   render(
     React.createElement(CandidateRecordingJourney, {
       ...baseProps,
+      captureSource: "camera",
       isReady: true,
       stream,
     })
@@ -577,6 +604,22 @@ it("connects a stream to an accessible inline camera preview", () => {
   expect(video.autoplay).toBe(true);
   expect(video.muted).toBe(true);
   expect(video.playsInline).toBe(true);
+});
+
+it("connects a screen stream to an accessible screen preview", () => {
+  const screenShare = { id: "screen" } as unknown as MediaStream;
+  render(
+    React.createElement(CandidateRecordingJourney, {
+      ...baseProps,
+      captureSource: "screen",
+      isReady: true,
+      stream: screenShare,
+    })
+  );
+  expect(
+    (screen.getByLabelText("Your screen preview") as HTMLVideoElement).srcObject
+  ).toBe(screenShare);
+  expect(screen.queryByLabelText("Your camera preview")).toBeNull();
 });
 
 it("capture ended overrides a stale recording flag and focuses submission", async () => {

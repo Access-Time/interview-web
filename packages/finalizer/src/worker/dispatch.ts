@@ -4,6 +4,7 @@ import { SessionId } from "../domain/brands.ts";
 import type { FinalizerEnv } from "../worker.ts";
 import { makeContainerClient } from "./container.ts";
 import { FinalizerDb, makeFinalizerDb } from "./db.ts";
+import { makePassthroughContainerClient } from "./passthrough.ts";
 import { processFinalization } from "./process.ts";
 import { FinalizationQueue, makeFinalizationQueue } from "./queue.ts";
 import { makeRecordings } from "./recordings.ts";
@@ -59,5 +60,7 @@ export const WorkerLive = (env: FinalizerEnv) =>
     makeFinalizerDb(createDb(env.DB)),
     makeFinalizationQueue(env.FINALIZATION_QUEUE as unknown as Queue<unknown>),
     makeRecordings(env.RECORDINGS as R2Bucket),
-    makeContainerClient(env.FINALIZER)
+    env.FINALIZER
+      ? makeContainerClient(env.FINALIZER)
+      : makePassthroughContainerClient()
   );

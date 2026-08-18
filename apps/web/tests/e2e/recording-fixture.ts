@@ -1,14 +1,22 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import type {
   AppendRecordingSegmentInput,
   RecordingFinalizeInput,
   RecordingFinalizeResult,
   RecordingManifest,
+  RecordingPlaybackSummary,
   RecordingStatus,
 } from "@interview-web/db";
 import { ORPCError, os } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Page } from "@playwright/test";
 import z from "zod";
+
+const tinyWebm = readFileSync(
+  path.join(import.meta.dirname, "fixtures/tiny.webm")
+);
+const recoveredSubmission = Buffer.concat([tinyWebm, tinyWebm]);
 
 declare global {
   interface Window {
@@ -53,10 +61,15 @@ export interface CandidateBindingFixture {
   ) => Promise<unknown>;
   deferCreate: () => Deferred<void>;
   deferManifest: (sessionId: string) => Deferred<RecordingManifest>;
+  getPlaybackSummary: (
+    sessionId: string
+  ) => Promise<RecordingPlaybackSummary | null>;
   getRecordingManifest: (
     sessionId: string
   ) => Promise<RecordingManifest | null>;
   getRecordingStatus: (sessionId: string) => Promise<RecordingStatus | null>;
+  lastFinalizeInput: () => RecordingFinalizeInput | null;
+  lastSessionId: () => string | null;
   markAllFailed: () => void;
   markAllReady: () => void;
   uploadedPartCount: () => number;
@@ -91,6 +104,8 @@ export function createCandidateBindings(): CandidateBindingFixture {
   const manifestDeferrals = new Map<string, Deferred<RecordingManifest>>();
   let createCalls = 0;
   let createDeferral: Deferred<void> | undefined;
+  let lastFinalize: RecordingFinalizeInput | null = null;
+  let lastSession: string | null = null;
 
   const fixture: CandidateBindingFixture = {
     appendRecordingSegment: (input) => {
@@ -121,6 +136,8 @@ export function createCandidateBindings(): CandidateBindingFixture {
     },
     bindings: {
       finalizeRecording: (input) => {
+        lastFinalize = input;
+        lastSession = input.sessionId;
         statuses.set(input.sessionId, { status: "queued" });
         return Promise.resolve({ status: "queued" });
       },
@@ -128,6 +145,7 @@ export function createCandidateBindings(): CandidateBindingFixture {
     createCallCount: () => createCalls,
     createRecordingSession: async (input) => {
       createCalls += 1;
+      lastSession = input.sessionId;
       await createDeferral?.promise;
       manifests.set(input.sessionId, {
         createdAt: Date.now(),
@@ -151,12 +169,28 @@ export function createCandidateBindings(): CandidateBindingFixture {
       manifestDeferrals.set(sessionId, pending);
       return pending;
     },
+    getPlaybackSummary: (sessionId) => {
+      const status = statuses.get(sessionId);
+      if (status?.status !== "ready") {
+        return Promise.resolve(null);
+      }
+      return Promise.resolve({
+        createdAt: Date.now(),
+        hasOutput: true,
+        id: sessionId,
+        outputByteSize: recoveredSubmission.byteLength,
+        outputMediaType: "video/webm",
+        status: "ready",
+      });
+    },
     getRecordingManifest: async (sessionId) => {
       const manifest = await manifestDeferrals.get(sessionId)?.promise;
       return manifest ?? manifests.get(sessionId) ?? null;
     },
     getRecordingStatus: (sessionId) =>
       Promise.resolve(statuses.get(sessionId) ?? null),
+    lastFinalizeInput: () => lastFinalize,
+    lastSessionId: () => lastSession,
     markAllFailed: () => {
       for (const sessionId of statuses.keys()) {
         statuses.set(sessionId, { status: "failed" });
@@ -193,6 +227,15 @@ function createCandidateRecordingRouter(fixture: CandidateBindingFixture) {
           throw new ORPCError("RECORDING_NOT_FOUND");
         }
         return manifest;
+      }),
+    getPlaybackSummary: procedure
+      .input(z.object({ sessionId: recordingId }))
+      .handler(async ({ input }) => {
+        const summary = await fixture.getPlaybackSummary(input.sessionId);
+        if (!summary) {
+          throw new ORPCError("RECORDING_NOT_FOUND");
+        }
+        return summary;
       }),
     getStatus: procedure
       .input(z.object({ sessionId: recordingId }))
@@ -278,6 +321,17 @@ export async function installRecordingApi(
     }
     recordUploadedPart(fixture);
     return route.fulfill({ body: "", status: 201 });
+  });
+
+  await page.route("**/api/recordings/**/submission", (route) => {
+    if (route.request().method() === "GET") {
+      return route.fulfill({
+        body: recoveredSubmission,
+        contentType: "video/webm",
+        status: 200,
+      });
+    }
+    return route.fulfill({ status: 405 });
   });
 }
 

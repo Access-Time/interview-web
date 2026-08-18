@@ -3,8 +3,10 @@ import { expect, it } from "vitest";
 import {
   isPlaybackReady,
   playbackDetailKind,
+  playbackSegmentForTime,
   playbackStatusLabel,
   playbackSummaryLookup,
+  preparePlaybackObjectUrl,
   recordingSubmissionUrl,
 } from "../src/recording/playback";
 
@@ -66,6 +68,32 @@ it("builds an encoded same-origin submission URL", () => {
   expect(recordingSubmissionUrl("session/a?b")).toBe(
     "/api/recordings/session%2Fa%3Fb/submission"
   );
+});
+
+it("maps a combined timeline onto recovered segments", () => {
+  expect(playbackSegmentForTime([10, 5], 3)).toEqual({
+    index: 0,
+    localTime: 3,
+  });
+  expect(playbackSegmentForTime([10, 5], 12)).toEqual({
+    index: 1,
+    localTime: 2,
+  });
+});
+
+it("loads the submission into an object URL", async () => {
+  const fetchImpl = (async () =>
+    ({
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      ok: true,
+    }) as Response) as typeof fetch;
+  const url = await preparePlaybackObjectUrl(
+    "session-1",
+    "video/webm",
+    fetchImpl
+  );
+  expect(url.startsWith("blob:")).toBe(true);
+  URL.revokeObjectURL(url);
 });
 
 it("maps a missing summary lookup to a typed missing result", async () => {

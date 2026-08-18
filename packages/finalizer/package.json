@@ -2,6 +2,9 @@
   "name": "@interview-web/finalizer",
   "private": true,
   "type": "module",
+  "exports": {
+    "./webm-seekable": "./src/domain/webm-seekable.ts"
+  },
   "scripts": {
     "start": "node output/server.cjs",
     "build:server": "esbuild src/server/main.ts --bundle --platform=node --format=cjs --outfile=output/server.cjs --packages=bundle",

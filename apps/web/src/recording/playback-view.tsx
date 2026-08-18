@@ -4,12 +4,12 @@ import type {
   RecordingPlaybackSummary,
 } from "@interview-web/db";
 import { Link } from "@tanstack/react-router";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   isPlaybackReady,
   playbackDetailKind,
   playbackStatusLabel,
-  recordingSubmissionUrl,
+  preparePlaybackObjectUrls,
 } from "./playback";
 
 export type PlaybackListErrorKind = "initial" | "load-more" | null;
@@ -202,40 +202,117 @@ function PlayableRecording({
   summary: RecordingPlaybackSummary;
 }) {
   const [failedForNonce, setFailedForNonce] = useState<number | null>(null);
+  const [objectUrls, setObjectUrls] = useState<string[]>([]);
+  const [partIndex, setPartIndex] = useState(0);
   const handleMediaError = useCallback(() => {
     setFailedForNonce(retryNonce);
   }, [retryNonce]);
+  const handlePartEnded = useCallback(() => {
+    setPartIndex((current) =>
+      current + 1 < objectUrls.length ? current + 1 : current
+    );
+  }, [objectUrls.length]);
+  const handlePreviousPart = useCallback(() => {
+    setPartIndex((current) => Math.max(0, current - 1));
+  }, []);
+  const handleNextPart = useCallback(() => {
+    setPartIndex((current) =>
+      current + 1 < objectUrls.length ? current + 1 : current
+    );
+  }, [objectUrls.length]);
   const playbackFailed = mediaFailed || failedForNonce === retryNonce;
+  const activeUrl = objectUrls[partIndex] ?? objectUrls[0] ?? null;
 
-  return (
-    <div className="grid gap-6">
-      {playbackFailed ? (
-        <div className="grid gap-4">
-          <p className="text-sm text-white/80">{UNAVAILABLE_MESSAGE}</p>
-          <Button
-            className={`${actionClassName} w-fit`}
-            onClick={onRetryPlayback}
-            type="button"
-          >
-            Try playback again
-          </Button>
-        </div>
-      ) : (
-        // biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source.
+  useEffect(() => {
+    let cancelled = false;
+    let createdUrls: string[] = [];
+    setObjectUrls([]);
+    setPartIndex(0);
+    setFailedForNonce(null);
+    preparePlaybackObjectUrls(summary.id, summary.outputMediaType)
+      .then((urls) => {
+        if (cancelled) {
+          for (const url of urls) {
+            URL.revokeObjectURL(url);
+          }
+          return;
+        }
+        createdUrls = urls;
+        setObjectUrls(urls);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFailedForNonce(retryNonce);
+        }
+      });
+    return () => {
+      cancelled = true;
+      for (const url of createdUrls) {
+        URL.revokeObjectURL(url);
+      }
+    };
+  }, [retryNonce, summary.id, summary.outputMediaType]);
+
+  let media: React.JSX.Element;
+  if (playbackFailed) {
+    media = (
+      <div className="grid gap-4">
+        <p className="text-sm text-white/80">{UNAVAILABLE_MESSAGE}</p>
+        <Button
+          className={`${actionClassName} w-fit`}
+          onClick={onRetryPlayback}
+          type="button"
+        >
+          Try playback again
+        </Button>
+      </div>
+    );
+  } else if (activeUrl) {
+    media = (
+      <div className="grid gap-3">
+        {/* biome-ignore lint/a11y/useMediaCaption: this public POC has no transcript source. */}
         <video
           aria-label="Recording playback"
           className="aspect-video w-full rounded-xl bg-black"
           controls
-          key={retryNonce}
+          key={`${retryNonce}-${partIndex}`}
+          onEnded={handlePartEnded}
           onError={handleMediaError}
-          preload="metadata"
-        >
-          <source
-            src={recordingSubmissionUrl(summary.id)}
-            type={summary.outputMediaType ?? undefined}
-          />
-        </video>
-      )}
+          preload="auto"
+          src={activeUrl}
+        />
+        {objectUrls.length > 1 ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="text-sm text-white/70">
+              Part {partIndex + 1} of {objectUrls.length}
+            </p>
+            <Button
+              className={`${actionClassName} w-fit`}
+              disabled={partIndex === 0}
+              onClick={handlePreviousPart}
+              type="button"
+            >
+              Previous part
+            </Button>
+            <Button
+              className={`${actionClassName} w-fit`}
+              disabled={partIndex + 1 >= objectUrls.length}
+              onClick={handleNextPart}
+              type="button"
+            >
+              Next part
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    );
+  } else {
+    media = <p className="text-sm text-white/70">Preparing playback.</p>;
+  }
+
+  return (
+    <div className="grid gap-6">
+      {media}
       <div className="grid gap-1.5">
         <time
           className="text-sm text-white/80"

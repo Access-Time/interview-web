@@ -174,8 +174,15 @@ it("labels a processing row as view status", () => {
   expect(screen.queryByRole("link", { name: "Play recording" })).toBeNull();
 });
 
-it("plays a ready recording with native controls and retries media failure", () => {
+it("plays a ready recording with native controls and retries media failure", async () => {
   const retryPlayback = vi.fn();
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue({
+      arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
+      ok: true,
+    })
+  );
   const { container } = render(
     <RecordingPlaybackDetail
       lookupKind="found"
@@ -187,13 +194,14 @@ it("plays a ready recording with native controls and retries media failure", () 
     />
   );
 
-  const video = screen.getByLabelText("Recording playback");
+  const video = await screen.findByLabelText("Recording playback");
   expect(video.getAttribute("controls")).not.toBeNull();
   fireEvent.error(video);
   expect(screen.getByText("Recording unavailable")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Try playback again" }));
   expect(retryPlayback).toHaveBeenCalledTimes(1);
   assertNoSensitiveDetails(container);
+  vi.unstubAllGlobals();
 });
 
 it("does not render a player while a recording is still processing", () => {
